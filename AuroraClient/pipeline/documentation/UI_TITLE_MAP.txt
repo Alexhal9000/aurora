@@ -1,0 +1,35 @@
+# Aurora UI title map for living documentation
+# Source of truth for processing-tool display names:
+#   BHTools/frontend/src/components/aurora/mainAurora.js → AURORA_PROCESSING_TOOL_DEFS
+#
+# Doc entry `title` MUST match the Aurora UI label for user-facing tools.
+# Keep `id` stable (kebab-case, API-oriented). Only change `title` when UI renames.
+#
+# Format: docs entry id → exact UI label
+
+extract-scans=Extract all scans
+extract-scans-preflight=Extract all scans (preflight)
+denoise-all-scans=Denoise
+preview-denoise=Denoise preview
+restore-all-scans=Restore
+batch-weld-mesh=Weld mesh
+align-to-reference=Align to reference
+homogenize-background=Background Offset Correction
+match-histogram=Intensity Normalization
+apply-threshold=Align Thresholds
+remove-background=Remove Background
+n4-bias-correction=N4 Bias Correction
+batch-cleanup-mesh=Batch cleanup mesh
+cleanup-mesh=Cleanup mesh
+mesh-elastic-registration=Elastic registration
+elastic-registration=Elastic registration (voxel / ANTs SyN)
+create-atlas=Create atlas
+transfer-landmarks=Transfer landmarks
+export-landmarks-bundle=Export landmarks
+export-landmarks=Export landmarks (file)
+export-landmarks-json=Export landmarks (JSON)
+export-landmark-distances=Export landmark distances
+batch-apply-mask-to-scans=Apply masks
+apply-mask-to-image=Apply masks (single)
+# Transfer masks → PropagateMaskView (add entry when documented):
+# propagate-mask=Transfer masks

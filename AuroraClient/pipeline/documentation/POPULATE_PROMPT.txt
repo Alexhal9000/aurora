@@ -1,0 +1,172 @@
+# Aurora Documentation — Full Backend Populate Prompt
+# Copy ONE batch at a time into an LLM coding-agent session (Cursor Agent / similar).
+# Do not paste all batches into a single message — context will overflow.
+#
+# Prerequisites already done:
+#   - Living docs infra exists (DocumentationManager, DocumentationPanel)
+#   - ALPACA rigid alignment stages live under Rigid & Elastic Registration → ALPACA rigid alignment
+#
+# After EVERY batch that adds entries, run:
+#   python3 Aurora/AuroraClient/pipeline/documentation/check_docs.py --seed
+# Then verify:
+#   python3 Aurora/AuroraClient/pipeline/documentation/check_docs.py
+# Expect: OK — all documented entries match live source hashes.
+
+================================================================================
+SHARED RULES (include with every batch)
+================================================================================
+
+You are populating Aurora living documentation.
+
+Files:
+- Master index: Aurora/AuroraClient/pipeline/documentation/docs_index.json
+- Schema/workflow: Aurora/AuroraClient/pipeline/documentation/WORKFLOW.md
+- Agent update rules: Aurora/AuroraClient/pipeline/documentation/UPDATE_PROMPT.txt
+- Manager: Aurora/AuroraClient/pipeline/documentationManager.py
+- Source package: Aurora/AuroraClient/pipeline/
+
+Hard rules:
+1. Prefer LIVE source under pipeline/ over Code_Summaries (those may be outdated). For educational
+   summary / algorithm.text / algorithm.math wording, prefer clear formulations from
+   /home/alejandro/Documents/Hallgrimsson_Image_Processing_Paper/Final_Paper/draft.md when they
+   match the live implementation; if paper and code disagree, **code wins**.
+2. Document user-facing / scientifically important symbols: public APIView classes, major tool classes, and key public methods. Skip private helpers (_name), tiny utils, and documentation* modules.
+3. For each new method entry use the existing schema (id, title, keywords, source{file,symbol,hash:"",lastChecked:null}, summary, options[], outputs[], algorithm{text,math,references,diagram}, related[], video:null, images[{caption,path:null}]).
+   - `algorithm.math` is an array of `{equation, caption}` (or `[]` if prose alone is clearer). See UPDATE_PROMPT.txt “Algorithm math rules”.
+   - One equation per array entry; every equation needs a symbol caption; skip low-value formulas.
+   - If the tool mainly wraps library denoisers/filters, use `algorithm.references` + `[[references]]` in text instead of equations (see UPDATE_PROMPT.txt “Library backends / references”). Example: Denoise.
+4. source.file is relative to pipeline/ (e.g. "denoiseTools.py"). source.symbol is dotted (e.g. "DenoiseAllScansView" or "RegistrationTools.some_method").
+5. Summaries must be educational: what it does + when/why a user would use it.
+6. options[] must come from real request params / method args in the source — do not invent. outputs[] must come from real Response JSON keys or method return values — do not invent. Use [] when unknown.
+7. algorithm.diagram = Mermaid flowchart markup when useful; else "".
+8. Do NOT remove or rewrite the existing ALPACA sample entries unless fixing a real error.
+9. Organize into sensible categories/subcategories. Extend existing categories when they fit; create new ones when needed.
+10. After editing docs_index.json for this batch, run:
+      python3 Aurora/AuroraClient/pipeline/documentation/check_docs.py --seed
+    Fix any ERROR lines (bad file/symbol) before finishing.
+11. Token-efficient: write complete entries for this batch only; do not dump whole source files into chat unless needed for one symbol.
+12. Titles must match Aurora UI labels (see pipeline/documentation/UI_TITLE_MAP.txt and AURORA_PROCESSING_TOOL_DEFS in mainAurora.js). Never invent titles from Python class names (e.g. MatchHistogramView → "Intensity Normalization", not "Match Histogram").
+
+Suggested top-level category map (adjust if clearer):
+- Rigid & Elastic Registration  (Align to reference, ALPACA stages, ANTs options, elastic, inversion)
+- Preprocessing
+- Denoise & Restore
+- Masks & Labels
+- Mesh Tools
+- Segmentation & Edges
+- Project & Scan I/O  (views.py extract/display/grid only — curated, not every helper)
+
+================================================================================
+BATCH 1 — Rigid alignment + registration tools
+================================================================================
+
+Populate docs for:
+- rigidAlignment.py: AlignToReferenceView, InvertAlignmentLandmarksView, ExportInvertedLandmarksView, normalize_ants_rigid_options (if user-facing)
+- registrationTools.py: RegistrationTools class — document the class overview entry PLUS its most important public methods used by alignment/elastic flows (inspect the class; skip private _)
+
+Keep/extend category "Rigid & Elastic Registration". ALPACA rigid stages belong under
+subcategory "ALPACA rigid alignment" (outer shell → Poisson → FPFH/RANSAC/ICP), not a
+separate Landmarking category.
+Then run --seed and confirm check_docs.py is OK.
+
+================================================================================
+BATCH 2 — Preprocessing
+================================================================================
+
+Populate docs for preprocessingTools.py public APIViews:
+CleanupMeshView, HomogenizeBackgroundView, ApplyThresholdView, RemoveBackgroundView,
+MatchHistogramView, BatchCleanupMeshView, N4BiasCorrectionView, SaveBackgroundValuesView,
+SaveThresholdValuesView, GetRotationMatrixView
+
+Category: Preprocessing (subcategories as needed, e.g. Intensity, Background, Mesh cleanup).
+Then --seed + check_docs.py OK.
+
+================================================================================
+BATCH 3 — Denoise & Restore
+================================================================================
+
+Populate:
+- denoiseTools.py: DenoiseAllScansView, PreviewDenoiseView
+- restoreTools.py: RestoreAllScansView
+- GPUTorchNLMDenoise.py: main public class/entry points if present and user-facing
+
+Category: Denoise & Restore.
+Then --seed + check_docs.py OK.
+
+================================================================================
+BATCH 4 — Masks & labels
+================================================================================
+
+Populate maskOperations.py public APIViews:
+SaveMaskView, LoadMaskView, UploadMaskView, DownloadMaskView, DeleteMaskView,
+CopyMaskToReferenceView, ListMaskFoldersView, ApplyMaskToImageView,
+BatchApplyMaskToScansView, MaskOutLabelsView, BatchMaskOutScansView
+
+Category: Masks & Labels.
+Then --seed + check_docs.py OK.
+
+================================================================================
+BATCH 5 — Mesh tools
+================================================================================
+
+Populate meshBasedTools.py / meshGridTools.py user-facing pieces:
+- MeshEditMixin (overview + key public helpers if they are the API surface)
+- Mesh edit/elastic-related public views/classes exported for HTTP (inspect meshBasedTools.py and urls.py for ApplyMesh* / MeshElastic*)
+- PreservedMeshEditWriter in meshGridTools.py if present
+- Important public functions: prepare_heatmap_reference_mesh, compute_mesh_to_reference_surface_distances, load_mesh_elastic_reference_surface (only if used by UI features)
+
+Skip private _helpers.
+Category: Mesh Tools.
+Then --seed + check_docs.py OK.
+
+================================================================================
+BATCH 6 — Segmentation, edges, resample
+================================================================================
+
+Populate:
+- segmentationTools.py: GetAIModelsView, RunAISegmentationView, ai_segmentation, medsam2_segmentation
+- edgeTools.py: EdgeDetectionView, EdgeDetectionSlicePreviewView
+- resampleAnisotropicVoxels.py: DeformationBasedMRIInterpolator (+ main public interpolate method)
+
+Category: Segmentation & Edges (and a small Resampling subcategory if needed).
+Then --seed + check_docs.py OK.
+
+================================================================================
+BATCH 7 — Project / scan I/O (curated views.py)
+================================================================================
+
+Do NOT document every helper in views.py. Document only these user-facing APIViews (verify names still exist):
+ExtractScansView, ExtractScansPreflightView, ExtractJsonView, DisplayNiftiView,
+NiftiHeaderInfoView, MarchingCubesView, GetGridView, ProjectionPngView,
+EnsureQuickGridProjectionPngsView, ListDirectoriesView, CreateFolderView,
+FileUploadView, FileCopyView, QuickAccessPathsView, FlagSubjectsView, ReportBadFileView
+
+Also include any clearly user-facing atlas/export views if they live in views.py and are registered in urls.py (CreateAtlas, TransferLandmarks, ExportLandmarks*, GetLandmarks, etc.) — check AuroraClient/urls.py and add those that are real product features.
+
+Category: Project & Scan I/O (subcategories: Filesystem, Display/Mesh, Landmarks export, Atlas).
+Then --seed + check_docs.py OK.
+
+================================================================================
+BATCH 8 — Final pass / cross-links
+================================================================================
+
+1. Run: python3 Aurora/AuroraClient/pipeline/documentation/check_docs.py
+2. Fix any ERROR/stale entries.
+3. Walk docs_index.json and wire sensible related[] links across categories (e.g. denoise ↔ restore, ALPACA ↔ AlignToReference, mask apply ↔ threshold).
+4. Ensure every entry has at least one images[] placeholder with path:null where a screenshot would help.
+5. Confirm the Documentation panel loads /docs/index/ with all new categories.
+
+================================================================================
+ONE-SHOT MEGA PROMPT (only if your agent has huge context)
+================================================================================
+
+If you prefer a single paste (risky / may truncate), use:
+
+---
+Populate the FULL remaining Aurora image-processing backend into
+Aurora/AuroraClient/pipeline/documentation/docs_index.json using Scenario 2 in WORKFLOW.md
+and the SHARED RULES above. Cover Batches 1–7 completely, skip documentation* modules
+and private helpers, keep the existing ALPACA sample intact, then run
+python3 Aurora/AuroraClient/pipeline/documentation/check_docs.py --seed
+and fix until check_docs.py prints OK. Finish with Batch 8 cross-links.
+---

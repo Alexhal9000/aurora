@@ -1,0 +1,1497 @@
+{
+  "categories": [
+    {
+      "id": "project-scan-io",
+      "title": "Project & Scan I/O",
+      "subcategories": [
+        {
+          "id": "file-browser",
+          "title": "File Browser & Upload",
+          "methods": [
+            {
+              "id": "list-directories",
+              "title": "List Directories",
+              "keywords": ["file browser", "directory listing", "filesystem", "browse", "extracted"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ListDirectoriesView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Lists child directories and files at a filesystem path for Aurora's project file browser. Expands tilde to the user home directory, supports a special root alias, and returns absolute path plus parallel file size arrays. When browsing inside an extracted folder, it flattens one level into subject subfolders so the UI can show scan contents without extra navigation.",
+              "options": [
+                {
+                  "name": "path",
+                  "type": "string",
+                  "default": "~",
+                  "description": "URL-encoded directory path to list; use root for filesystem root."
+                }
+              ],
+              "algorithm": {
+                "text": "Expand and normalize the requested path, verify it is a directory, then enumerate non-hidden entries. Inside extracted/, list each subject folder's immediate children instead of top-level extracted entries. Return directories, files, sizes, absolute path, and missing flag when the path does not exist.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[GET path param] --> B[Expand ~ / root]\n  B --> C{Path is directory?}\n  C -->|no| D[Return missing=true]\n  C -->|yes| E{basename == extracted?}\n  E -->|yes| F[List each subject subfolder contents]\n  E -->|no| G[List immediate children]\n  F --> H[Return dirs, files, sizes, path]\n  G --> H"
+              },
+              "related": ["quick-access-paths", "create-folder"],
+              "video": null,
+              "images": [{"caption": "File browser listing project and extracted scan folders.", "path": null}]
+            },
+            {
+              "id": "quick-access-paths",
+              "title": "Quick Access Paths",
+              "keywords": ["file browser", "shortcuts", "home", "desktop", "drives", "OS paths"],
+              "source": {
+                "file": "views.py",
+                "symbol": "QuickAccessPathsView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Returns OS-specific shortcut paths for the file browser: home, desktop, documents, downloads, and mount or drive roots. On Windows it enumerates drive letters; on Linux and macOS it adds common mount points such as /media, /mnt, /Volumes, and /run/media/<user> when present.",
+              "options": [],
+              "algorithm": {
+                "text": "Detect platform with platform.system(), build standard user folders from Path.home(), then append drive letters on Windows or known mount directories on Linux and macOS. Fail gracefully and still return home paths if enumeration errors occur.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[Detect OS] --> B[Add home/desktop/documents/downloads]\n  B --> C{OS type?}\n  C -->|Windows| D[psutil.disk_partitions drive letters]\n  C -->|Darwin| E[/Volumes, /mnt if exist]\n  C -->|Linux| F[/media, /mnt, /run/media/user]\n  D --> G[Return quick_paths JSON]\n  E --> G\n  F --> G"
+              },
+              "related": ["list-directories"],
+              "video": null,
+              "images": [{"caption": "Quick-access sidebar shortcuts in the file browser.", "path": null}]
+            },
+            {
+              "id": "create-folder",
+              "title": "Create Folder",
+              "keywords": ["mkdir", "file browser", "project folder", "directory create"],
+              "source": {
+                "file": "views.py",
+                "symbol": "CreateFolderView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Creates a new subdirectory under a chosen parent path from the file browser. Used when setting up project folders or organizing raw scan data before extraction.",
+              "options": [
+                {
+                  "name": "path",
+                  "type": "string",
+                  "default": null,
+                  "description": "Parent directory where the new folder will be created."
+                },
+                {
+                  "name": "folderName",
+                  "type": "string",
+                  "default": null,
+                  "description": "Name of the new folder to create inside path."
+                }
+              ],
+              "algorithm": {
+                "text": "Join path and folderName, call os.makedirs on the result, and return success or the filesystem error.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[path + folderName] --> B[os.makedirs]\n  B --> C{Success?}\n  C -->|yes| D[Return success message]\n  C -->|no| E[Return error]"
+              },
+              "related": ["list-directories", "upload"],
+              "video": null,
+              "images": [{"caption": "Creating a project folder from the file browser.", "path": null}]
+            },
+            {
+              "id": "upload",
+              "title": "Upload File",
+              "keywords": ["multipart upload", "file transfer", "import", "target folder"],
+              "source": {
+                "file": "views.py",
+                "symbol": "FileUploadView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Uploads a single file via multipart form data into a target folder on the Aurora server filesystem. Streams chunks to disk to support large scan archives or mesh files imported through the UI.",
+              "options": [
+                {
+                  "name": "file",
+                  "type": "file (multipart)",
+                  "default": null,
+                  "description": "Binary file payload in request.FILES."
+                },
+                {
+                  "name": "target_folder",
+                  "type": "string",
+                  "default": ".",
+                  "description": "Destination directory on the server where the uploaded file is saved."
+                }
+              ],
+              "algorithm": {
+                "text": "Read the uploaded file from multipart request.FILES, join target_folder with the original filename, and write chunked bytes to disk.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[Multipart POST] --> B[Read file chunks]\n  B --> C[Write to target_folder/file.name]\n  C --> D[Return success]"
+              },
+              "related": ["copy-folder", "list-directories"],
+              "video": null,
+              "images": [{"caption": "Uploading scan data into a project directory.", "path": null}]
+            },
+            {
+              "id": "copy-folder",
+              "title": "Copy Folder",
+              "keywords": ["copytree", "duplicate project", "folder copy", "import"],
+              "source": {
+                "file": "views.py",
+                "symbol": "FileCopyView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Recursively copies one or more source directories into a target folder. Resolves relative source paths under the user home directory when needed, then copies each folder tree preserving the basename.",
+              "options": [
+                {
+                  "name": "source_paths",
+                  "type": "string[]",
+                  "default": null,
+                  "description": "Relative or absolute folder paths to copy; resolved via home-directory glob search."
+                },
+                {
+                  "name": "target_folder",
+                  "type": "string",
+                  "default": null,
+                  "description": "Destination parent directory receiving copied folder trees."
+                }
+              ],
+              "algorithm": {
+                "text": "Resolve source_paths to absolute unique parent folders, then shutil.copytree each source into target_folder using its basename. Reject ambiguous or missing matches from path resolution.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[source_paths + target_folder] --> B[Resolve absolute paths]\n  B --> C{Valid list?}\n  C -->|no| D[400 error]\n  C -->|yes| E[copytree each source]\n  E --> F[Return success]"
+              },
+              "related": ["upload", "list-directories"],
+              "video": null,
+              "images": [{"caption": "Copying an existing project folder to a new location.", "path": null}]
+            }
+          ]
+        },
+        {
+          "id": "scan-extraction",
+          "title": "Scan Extraction",
+          "methods": [
+            {
+              "id": "extract-scans-preflight",
+              "title": "Extract Scans Preflight",
+              "keywords": ["preflight", "mesh scale", "extraction preview", "scale groups", "voxelize"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ExtractScansPreflightView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Analyzes pending scans before extraction, especially mesh imports, to detect scale mismatches and recommend grouping. Returns mesh centroid statistics, auto-derived scale groups, and counts of mesh versus volume scans that still need extraction. Use this before Extract Scans when importing PLY/OBJ/STL subjects of uncertain physical scale.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing raw scan files."
+                },
+                {
+                  "name": "scans",
+                  "type": "object[]",
+                  "default": null,
+                  "description": "Scan descriptors with at least name and subtype fields, same shape as extract-scans."
+                }
+              ],
+              "algorithm": {
+                "text": "Reuse ExtractScansView helpers to filter scans not yet fully extracted, split mesh and volume candidates, load mesh geometry summaries, cluster subjects by centroid size into scale groups, and return mesh_infos, scale_groups, subject_scale_groups, and has_scale_warning when multiple groups exist.",
+                "math": "scale group split when centroid_size > 1.5 × median(group)",
+                "diagram": "flowchart TD\n  A[scans list] --> B[Filter needs extraction]\n  B --> C[Split mesh vs volume]\n  C --> D[Load mesh summaries]\n  D --> E[Group by centroid size]\n  E --> F[Return scale warnings + counts]"
+              },
+              "related": ["extract-scans"],
+              "video": null,
+              "images": [{"caption": "Preflight scale-group warning before mesh extraction.", "path": null}]
+            },
+            {
+              "id": "extract-scans",
+              "title": "Extract Scans",
+              "keywords": ["import", "DICOM", "NIfTI", "MINC", "mesh", "voxelize", "segmentation", "lossy compression"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ExtractScansView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Imports raw scans from a project directory into extracted/<subject>/ as Aurora-ready NIfTI volumes or preserved PLY meshes. Supports DICOM folders, NIfTI, MINC, TIFF stacks, SCANCO AIM, and mesh formats (OBJ/PLY/STL/glTF/GLB). Creates full-resolution and lossy preview volumes, metadata JSON, optional segmentation masks, anisotropic resampling, and WebSocket progress updates. Skips already-extracted subjects, atlas entries, and standalone segmentation sidecars.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing raw scan files and folders."
+                },
+                {
+                  "name": "scans",
+                  "type": "object[]",
+                  "default": null,
+                  "description": "Each entry requires name (string) and subtype (string, e.g. DICOM, NIfTI (.nii.gz), PLY Mesh)."
+                },
+                {
+                  "name": "mesh_extraction_options",
+                  "type": "object",
+                  "default": "{}",
+                  "description": "Mesh import options: mode (keep|voxelize), skipped_subjects (string[]), subject_scale_factors ({name: factor}), subject_scale_groups ({name: group label})."
+                }
+              ],
+              "algorithm": {
+                "text": "Filter out fully extracted, segmentation-only, and atlas scans. For each remaining scan, load by subtype, standardize dtype, resample anisotropic volumes to isotropic voxels when needed, attach paired .seg masks if present, write <name>.nii.gz plus lossy preview, threshold metadata, scanner header fields, and projection PNGs. Mesh keep mode saves welded PLY with metadata only; voxelize mode fills a bounded voxel grid then follows the volume pipeline. Emit WebSocket progress per scan.",
+                "math": "voxel_size ≥ max(2·mean(centroid_size)/512, max(extent)/usable_dim); threshold stored in metadata JSON",
+                "diagram": "flowchart TD\n  A[scans + directory] --> B[Skip extracted/seg/atlas]\n  B --> C{For each scan}\n  C --> D{Subtype}\n  D -->|Volume| E[Load + resample + save NIfTI]\n  D -->|Mesh keep| F[Save PLY + metadata]\n  D -->|Mesh voxelize| G[Voxelize → volume path]\n  E --> H[Attach seg mask + lossy + JSON]\n  F --> I[Progress update]\n  G --> H\n  H --> I"
+              },
+              "related": ["extract-scans-preflight", "extract-json", "get-grid-view"],
+              "video": null,
+              "images": [{"caption": "Raw DICOM or mesh folder converted into extracted scan structure.", "path": null}]
+            },
+            {
+              "id": "extract-json",
+              "title": "Extract JSON Metadata",
+              "keywords": ["metadata", "edits list", "landmarks index", "scan json", "guidepoints"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ExtractJsonView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Loads a subject metadata JSON file and enriches it with live filesystem state: sorted edit filenames, mask edit filenames, landmark file list, legacy six-voxel outlier counts, and whether guidepoints exist for the latest edit. Strips ephemeral persisted edit lists from disk JSON when migrating legacy metadata.",
+              "options": [
+                {
+                  "name": "path",
+                  "type": "string",
+                  "default": null,
+                  "description": "Absolute path to a subject or atlas metadata JSON file."
+                }
+              ],
+              "algorithm": {
+                "text": "Read JSON, infer scan name, strip ephemeral edit lists from disk if present, enumerate edit and mask files from the subject folder, attach sorted edits/edits_masks/landmark_files, derive legacy outliers_six from distance files when missing, detect guidepoints on latest edit, and return the enriched metadata object.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[path to JSON] --> B[Load + strip ephemeral keys]\n  B --> C[List edits/masks/landmarks on disk]\n  C --> D[Derive legacy outlier counts]\n  D --> E[Check guidepoints]\n  E --> F[Return enriched JSON]"
+              },
+              "related": ["get-landmarks", "get-project-settings"],
+              "video": null,
+              "images": [{"caption": "Scan metadata panel populated from live edit files.", "path": null}]
+            }
+          ]
+        },
+        {
+          "id": "volume-display",
+          "title": "Volume Display & Previews",
+          "methods": [
+            {
+              "id": "display-nifti",
+              "title": "Display NIfTI",
+              "keywords": ["NIfTI download", "lossy volume", "full resolution", "slice viewer", "binary stream"],
+              "source": {
+                "file": "views.py",
+                "symbol": "DisplayNiftiView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Serves a scan or edit NIfTI file as a binary download for the frontend slice viewer. By default returns the requested lossy or full-res file on disk; when request_full_res is true, loads the lossless volume, reapplies stored lossy compression parameters, and streams a freshly compressed preview without downsampling resolution.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Base or lossy NIfTI filename for the subject."
+                },
+                {
+                  "name": "edit",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Specific edit filename; when set and containing edit, replaces filename."
+                },
+                {
+                  "name": "request_full_res",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, rebuild compressed preview from lossless NIfTI using metadata lossy_compression settings."
+                }
+              ],
+              "algorithm": {
+                "text": "Resolve subject path under extracted/ or atlas/, optionally swap to edit filename, then either stream the on-disk file or load lossless NIfTI, read scale_factor/zero_point_shift/resolution_factor from metadata, recompress in memory, and return FileResponse octet-stream attachment.",
+                "math": "lossy_value = (raw - zero_point_shift) / scale_factor",
+                "diagram": "flowchart TD\n  A[directory + filename + edit] --> B{request_full_res?}\n  B -->|no| C[Stream existing NIfTI file]\n  B -->|yes| D[Load lossless + metadata params]\n  D --> E[Recompress without shrink]\n  E --> F[Stream compressed bytes]"
+              },
+              "related": ["nifti-header-info", "marchingcubes"],
+              "video": null,
+              "images": [{"caption": "Slice viewer loading a lossy NIfTI edit stream.", "path": null}]
+            },
+            {
+              "id": "nifti-header-info",
+              "title": "NIfTI Header Info",
+              "keywords": ["dimensions", "voxel size", "pixDims", "header", "metadata"],
+              "source": {
+                "file": "views.py",
+                "symbol": "NiftiHeaderInfoView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Returns lightweight geometry metadata for a subject NIfTI without transferring voxel data: 3D dimensions and voxel spacing (pixDims). Used by the UI to size viewers and overlays before downloading full volumes.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "NIfTI filename; lossy suffix is stripped for full-res lookup."
+                },
+                {
+                  "name": "edit",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Optional edit filename override when it contains edit."
+                }
+              ],
+              "algorithm": {
+                "text": "Resolve full-resolution NIfTI path for subject or atlas, load header with nibabel, and return dims and pixDims as integer/float arrays.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[Resolve full-res path] --> B[nib.load header]\n  B --> C[Return dims + pixDims]"
+              },
+              "related": ["display-nifti", "get-grid-view"],
+              "video": null,
+              "images": [{"caption": "Header dimensions shown before volume download.", "path": null}]
+            },
+            {
+              "id": "get-grid-view",
+              "title": "Get Grid View Preview",
+              "keywords": ["grid preview", "thumbnail", "histogram", "quadrant render", "preserved mesh"],
+              "source": {
+                "file": "views.py",
+                "symbol": "GetGridView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Returns a base64 JPEG grid preview and intensity histogram for a subject or atlas, regenerating the thumbnail when the latest non-elastic edit or threshold changed. Voxel scans render four orthogonal/max-projection quadrants from the latest lossy edit; preserved PLY meshes render a mesh-specific preview JPEG.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "scan_name",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject folder name or atlas."
+                },
+                {
+                  "name": "ignoreElastic",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, ignore elastic edits when picking the latest edit for preview staleness checks."
+                }
+              ],
+              "algorithm": {
+                "text": "Compare preview.json last_edit, threshold, and timestamp against latest edit file. If current, read cached preview.jpg; otherwise load latest lossy NIfTI or preserved mesh PLY, render quadrant JPEG or mesh preview, update preview.json, compute histogram from metadata/threshold, and return base64 image plus histogram_data.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[scan_name + directory] --> B{Preview up to date?}\n  B -->|yes| C[Read preview.jpg]\n  B -->|no| D{Preserved mesh?}\n  D -->|yes| E[Render mesh preview]\n  D -->|no| F[Render lossy quadrant JPEG]\n  C --> G[Attach histogram]\n  E --> G\n  F --> G"
+              },
+              "related": ["projection-png", "ensure-quick-grid-projections", "extract-scans"],
+              "video": null,
+              "images": [{"caption": "Project grid showing regenerated scan thumbnails.", "path": null}]
+            },
+            {
+              "id": "projection-png",
+              "title": "Projection PNG",
+              "keywords": ["isometric projection", "Quick Grid", "preview PNG", "front back", "mesh projection"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ProjectionPngView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Serves a front or back isometric projection PNG for a specific scan edit. Searches standard projection filename patterns for NIfTI and PLY edits, including lossy variants, and falls back to mesh projection resolution helpers when needed.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory (query param)."
+                },
+                {
+                  "name": "scan_name",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject name or atlas (query param)."
+                },
+                {
+                  "name": "edit",
+                  "type": "string",
+                  "default": null,
+                  "description": "Edit filename stem including extension (query param)."
+                },
+                {
+                  "name": "side",
+                  "type": "string",
+                  "default": "front",
+                  "description": "Projection side: omit or front for _projection.png; back for _projection_back.png."
+                }
+              ],
+              "algorithm": {
+                "text": "Validate scan path stays under project directory, build candidate PNG paths from edit basename and lossy aliases, pick first existing PNG or resolve mesh projection path, then stream image/png FileResponse.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[directory + scan + edit + side] --> B[Build PNG candidate list]\n  B --> C{PNG exists?}\n  C -->|no| D[resolve_mesh_projection_path]\n  C -->|yes| E[Stream PNG]\n  D --> E"
+              },
+              "related": ["ensure-quick-grid-projections", "get-grid-view"],
+              "video": null,
+              "images": [{"caption": "Front and back isometric projection PNGs in Quick Grid.", "path": null}]
+            },
+            {
+              "id": "ensure-quick-grid-projections",
+              "title": "Ensure Quick Grid Projections",
+              "keywords": ["Quick Grid", "batch projection", "generate PNG", "non-elastic edit", "mesh projection"],
+              "source": {
+                "file": "views.py",
+                "symbol": "EnsureQuickGridProjectionPngsView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Batch-generates missing front/back projection PNG pairs for Quick Grid subjects. For each requested scan, resolves the latest non-elastic NIfTI or preserved PLY edit, generates isometric PNGs from lossy or full volume data when absent, or ensures mesh projection PNGs for PLY edits.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "subjects",
+                  "type": "object[]",
+                  "default": null,
+                  "description": "Each item: scan_name (required), edit (optional hint; latest non-elastic edit is resolved when omitted)."
+                }
+              ],
+              "algorithm": {
+                "text": "For each subject, resolve latest non-elastic edit via lossy edit, edit glob, original NIfTI, or projection PNG hints. If front/back PNG pair exists, mark ready; else generate from lossy/full NIfTI with uint8 normalization or call ensure_mesh_projection_pngs for PLY. Return per-subject ready, generated, and debug fields.",
+                "math": "uint8 = clip((I - min) × 255 / (max - min))",
+                "diagram": "flowchart TD\n  A[subjects list] --> B[Resolve latest non-elastic edit]\n  B --> C{Projection pair exists?}\n  C -->|yes| D[ready=true]\n  C -->|no| E{PLY or NIfTI?}\n  E -->|PLY| F[ensure_mesh_projection_pngs]\n  E -->|NIfTI| G[generate_lossy_isometric_projection_png]\n  F --> H[Append result]\n  G --> H\n  D --> H"
+              },
+              "related": ["projection-png", "get-grid-view"],
+              "video": null,
+              "images": [{"caption": "Quick Grid batch ensuring projection thumbnails exist.", "path": null}]
+            }
+          ]
+        },
+        {
+          "id": "mesh-generation",
+          "title": "Mesh Generation & Overlay",
+          "methods": [
+            {
+              "id": "marchingcubes",
+              "title": "Marching Cubes Mesh",
+              "keywords": ["marching cubes", "GLB", "Quick Mesh", "threshold", "heatmap", "preserved mesh", "shell mode"],
+              "source": {
+                "file": "views.py",
+                "symbol": "MarchingCubesView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Generates the interactive 3D mesh shown in Quick Mesh Canvas. Voxel scans run marching cubes on a lossy or full-res NIfTI at the project threshold (with optional Gaussian blur, shell mode, and label masks); preserved PLY scans load and decimate native mesh geometry. Returns base64 GLB plus center/scale_factor for BabylonJS display, optional base64-encoded per-vertex heatmap distances after elastic registration, and multi-label GLB when segmentations are present.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject folder name or atlas."
+                },
+                {
+                  "name": "edit",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Lossy edit filename, latest, explicit PLY edit, or null for base lossy/original volume."
+                },
+                {
+                  "name": "threshold",
+                  "type": "number|string",
+                  "default": "fromfile",
+                  "description": "Iso-surface level; fromfile reads metadata threshold mapped through lossy compression params."
+                },
+                {
+                  "name": "high_quality",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Use full voxel spacing instead of lossy resolution factor when computing mesh spacing."
+                },
+                {
+                  "name": "shell_mode",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Extract outer shell surface instead of full solid isosurface."
+                },
+                {
+                  "name": "full_resolution",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Load full-resolution NIfTI instead of lossy edit."
+                },
+                {
+                  "name": "calculate_dense_distances",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Compute per-vertex registration heatmap distances for elastic edits."
+                },
+                {
+                  "name": "gaussian_blur",
+                  "type": "number|null",
+                  "default": null,
+                  "description": "Gaussian sigma applied to volume before isosurface extraction."
+                },
+                {
+                  "name": "mask_label",
+                  "type": "number|null",
+                  "default": null,
+                  "description": "When set with use_label_mask, restrict mesh to voxels matching this label id."
+                },
+                {
+                  "name": "use_label_mask",
+                  "type": "boolean",
+                  "default": true,
+                  "description": "When true and mask_label set, use label mask instead of global threshold."
+                },
+                {
+                  "name": "heatmap_metric",
+                  "type": "string",
+                  "default": "surface_distance",
+                  "description": "Registration heatmap metric id; legacy elastic_metric alias accepted. Falls back when unsupported for mesh/voxel combo."
+                }
+              ],
+              "algorithm": {
+                "text": "Route PLY or preserved-mesh metadata to decimated GLB loader with optional reference-surface distances. Otherwise load NIfTI, swap axes for BabylonJS, map threshold through lossy params, reject degenerate foreground ratios, apply optional blur/mask/shell, run marching cubes at spacing = voxel_size × resolution_factor, decimate to vertex budget, center and scale vertices, encode GLB and optional float32 distance buffer as base64.",
+                "math": "surface at {v | I(v) ≥ τ}; spacing = voxel_size · r_lossy",
+                "diagram": "flowchart TD\n  A[POST mesh request] --> B{PLY / is_mesh?}\n  B -->|yes| C[Load/decimate preserved mesh GLB]\n  B -->|no| D[Load NIfTI + map threshold]\n  D --> E{Valid foreground ratio?}\n  E -->|no| F[400 threshold error]\n  E -->|yes| G[marching cubes + decimate]\n  G --> H[Center/scale + GLB base64]\n  C --> H\n  H --> I{calculate_dense_distances?}\n  I -->|yes| J[Encode heatmap distances]\n  I -->|no| K[Return payload]"
+              },
+              "related": ["physically-accurate-mesh", "get-all-subjects-mesh", "overwrite-threshold"],
+              "video": null,
+              "images": [{"caption": "Quick Mesh Canvas surface generated from thresholded volume.", "path": null}]
+            },
+            {
+              "id": "physically-accurate-mesh",
+              "title": "Physically Accurate Mesh Export",
+              "keywords": ["PLY export", "GLB export", "physical coordinates", "marching cubes", "download mesh"],
+              "source": {
+                "file": "views.py",
+                "symbol": "PhysicallyAccurateMeshView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Exports a subject mesh in physical millimeter coordinates for external tools. Voxel scans run full-resolution marching cubes at the stored threshold (optional Gaussian pre-blur), apply Aurora's X/Z axis convention, and write both GLB and ASCII PLY to the subject folder before streaming the PLY download. Preserved mesh subjects stream the native PLY edit directly without re-voxelization.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject folder name or atlas."
+                },
+                {
+                  "name": "edit",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Edit filename; lossy suffix stripped for full-res source."
+                },
+                {
+                  "name": "gaussian_blur",
+                  "type": "number",
+                  "default": 0.0,
+                  "description": "Gaussian sigma applied before marching cubes; clamped to 0–10."
+                }
+              ],
+              "algorithm": {
+                "text": "If preserved mesh metadata, resolve PLY edit path and stream binary PLY. Else load full-res NIfTI, optional gaussian_filter, marching_cubes at metadata threshold with physical spacing, swap X/Z axes and fix winding, save GLB and ASCII PLY beside subject, return PLY FileResponse attachment.",
+                "math": "vertices_phys = MC(I, level=τ, spacing=voxel_size)",
+                "diagram": "flowchart TD\n  A[directory + filename + edit] --> B{Preserved mesh?}\n  B -->|yes| C[Stream PLY edit]\n  B -->|no| D[Load full-res volume]\n  D --> E[Optional Gaussian blur]\n  E --> F[Marching cubes at threshold]\n  F --> G[Save GLB + PLY, stream PLY]"
+              },
+              "related": ["marchingcubes", "extract-scans"],
+              "video": null,
+              "images": [{"caption": "Exported PLY mesh in physical millimeter coordinates.", "path": null}]
+            },
+            {
+              "id": "get-all-subjects-mesh",
+              "title": "Get All Subjects Mesh Overlay",
+              "keywords": ["overlay", "crop mode", "combined mesh", "OR mask", "preserved PLY", "reference frame"],
+              "source": {
+                "file": "views.py",
+                "symbol": "GetAllSubjectsMeshView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Builds one combined GLB overlay of all non-faulty subjects aligned in the reference display frame for crop-mode show-all-scans. Voxel subjects contribute threshold masks resampled to a shared reference grid, unioned, largest-component filtered, and meshed with marching cubes; preserved PLY subjects load decimated native meshes in shared millimeters. Merges all parts, centers/scales like the reference Quick Mesh, and returns GLB plus overlay debug stats.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "reference",
+                  "type": "string",
+                  "default": null,
+                  "description": "Reference subject name defining the shared overlay coordinate frame."
+                },
+                {
+                  "name": "full_resolution",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, use full-resolution reference voxel context for mask resampling."
+                }
+              ],
+              "algorithm": {
+                "text": "List valid non-faulty extracted subjects, resolve reference anchor and voxel grid, for each voxel subject load mask in reference space and keep largest connected component, OR-combine masks and marching-cubes the union, for each PLY subject load shared-mm mesh and decimate to per-subject budget, merge meshes, apply reference center/scale, build GLB via MarchingCubesView helper.",
+                "math": "M_union = ∨_i M_i; surface = MC(M_union)",
+                "diagram": "flowchart TD\n  A[reference + directory] --> B[Split voxel vs PLY subjects]\n  B --> C[Voxel: resample masks → OR → MC]\n  B --> D[PLY: load shared-mm meshes]\n  C --> E[Merge + reference center/scale]\n  D --> E\n  E --> F[Return GLB + overlay_debug]"
+              },
+              "related": ["marchingcubes", "apply-crop"],
+              "video": null,
+              "images": [{"caption": "Combined subject overlay mesh in crop mode.", "path": null}]
+            }
+          ]
+        },
+        {
+          "id": "subject-qc",
+          "title": "Subject QC & Labels",
+          "methods": [
+            {
+              "id": "flag-subjects",
+              "title": "Flag Subjects",
+              "keywords": ["flag", "batch filter", "metadata", "subject QC", "exclude"],
+              "source": {
+                "file": "views.py",
+                "symbol": "FlagSubjectsView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Sets the metadata flag field on one or more extracted subjects. Flagged scans can be excluded or targeted by batch operations via flagFilter modes across preprocessing and registration endpoints.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filenames",
+                  "type": "string[]",
+                  "default": null,
+                  "description": "Subject folder names to update; a single string is coerced to a one-element list."
+                },
+                {
+                  "name": "flag",
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Flag value to persist in each subject JSON."
+                }
+              ],
+              "algorithm": {
+                "text": "For each filename, open extracted/<name>/<name>.json, set flag boolean, rewrite JSON, re-read to confirm persistence, and aggregate updated list with per-file errors.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[filenames + flag] --> B{For each subject}\n  B --> C[Load JSON]\n  C --> D[Write flag]\n  D --> E[Confirm read-back]\n  E --> F[Collect updated/errors]"
+              },
+              "related": ["report-bad-file", "extract-scans"],
+              "video": null,
+              "images": [{"caption": "Flagged subjects filtered in batch processing views.", "path": null}]
+            },
+            {
+              "id": "report-bad-file",
+              "title": "Report Bad File",
+              "keywords": ["faulty", "QC", "exclude scan", "metadata", "bad scan"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ReportBadFileView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Marks or clears the faulty boolean on a subject metadata JSON. Faulty scans are skipped by atlas creation, landmark export, overlay mesh generation, and many batch pipelines.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject folder name whose faulty status is updated."
+                },
+                {
+                  "name": "faulty",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "True marks scan faulty; false clears the faulty flag."
+                }
+              ],
+              "algorithm": {
+                "text": "Load extracted/<filename>/<filename>.json, coerce faulty to boolean, write JSON back, return success.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[directory + filename + faulty] --> B[Load subject JSON]\n  B --> C[Set faulty bool]\n  C --> D[Save JSON]"
+              },
+              "related": ["flag-subjects", "clear-intermediate-files"],
+              "video": null,
+              "images": [{"caption": "Marking a corrupted scan as faulty to exclude it from analysis.", "path": null}]
+            },
+            {
+              "id": "overwrite-threshold",
+              "title": "Overwrite Threshold",
+              "keywords": ["threshold", "metadata", "iso-surface", "segmentation level"],
+              "source": {
+                "file": "views.py",
+                "symbol": "OverwriteThresholdView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Directly overwrites the stored segmentation threshold in subject or atlas metadata JSON without creating a new edit. Used when adjusting the iso-surface level that marching cubes and previews read from metadata.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject name or atlas."
+                },
+                {
+                  "name": "threshold",
+                  "type": "number",
+                  "default": null,
+                  "description": "New threshold value stored as integer in metadata JSON."
+                }
+              ],
+              "algorithm": {
+                "text": "Open subject or atlas JSON, assign threshold = int(threshold), save file, return 200 OK.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[filename + threshold] --> B[Load JSON metadata]\n  B --> C[threshold ← int(value)]\n  C --> D[Save JSON]"
+              },
+              "related": ["marchingcubes", "get-grid-view"],
+              "video": null,
+              "images": [{"caption": "Updated threshold affecting mesh and preview regeneration.", "path": null}]
+            },
+            {
+              "id": "get-label-names",
+              "title": "Get Label Names",
+              "keywords": ["segmentation labels", "project settings", "custom names", "mask labels"],
+              "source": {
+                "file": "views.py",
+                "symbol": "GetLabelNamesView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Returns the project-wide map of segmentation label IDs to custom display names stored in extracted/project_settings.json. Shared by every subject in the project for consistent multi-label UI naming.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                }
+              ],
+              "algorithm": {
+                "text": "Call load_project_label_names(directory) and return {label_names: {...}}, defaulting to empty object on error.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[directory] --> B[Read project_settings.json label map]\n  B --> C[Return label_names]"
+              },
+              "related": ["save-label-names", "marchingcubes"],
+              "video": null,
+              "images": [{"caption": "Custom label names applied across segmentation masks.", "path": null}]
+            },
+            {
+              "id": "save-label-names",
+              "title": "Save Label Name",
+              "keywords": ["segmentation labels", "rename label", "project settings", "mask labels"],
+              "source": {
+                "file": "views.py",
+                "symbol": "SaveLabelNamesView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Creates, updates, or removes a custom display name for one segmentation label ID project-wide. Blank names remove the custom mapping so the UI falls back to default Label <n> text.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "label",
+                  "type": "number|string",
+                  "default": null,
+                  "description": "Segmentation label id to rename."
+                },
+                {
+                  "name": "name",
+                  "type": "string",
+                  "default": "",
+                  "description": "Custom display name; empty string removes the custom mapping."
+                }
+              ],
+              "algorithm": {
+                "text": "Validate label present, call save_project_label_name(directory, label, name) to merge into project_settings.json, return updated label_names map.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[label + name] --> B[Merge into project_settings.json]\n  B --> C[Return full label_names map]"
+              },
+              "related": ["get-label-names"],
+              "video": null,
+              "images": [{"caption": "Renaming a multi-label segmentation class project-wide.", "path": null}]
+            }
+          ]
+        },
+        {
+          "id": "geometric-edits",
+          "title": "Geometric Edits",
+          "methods": [
+            {
+              "id": "apply-rotation",
+              "title": "Apply Rotation",
+              "keywords": ["rotate", "3D rotation", "affine", "batch rotate", "reorientation"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ApplyRotationView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Applies a 3D rotation from the Quick Mesh Canvas to a subject NIfTI edit or to all scans in a project. Converts the BabylonJS rotation matrix to scipy affine_transform coordinates, rotates around the mesh center stored in metadata, uses tight bounding-box sizing to limit memory, saves a new *_edit_* rotated volume plus lossy copy, and propagates masks and landmarks.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject name for single-scan rotation; reference context when all is true."
+                },
+                {
+                  "name": "edit",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Source edit filename; null uses base <filename>.nii.gz."
+                },
+                {
+                  "name": "rotation",
+                  "type": "object",
+                  "default": null,
+                  "description": "BabylonJS rotation payload with _m indexed matrix entries remapped to 3×3 numpy rotation."
+                },
+                {
+                  "name": "interpolation",
+                  "type": "string",
+                  "default": "linear",
+                  "description": "nearest (order 0) or linear (order 1) interpolation during affine resampling."
+                },
+                {
+                  "name": "all",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, apply the same rotation to all eligible scans via rotate_all_scans."
+                }
+              ],
+              "algorithm": {
+                "text": "Build rotation_matrix from rotation._m, load full-res NIfTI and metadata center converted to voxel ZYX, estimate background, compute minimal rotated bounding box, affine_transform volume about center with chosen interpolation, save new edit and lossy companion, copy/transform paired masks and landmarks.",
+                "math": "v' = R · (v - c) + c + offset; scipy affine_transform with R^T",
+                "diagram": "flowchart TD\n  A[rotation matrix + edit] --> B{all scans?}\n  B -->|yes| C[rotate_all_scans]\n  B -->|no| D[Load volume + mesh center]\n  D --> E[Compute tight rotated bbox]\n  E --> F[affine_transform]\n  F --> G[Save edit + lossy + propagate masks/LM]"
+              },
+              "related": ["apply-crop", "marchingcubes"],
+              "video": null,
+              "images": [{"caption": "Reorienting a scan using Quick Mesh rotation controls.", "path": null}]
+            },
+            {
+              "id": "apply-crop",
+              "title": "Apply Crop",
+              "keywords": ["crop", "bounding box", "padding", "edit", "mask propagation", "landmarks"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ApplyCropView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Crops a subject volume to a 3D bounding box from the UI, adds configurable padding filled with the estimated background value, and saves a new *_edit_*_cropped NIfTI plus matching lossy edit. Propagates paired masks and landmarks with identical crop/pad geometry, filtering landmarks outside the crop.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject folder name."
+                },
+                {
+                  "name": "edit",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Source edit filename; null uses base full-res NIfTI."
+                },
+                {
+                  "name": "crop",
+                  "type": "number[6]",
+                  "default": null,
+                  "description": "Axis-aligned bounds [x_min, y_min, z_min, x_max, y_max, z_max] in voxel order mapped to ZYX slices with ±2 voxel margin."
+                },
+                {
+                  "name": "padding",
+                  "type": "number",
+                  "default": 40,
+                  "description": "Voxels of background padding added on every face after cropping."
+                }
+              ],
+              "algorithm": {
+                "text": "Load full-res NIfTI (strip _lossy from edit), map crop box to ZYX indices with small margin, slice volume, pad with background_value, save cropped edit and lossy derivative, mirror crop/pad on .nii.mask.gz if present with downsampled lossy mask, transform landmarks and filter distance arrays to kept indices.",
+                "math": "V_crop = pad(V[z_min:z_max, y_min:y_max, x_min:x_max], padding, background)",
+                "diagram": "flowchart TD\n  A[crop box + edit] --> B[Load full-res volume]\n  B --> C[Slice ZYX with margin]\n  C --> D[Pad with background]\n  D --> E[Save cropped edit + lossy]\n  E --> F[Propagate mask + landmarks]"
+              },
+              "related": ["apply-rotation", "get-all-subjects-mesh"],
+              "video": null,
+              "images": [{"caption": "Cropped volume with padding preserving context around specimen.", "path": null}]
+            }
+          ]
+        },
+        {
+          "id": "project-settings",
+          "title": "Project Settings & Cleanup",
+          "methods": [
+            {
+              "id": "get-project-settings",
+              "title": "Get Project Settings",
+              "keywords": ["project settings", "selected reference", "general settings", "configuration"],
+              "source": {
+                "file": "views.py",
+                "symbol": "GetProjectSettingsView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Reads extracted/project_settings.json and returns the selected reference subject name plus general_settings object. Returns empty defaults when the file is missing or unreadable.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                }
+              ],
+              "algorithm": {
+                "text": "Open extracted/project_settings.json if present, parse selected_reference and general_settings, else return empty strings/objects.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[directory] --> B{project_settings.json exists?}\n  B -->|yes| C[Parse settings]\n  B -->|no| D[Empty defaults]\n  C --> E[Return selected_reference + general_settings]\n  D --> E"
+              },
+              "related": ["save-project-settings", "make-atlas-reference"],
+              "video": null,
+              "images": [{"caption": "Project settings panel showing selected reference scan.", "path": null}]
+            },
+            {
+              "id": "save-project-settings",
+              "title": "Save Project Settings",
+              "keywords": ["project settings", "selected reference", "general settings", "persist"],
+              "source": {
+                "file": "views.py",
+                "symbol": "SaveProjectSettingsView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Creates or updates extracted/project_settings.json with the chosen reference subject and general_settings blob used across the Aurora UI.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "selected_reference",
+                  "type": "string",
+                  "default": "",
+                  "description": "Subject name designated as the project reference scan."
+                },
+                {
+                  "name": "general_settings",
+                  "type": "object",
+                  "default": "{}",
+                  "description": "Arbitrary project-wide UI and processing preferences object."
+                }
+              ],
+              "algorithm": {
+                "text": "Merge selected_reference and general_settings into existing project_settings.json or create new file under extracted/, write indented JSON, return success message.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[settings payload] --> B[Load or init project_settings.json]\n  B --> C[Merge fields]\n  C --> D[Write JSON]"
+              },
+              "related": ["get-project-settings"],
+              "video": null,
+              "images": [{"caption": "Saving reference scan selection to project settings.", "path": null}]
+            },
+            {
+              "id": "make-atlas-reference",
+              "title": "Make Atlas Reference",
+              "keywords": ["atlas reference", "ReferenceAtlas", "promote atlas", "selected reference"],
+              "source": {
+                "file": "views.py",
+                "symbol": "MakeAtlasReferenceView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Promotes the population atlas into a normal extracted reference subject (ReferenceAtlas): moves atlas/ or legacy extracted/atlas/ into extracted/ReferenceAtlas/, renames atlas-prefixed files, updates project_settings selected_reference, and removes obsolete average-only files. Idempotent when already promoted.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing atlas output and extracted/ folder."
+                }
+              ],
+              "algorithm": {
+                "text": "If already promoted, refresh settings via finalize_promoted_reference_atlas. Else locate atlas source folder, shutil.move to extracted/ReferenceAtlas, rename files from atlas* to ReferenceAtlas*, set selected_reference in project_settings.json, return paths and cleanup summary.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[directory] --> B{Already promoted?}\n  B -->|yes| C[Refresh settings]\n  B -->|no| D[Move atlas → extracted/ReferenceAtlas]\n  D --> E[Rename files + update settings]\n  C --> F[Return subject_path + selected_reference]\n  E --> F"
+              },
+              "related": ["create-atlas", "get-project-settings"],
+              "video": null,
+              "images": [{"caption": "Population atlas promoted to ReferenceAtlas subject.", "path": null}]
+            },
+            {
+              "id": "clear-intermediate-files",
+              "title": "Clear Intermediate Files",
+              "keywords": ["cleanup", "storage", "elastic lock-in", "faulty delete", "intermediate edits"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ClearIntermediateFilesView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Irreversibly cleans completed projects to save disk space. Deletes faulty subjects from extracted/ and moves their raw counterparts into directory/faulty/. For subjects with completed elastic registration, keeps only the elastic edit and the immediately prior edit plus originals, deletes other intermediate edits, and trims lossy_compression metadata to the last two entries. Emits WebSocket progress per subject.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing extracted/ subjects."
+                }
+              ],
+              "algorithm": {
+                "text": "Iterate extracted subjects, delete entire folder when faulty (track raw names for faulty/ relocation), else find latest elastic edit number, retain elastic and edit N-1 files plus originals, delete other edits and auxiliary files, prune lossy_compression list, update JSON, report space freed.",
+                "math": "keep edits ∈ {E_elastic, E_elastic - 1} ∪ originals",
+                "diagram": "flowchart TD\n  A[directory] --> B[For each extracted subject]\n  B --> C{faulty?}\n  C -->|yes| D[Delete folder + queue raw move]\n  C -->|no| E{Has elastic edit?}\n  E -->|no| F[Skip]\n  E -->|yes| G[Delete intermediate edits]\n  G --> H[Trim lossy_compression metadata]\n  D --> I[Progress + summary]\n  F --> I\n  H --> I"
+              },
+              "related": ["report-bad-file", "create-atlas"],
+              "video": null,
+              "images": [{"caption": "Storage cleanup retaining final elastic registration results.", "path": null}]
+            }
+          ]
+        },
+        {
+          "id": "atlas",
+          "title": "Atlas Creation",
+          "methods": [
+            {
+              "id": "create-atlas",
+              "title": "Create Atlas",
+              "keywords": ["atlas", "population average", "elastic registration", "inverse transform", "ANTs"],
+              "source": {
+                "file": "views.py",
+                "symbol": "CreateAtlasView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Builds a population atlas in directory/atlas/ from elastically registered subjects. Averages transformed intensities and forward deformation fields across non-faulty movers, inverts the mean forward field with ANTs to map reference space back to average space, warps the mean intensity into atlas space, and writes atlas NIfTI, transforms, previews, and metadata. Requires every non-reference subject's latest edit to be an elastic registration.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory with extracted/ subjects."
+                },
+                {
+                  "name": "reference",
+                  "type": "string",
+                  "default": null,
+                  "description": "Reference subject name whose space defines the atlas construction frame."
+                }
+              ],
+              "algorithm": {
+                "text": "Validate reference latest edit, skip faulty subjects, require latest elastic.nii.gz and elastic_fwd.nii.gz for each mover, accumulate average intensity and average forward deformation with ANTs images, invert mean forward field, apply inverse warp to mean intensity, save atlas/ outputs and metadata, stream WebSocket progress across subjects.",
+                "math": "I_atlas = warp(I_mean, inv(mean(F_fwd)))",
+                "diagram": "flowchart TD\n  A[reference + directory] --> B[Collect elastic edits + fwd fields]\n  B --> C[Average intensity + forward deformations]\n  C --> D[Invert mean forward field ANTs]\n  D --> E[Warp mean intensity to atlas space]\n  E --> F[Write atlas/ + metadata]"
+              },
+              "related": ["make-atlas-reference", "transfer-landmarks"],
+              "video": null,
+              "images": [{"caption": "Population atlas averaged from elastically aligned subjects.", "path": null}]
+            }
+          ]
+        },
+        {
+          "id": "landmarks-io",
+          "title": "Landmarks I/O",
+          "methods": [
+            {
+              "id": "get-landmarks",
+              "title": "Get Landmarks",
+              "keywords": ["landmarks", "distances", "edit landmarks", "atlas landmarks"],
+              "source": {
+                "file": "views.py",
+                "symbol": "GetLandmarksView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Loads landmark coordinates and optional distance arrays for a subject edit. Resolves the correct landmarks JSON stem from the edit name, normalizes list or dict on-disk formats into indexed landmarks with position and landmark_type, and returns paired distances or false when no distance file exists.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject name or atlas."
+                },
+                {
+                  "name": "edit",
+                  "type": "string",
+                  "default": null,
+                  "description": "Edit filename used to resolve <edit_stem>_landmarks.json."
+                }
+              ],
+              "algorithm": {
+                "text": "Resolve sub_path and landmark edit stem, load landmarks JSON or 422 if missing, convert list entries to indexed dict with landmark_type, load matching _landmark_distances.json when present, return {landmarks, distances}.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[filename + edit] --> B[Resolve landmarks path]\n  B --> C{File exists?}\n  C -->|no| D[422 not found]\n  C -->|yes| E[Normalize format]\n  E --> F[Load distances if any]\n  F --> G[Return payload]"
+              },
+              "related": ["upload-landmarks", "export-landmarks"],
+              "video": null,
+              "images": [{"caption": "Landmark overlay loaded for a specific subject edit.", "path": null}]
+            },
+            {
+              "id": "random-landmarking",
+              "title": "Random Landmarking",
+              "keywords": ["random landmarks", "Poisson disk", "FPS", "surface landmarks", "symmetry"],
+              "source": {
+                "file": "views.py",
+                "symbol": "RandomLandmarkingView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Automatically places a requested number of approximately evenly spaced landmarks on a subject surface. Voxel scans marching-cube the edit mesh; preserved meshes load PLY directly. Uses Poisson-disk sampling plus farthest-point refinement, optional symmetry mirroring on mesh projects, snaps landmarks to the surface, writes landmarks and distance JSON, and updates metadata landmark statistics.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject name or atlas."
+                },
+                {
+                  "name": "edit",
+                  "type": "string",
+                  "default": null,
+                  "description": "Lossy edit filename; _lossy suffix stripped to locate full-res source."
+                },
+                {
+                  "name": "num_landmarks",
+                  "type": "number",
+                  "default": null,
+                  "description": "Target count of landmarks to generate on the surface."
+                }
+              ],
+              "algorithm": {
+                "text": "Load mesh from preserved PLY or marching cubes on NIfTI edit, attempt symmetry-plane mirrored landmark warp on mesh projects else Poisson-disk oversample + farthest-point sample to num_landmarks, snap to surface, compute residual and snap distances, save _landmarks.json and _landmark_distances.json, write landmarks summary into subject metadata.",
+                "math": "FPS maximizes min pairwise distance among Poisson candidates",
+                "diagram": "flowchart TD\n  A[num_landmarks + edit] --> B[Build surface mesh]\n  B --> C{Symmetric mesh project?}\n  C -->|yes| D[Mirror-warp landmarks]\n  C -->|no| E[Poisson + FPS sample]\n  D --> F[Snap to mesh + save JSON]\n  E --> F"
+              },
+              "related": ["get-landmarks", "upload-landmarks"],
+              "video": null,
+              "images": [{"caption": "Automatically distributed landmarks on specimen surface.", "path": null}]
+            },
+            {
+              "id": "upload-landmarks",
+              "title": "Upload Landmarks",
+              "keywords": ["import landmarks", "validate", "fit", "snap to mesh", "coordinate mismatch"],
+              "source": {
+                "file": "views.py",
+                "symbol": "UploadLandmarksView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Imports external landmark coordinates for a subject edit with validate or fit actions. Validates mean mesh distance against a voxel-size tolerance, optionally runs RANSAC/mesh ICP fit with scaling and snap-to-mesh, then saves landmarks bundle JSON and updates metadata outlier statistics.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Subject name or atlas."
+                },
+                {
+                  "name": "edit",
+                  "type": "string",
+                  "default": null,
+                  "description": "Edit filename associated with the uploaded landmarks."
+                },
+                {
+                  "name": "landmarks",
+                  "type": "object",
+                  "default": null,
+                  "description": "Indexed landmark dict with position arrays (and optional landmark_type) from the client."
+                },
+                {
+                  "name": "action",
+                  "type": "string",
+                  "default": "validate",
+                  "description": "validate checks mesh alignment; fit aligns landmarks to current mesh before save."
+                },
+                {
+                  "name": "allow_scaling",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When action is fit, permit uniform scaling during landmark-to-mesh alignment."
+                },
+                {
+                  "name": "snap_to_mesh",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When action is fit, snap fitted landmarks onto the mesh surface."
+                },
+                {
+                  "name": "use_outer_shell",
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Prefer outer-shell mesh for fit when combined with snap_to_mesh."
+                }
+              ],
+              "algorithm": {
+                "text": "Load mesh for edit, convert landmarks dict to array, optional fit via landmark_upload_aligner with scaling/snap/outer shell, compute mesh distances and outlier counts, reject with 409/422 on mismatch thresholds, else _save_landmarks_bundle and return success.",
+                "math": "mismatch when mean_distance > k · voxel_size",
+                "diagram": "flowchart TD\n  A[landmarks + action] --> B[Load mesh + metadata]\n  B --> C{action == fit?}\n  C -->|yes| D[ICP/RANSAC fit + optional snap]\n  C -->|no| E[Validate distances only]\n  D --> F{Within tolerance?}\n  E --> F\n  F -->|no| G[409/422 mismatch]\n  F -->|yes| H[Save landmarks bundle]"
+              },
+              "related": ["get-landmarks", "transfer-landmarks"],
+              "video": null,
+              "images": [{"caption": "Importing external landmark file with validation against current mesh.", "path": null}]
+            },
+            {
+              "id": "transfer-landmarks",
+              "title": "Transfer Landmarks",
+              "keywords": ["landmark transfer", "atlas to subjects", "deformation field", "propagation", "snap"],
+              "source": {
+                "file": "views.py",
+                "symbol": "TransferLandmarksView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Propagates landmarks between atlas, reference, and subject spaces using elastic or rigid transforms. Supports transferType modes atlas-to-subjects, reference-to-subjects, and reference-to-atlas, warping landmark coordinates through displacement fields, optionally snapping to target meshes, respecting masks, and skipping or overwriting existing landmark files.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "reference",
+                  "type": "string",
+                  "default": null,
+                  "description": "Reference subject name driving transfer geometry."
+                },
+                {
+                  "name": "transferType",
+                  "type": "string",
+                  "default": null,
+                  "description": "Transfer mode: atlas-to-subjects, reference-to-subjects, or reference-to-atlas."
+                },
+                {
+                  "name": "autoSnapToMesh",
+                  "type": "boolean",
+                  "default": null,
+                  "description": "When true, snap transferred landmarks onto target subject mesh surfaces."
+                },
+                {
+                  "name": "prefer_mask",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Use segmentation mask geometry when resolving transfer targets."
+                },
+                {
+                  "name": "mask_label",
+                  "type": "number",
+                  "default": 1,
+                  "description": "Label id used when prefer_mask is true."
+                },
+                {
+                  "name": "overwriteExistingLandmarks",
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Replace existing subject landmark files when true; skip subjects that already have landmarks when false."
+                },
+                {
+                  "name": "use_outer_shell",
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Use outer-shell mesh extraction when snapping transferred landmarks."
+                }
+              ],
+              "algorithm": {
+                "text": "Branch on transferType to select source landmark file and target subject list, load atlas/reference transforms and displacement fields, displace each landmark through trilinear-interpolated vector fields (with shrink-factor handling for lossy fields), optionally snap to target mesh, write per-subject landmarks and distance JSON, update metadata, skip faulty scans.",
+                "math": "x' = x + u(x); u interpolated from 3×3×3 displacement neighborhood",
+                "diagram": "flowchart TD\n  A[transferType + reference] --> B[Select source landmarks + targets]\n  B --> C[Load deformation / alignment fields]\n  C --> D[Displace each landmark]\n  D --> E{autoSnapToMesh?}\n  E -->|yes| F[Snap to target surface]\n  E -->|no| G[Save landmarks JSON]\n  F --> G"
+              },
+              "related": ["create-atlas", "get-landmarks", "upload-landmarks"],
+              "video": null,
+              "images": [{"caption": "Atlas landmarks propagated to aligned subject scans.", "path": null}]
+            },
+            {
+              "id": "export-landmarks",
+              "title": "Export Landmarks CSV",
+              "keywords": ["export", "CSV", "landmark coordinates", "semilandmarks", "download"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ExportLandmarksView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Exports latest landmark coordinates for all non-faulty extracted subjects as a CSV download. Flattens main and semi landmarks into Subject plus landmark_N_x/y/z columns using semi_ prefix for semilandmarks.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                }
+              ],
+              "algorithm": {
+                "text": "Enumerate extracted subjects, skip faulty or missing metadata, pick most recently modified *_landmarks.json per scan, normalize list/dict formats to row dicts, build pandas DataFrame, write temp CSV, stream FileResponse attachment.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[directory] --> B[For each non-faulty subject]\n  B --> C[Load latest landmarks file]\n  C --> D[Build CSV row]\n  D --> E[Write temp CSV + download]"
+              },
+              "related": ["export-landmarks-bundle", "export-landmarks-json"],
+              "video": null,
+              "images": [{"caption": "CSV spreadsheet of landmark coordinates for all subjects.", "path": null}]
+            },
+            {
+              "id": "export-landmark-distances",
+              "title": "Export Landmark Distances",
+              "keywords": ["export", "ZIP", "surface distances", "snap distances", "QC"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ExportLandmarkDistancesView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Exports per-landmark mesh distance QC data as a ZIP containing surface-distance CSV and, when available, pre-snap distance CSV. Surface distances reflect landmark-to-mesh residuals; snap distances record how far landmarks moved during snapping.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                }
+              ],
+              "algorithm": {
+                "text": "For each non-faulty subject with landmarks, load paired _landmark_distances.json, extract distances and optional snap_distance arrays, build aligned CSV rows with semi_landmark naming, zip surface and snap CSVs into timestamped archive, return ZIP download.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[directory] --> B[Collect distance arrays per subject]\n  B --> C[Build surface CSV]\n  C --> D{snap_distance present?}\n  D -->|yes| E[Add snap CSV to ZIP]\n  D -->|no| F[ZIP surface CSV only]\n  E --> G[Download ZIP]\n  F --> G"
+              },
+              "related": ["export-landmarks-bundle", "get-landmarks"],
+              "video": null,
+              "images": [{"caption": "ZIP export of landmark surface and snap distance tables.", "path": null}]
+            },
+            {
+              "id": "export-landmarks-bundle",
+              "title": "Export Landmarks Bundle",
+              "keywords": ["export", "ZIP bundle", "coordinates", "distances", "single download"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ExportLandmarksBundleView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Single ZIP download combining landmark coordinate CSV plus surface-distance and optional snap-distance CSVs for all non-faulty subjects. Convenience wrapper merging Export Landmarks and Export Landmark Distances outputs.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                }
+              ],
+              "algorithm": {
+                "text": "Scan extracted subjects once, build coordinates_data, surface_data, and snap_data tables with shared semi_landmark column naming, require at least coordinates, write three CSVs into timestamped ZIP under .temp/, stream ZIP FileResponse.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[directory] --> B[Single pass collect coords + distances]\n  B --> C[Write landmarks.csv]\n  C --> D[Add surface distances CSV]\n  D --> E{snap data?}\n  E -->|yes| F[Add snap CSV]\n  E -->|no| G[Finalize ZIP]\n  F --> G"
+              },
+              "related": ["export-landmarks", "export-landmark-distances"],
+              "video": null,
+              "images": [{"caption": "One-click ZIP bundle with coordinates and QC distance tables.", "path": null}]
+            },
+            {
+              "id": "export-landmarks-json",
+              "title": "Export Landmarks JSON",
+              "keywords": ["export", "JSON", "landmark coordinates", "semilandmarks", "download"],
+              "source": {
+                "file": "views.py",
+                "symbol": "ExportLandmarksJsonView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Exports all subject landmark coordinates as one nested JSON file keyed by scan name with landmark_N and semi_landmark_N arrays in millimeters. Skips faulty scans and uses the most recently modified landmarks file per subject.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory."
+                }
+              ],
+              "algorithm": {
+                "text": "Iterate non-faulty extracted subjects, load latest landmarks JSON, map list entries to landmark_i or semi_landmark_i keys by landmark_type, assemble nested dict, write temp JSON, return FileResponse download.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[directory] --> B[For each subject]\n  B --> C[Latest landmarks file]\n  C --> D[Map to landmark_i / semi_landmark_i]\n  D --> E[Write nested JSON download]"
+              },
+              "related": ["export-landmarks", "upload-landmarks"],
+              "video": null,
+              "images": [{"caption": "JSON export structured by subject and landmark index.", "path": null}]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

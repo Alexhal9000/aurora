@@ -1,0 +1,619 @@
+{
+  "categories": [
+    {
+      "id": "segmentation-edges",
+      "title": "Segmentation & Edges",
+      "subcategories": [
+        {
+          "id": "ai-segmentation",
+          "title": "AI Segmentation",
+          "methods": [
+            {
+              "id": "get-ai-models",
+              "title": "Get AI Models",
+              "keywords": [
+                "segmentation",
+                "ai",
+                "medsam2",
+                "models",
+                "list"
+              ],
+              "source": {
+                "file": "segmentationTools.py",
+                "symbol": "GetAIModelsView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Returns the list of AI segmentation models available in the Aurora pipeline. Call this before RunAISegmentationView so the UI can populate a model picker. Currently returns a hardcoded list containing MedSAM2.",
+              "options": [],
+              "algorithm": {
+                "text": "GET handler with no request parameters. Returns a JSON object with models (string array) and count (integer). On failure returns HTTP 500 with an error message.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[GET / GetAIModelsView] --> B[Build available_models list]\n  B --> C[Return models + count]"
+              },
+              "related": [
+                "run-ai-segmentation",
+                "ai-segmentation",
+                "medsam2-segmentation"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "AI model picker populated from the models list",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "run-ai-segmentation",
+              "title": "Run AI Segmentation",
+              "keywords": [
+                "segmentation",
+                "ai",
+                "medsam2",
+                "mask",
+                "label",
+                "nifti"
+              ],
+              "source": {
+                "file": "segmentationTools.py",
+                "symbol": "RunAISegmentationView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Runs AI-assisted segmentation on a subject scan and merges the result into the existing mask at a chosen label. Loads the full-resolution NIfTI image and mask from the extracted subject folder (or atlas), dispatches to ai_segmentation, then saves both full- and lossy-resolution masks. Use when a user has seeded a rough label region and wants MedSAM2 to refine or expand it.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory containing extracted/ or atlas/ folders."
+                },
+                {
+                  "name": "subject",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Subject folder name or 'atlas' for atlas data."
+                },
+                {
+                  "name": "edit",
+                  "type": "str | null",
+                  "default": "null",
+                  "description": "Edit filename (e.g. scan_lossy.nii.gz). When null, uses the raw subject image as base."
+                },
+                {
+                  "name": "model",
+                  "type": "str",
+                  "default": "required",
+                  "description": "AI model name to run (currently only 'MedSAM2' is supported)."
+                },
+                {
+                  "name": "current_label",
+                  "type": "int",
+                  "default": "required",
+                  "description": "Label number (1–255) to segment and write into the mask. 0 is reserved for background."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Validate required POST fields and coerce current_label to int in range 1–255. 2) Resolve base_path (extracted/{subject} or atlas/). 3) Load {full_edit}.nii.gz image and existing or empty {full_edit}.nii.mask.gz mask (via temporary _mask.nii.gz rename for nibabel). 4) Call ai_segmentation(image, mask, current_label, model). 5) Save merged mask at full resolution, then downscale to lossy resolution with scipy.ndimage.zoom (order=0). 6) Return message, segmentation_label, voxels_segmented, and model_used.",
+                "math": "Lossy mask scaling uses per-axis zoom factors z_i = target_shape_i / source_shape_i with nearest-neighbor (order=0) interpolation.",
+                "diagram": "flowchart TD\n  A[POST RunAISegmentationView] --> B[Validate params]\n  B --> C[Load image + mask NIfTI]\n  C --> D[ai_segmentation]\n  D --> E[Merge at current_label]\n  E --> F[Save full mask]\n  F --> G[Scale + save lossy mask]\n  G --> H[Return stats]"
+              },
+              "related": [
+                "get-ai-models",
+                "ai-segmentation",
+                "medsam2-segmentation"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Before/after mask refinement at a selected label using MedSAM2",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "ai-segmentation",
+              "title": "AI Segmentation Dispatcher",
+              "keywords": [
+                "segmentation",
+                "ai",
+                "medsam2",
+                "dispatch",
+                "mask"
+              ],
+              "source": {
+                "file": "segmentationTools.py",
+                "symbol": "ai_segmentation",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Internal dispatcher that routes AI segmentation requests to the correct model implementation. Currently supports MedSAM2 only; raises an exception for unsupported model names. Called by RunAISegmentationView after image and mask volumes are loaded.",
+              "options": [
+                {
+                  "name": "image_data_3d",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "3D medical image volume. Shape (width, height, depth) or (D, H, W); typically uint8 or float32."
+                },
+                {
+                  "name": "mask_data_3d",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "3D label mask volume, same shape as image. dtype uint8; 0 = background."
+                },
+                {
+                  "name": "target_label",
+                  "type": "int",
+                  "default": "required",
+                  "description": "Label number to segment (1–255)."
+                },
+                {
+                  "name": "model",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Model name. Supported: 'MedSAM2'."
+                }
+              ],
+              "algorithm": {
+                "text": "If model == 'MedSAM2', delegate to medsam2_segmentation. Otherwise raise Exception with 'Model {model} not supported'. Returns the merged 3D mask array.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[ai_segmentation] --> B{model == MedSAM2?}\n  B -->|yes| C[medsam2_segmentation]\n  B -->|no| D[Raise unsupported model error]\n  C --> E[Return result_mask]"
+              },
+              "related": [
+                "run-ai-segmentation",
+                "medsam2-segmentation",
+                "get-ai-models"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Model dispatch flow from API to MedSAM2 backend",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "medsam2-segmentation",
+              "title": "MedSAM2 Segmentation",
+              "keywords": [
+                "medsam2",
+                "segmentation",
+                "bounding box",
+                "ensemble",
+                "mask"
+              ],
+              "source": {
+                "file": "segmentationTools.py",
+                "symbol": "medsam2_segmentation",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Runs MedSAM2 on a 3D volume using the existing mask voxels at target_label to define a bounding box and binary reference mask. Segments within that region, keeps the largest connected component, uses a 3-view ensemble, then merges the result back into the mask at target_label only. Returns the original mask unchanged if no voxels carry the target label.",
+              "options": [
+                {
+                  "name": "image_data_3d",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "3D image volume, shape (D, H, W)."
+                },
+                {
+                  "name": "mask_data_3d",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "3D mask volume, shape (D, H, W), dtype uint8."
+                },
+                {
+                  "name": "target_label",
+                  "type": "int",
+                  "default": "required",
+                  "description": "Label whose voxels define the bounding box and reference region."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Find all voxels where mask == target_label; compute axis-aligned bounding box (d_min..d_max, h_min..h_max, w_min..w_max) in (z,y,x) order. 2) Build binary reference_mask (1 at target_label, 0 elsewhere). 3) Instantiate MedSAM2Segmenter(force_cpu=False). 4) Call segmenter.segment with bbox_min/bbox_max, reference mask, use_largest_cc=True, existing_mask_as_reference=True, ensemble=True. 5) Copy mask and set result_mask[segmentation_mask==1] = target_label.",
+                "math": "Bounding box: for label set L = {(d,h,w) | mask[d,h,w]=target_label}, bbox_min=(min d, min h, min w), bbox_max=(max d, max h, max w).",
+                "diagram": "flowchart TD\n  A[Find target_label voxels] --> B{Bbox empty?}\n  B -->|yes| C[Return mask copy]\n  B -->|no| D[Build reference binary mask]\n  D --> E[MedSAM2Segmenter.segment]\n  E --> F[Merge into result_mask at target_label]\n  F --> G[Return result_mask]"
+              },
+              "related": [
+                "ai-segmentation",
+                "run-ai-segmentation"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "MedSAM2 bounding box derived from seeded label voxels",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "edge-detection",
+          "title": "Edge Detection",
+          "methods": [
+            {
+              "id": "edge-detection-slice-preview",
+              "title": "Edge Detection Slice Preview",
+              "keywords": [
+                "edge",
+                "hysteresis",
+                "preview",
+                "patch",
+                "morphology"
+              ],
+              "source": {
+                "file": "edgeTools.py",
+                "symbol": "EdgeDetectionSlicePreviewView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Fast 2D slice preview of hysteresis edge detection on a 100³ patch centered at (x,y,z). Uses the same global volume min/max normalization as the full mesh pipeline so slider tuning matches the final result. Caches raw patch and v_min/v_max per scan/edit/position/resolution (max 3 entries).",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Subject filename or 'atlas'."
+                },
+                {
+                  "name": "edit",
+                  "type": "str",
+                  "default": "optional",
+                  "description": "Edit NIfTI filename; used to resolve volume path."
+                },
+                {
+                  "name": "full_resolution",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "Load full-resolution volume instead of lossy."
+                },
+                {
+                  "name": "x",
+                  "type": "float",
+                  "default": "0",
+                  "description": "Patch center X coordinate in volume indices."
+                },
+                {
+                  "name": "y",
+                  "type": "float",
+                  "default": "0",
+                  "description": "Patch center Y coordinate in volume indices."
+                },
+                {
+                  "name": "z",
+                  "type": "float",
+                  "default": "0",
+                  "description": "Patch center Z coordinate in volume indices."
+                },
+                {
+                  "name": "low",
+                  "type": "float",
+                  "default": "0.10",
+                  "description": "Hysteresis low threshold on normalized [0,1] intensities."
+                },
+                {
+                  "name": "high",
+                  "type": "float",
+                  "default": "0.30",
+                  "description": "Hysteresis high threshold on normalized [0,1] intensities."
+                },
+                {
+                  "name": "closing_radius",
+                  "type": "int",
+                  "default": "3",
+                  "description": "Radius (voxels) of the spherical structuring element for binary closing."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Load or cache 100³ patch and global v_min/v_max. 2) Normalize patch: (patch - v_min)/(v_max - v_min). 3) apply_hysteresis_threshold(low, high). 4) binary_closing with morphology.ball(closing_radius). 5) Return flat uint8 center-Z slices for raw, edges, closed, and filled stages plus patch/volume intensity stats.",
+                "math": "Normalization: \\hat{v} = (v - v_{min}) / (v_{max} - v_{min}). Hysteresis keeps pixels above high and connected to high through pixels above low.",
+                "diagram": "flowchart TD\n  A[POST slice preview] --> B[Load/cache 100³ patch]\n  B --> C[Global min-max normalize]\n  C --> D[Hysteresis threshold]\n  D --> E[Binary closing ball r]\n  E --> F[Return center-Z slices flat]"
+              },
+              "related": [
+                "edge-detection"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Side-by-side raw, edge, closed, and filled center slices from the preview patch",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "edge-detection",
+              "title": "Edge Detection",
+              "keywords": [
+                "edge",
+                "hysteresis",
+                "marching cubes",
+                "mesh",
+                "mask",
+                "morphology"
+              ],
+              "source": {
+                "file": "edgeTools.py",
+                "symbol": "EdgeDetectionView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Full-volume edge detection pipeline: hysteresis thresholding, morphological closing, optional largest-component filtering, then either preview GLB mesh via marching cubes or save the result as a segmentation mask label. When saving permanently from a lossy preview, morphological parameters are scaled up to full resolution. Supports preview-only mesh generation or mask export with force_new_label.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Subject filename or 'atlas'."
+                },
+                {
+                  "name": "edit",
+                  "type": "str",
+                  "default": "optional",
+                  "description": "Edit NIfTI filename."
+                },
+                {
+                  "name": "full_resolution",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "Use full-resolution volume for processing."
+                },
+                {
+                  "name": "preview_only",
+                  "type": "bool",
+                  "default": "true",
+                  "description": "When true with save_as_mask false, return GLB mesh preview only."
+                },
+                {
+                  "name": "force_new_label",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "When saving mask and one exists, allocate a new label instead of returning mask_already_exists."
+                },
+                {
+                  "name": "save_as_mask",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "Save binary result as segmentation mask instead of returning mesh."
+                },
+                {
+                  "name": "low",
+                  "type": "float",
+                  "default": "0.10",
+                  "description": "Hysteresis low threshold on normalized intensities."
+                },
+                {
+                  "name": "high",
+                  "type": "float",
+                  "default": "0.30",
+                  "description": "Hysteresis high threshold on normalized intensities."
+                },
+                {
+                  "name": "closing_radius",
+                  "type": "int",
+                  "default": "3",
+                  "description": "Binary closing ball radius in voxels."
+                },
+                {
+                  "name": "largest_component_mode",
+                  "type": "str",
+                  "default": "largest",
+                  "description": "Component filter: 'off', 'largest' (keep single largest CC), or 'above_min' (remove objects smaller than min_size)."
+                },
+                {
+                  "name": "min_size",
+                  "type": "int",
+                  "default": "1000",
+                  "description": "Minimum connected-component volume in voxels for debris removal."
+                },
+                {
+                  "name": "fill_mesh",
+                  "type": "bool",
+                  "default": "true",
+                  "description": "When true, march cubes on the closed/filled binary mask; when false, march cubes on raw hysteresis edges."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Load volume and metadata via _load_volume_and_meta. 2) If save_as_mask and not preview_only and not full_resolution, scale closing_radius by resolution_factor and min_size by resolution_factor³. 3) _run_pipeline: normalize, hysteresis, binary closing, optional largest-component or above_min filtering. 4a) Mask path: write .nii.mask.gz with new or merged label; mirror to companion resolution. 4b) Mesh path: swap axes for Babylon, marching_cubes(level=0.5), center and normalize verts, decimate if >250k vertices, return base64 GLB with scale_factor and center.",
+                "math": "Full-res scaling from lossy preview: r' = r \\cdot f,\\; s' = s \\cdot f^3 where f is resolution_factor from lossy_compression metadata.",
+                "diagram": "flowchart TD\n  A[POST EdgeDetectionView] --> B[Load volume + spacing]\n  B --> C[Scale params if lossy→full save]\n  C --> D[Hysteresis + closing + CC filter]\n  D --> E{save_as_mask?}\n  E -->|yes| F[Write mask label]\n  E -->|no| G[Marching cubes → GLB]\n  F --> H[Write companion resolution mask]\n  G --> I[Return gltf + scale + center]"
+              },
+              "related": [
+                "edge-detection-slice-preview"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Edge-detection mesh preview generated from hysteresis + morphological closing",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "resampling",
+          "title": "Resampling",
+          "methods": [
+            {
+              "id": "deformation-based-mri-interpolator",
+              "title": "Deformation-Based MRI Interpolator",
+              "keywords": [
+                "resample",
+                "anisotropic",
+                "isotropic",
+                "ants",
+                "deformation",
+                "mri"
+              ],
+              "source": {
+                "file": "resampleAnisotropicVoxels.py",
+                "symbol": "DeformationBasedMRIInterpolator",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Class that converts anisotropic MRI volumes to isotropic voxel spacing using bidirectional ANTs slice registration. Requires exactly one thick axis and two equal thin axes (within 1% tolerance). Used during scan extraction in views.py when anisotropy ratio exceeds 1.1. Default registration_type is SyNOnly for performance.",
+              "options": [
+                {
+                  "name": "registration_type",
+                  "type": "str",
+                  "default": "SyNOnly",
+                  "description": "ANTs registration method: 'SyNOnly' (elastic only), 'SyN', 'Affine', or 'Rigid'."
+                },
+                {
+                  "name": "verbose",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "Enable progress and diagnostic print output."
+                }
+              ],
+              "algorithm": {
+                "text": "Constructor stores registration_type and verbose. Main entry is interpolate_anisotropic_to_isotropic (see related entry). Internally: auto-detect thick axis as argmax(voxel_size); validate single maximum and equal thin axes; compute target isotropic size as min(thin axes); upsample slice count by scale_factor = thick_size / target_size; for each adjacent slice pair precompute A→B and B→A ANTs SyN deformations; for each target slice position interpolate by scaled deformations and distance-weighted blend of moved A and B slices.",
+                "math": "scale\\_factor = s_{thick} / s_{iso},\\; N' = \\mathrm{round}(N \\cdot scale\\_factor). Blend weights: w_A = (p - p_A)/(p_B - p_A),\\; w_B = 1 - w_A.",
+                "diagram": "flowchart TD\n  A[DeformationBasedMRIInterpolator] --> B[interpolate_anisotropic_to_isotropic]\n  B --> C[Detect thick axis + validate]\n  C --> D[Precompute pair deformations ANTs SyN]\n  D --> E[For each target slice position]\n  E --> F[Scale + apply A→B / B→A fields]\n  F --> G[Blend A_moved and B_moved]\n  G --> H[Isotropic volume]"
+              },
+              "related": [
+                "interpolate-anisotropic-to-isotropic",
+                "interpolate-mri-bidirectional"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Anisotropic thick-slice MRI resampled to isotropic voxels",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "interpolate-anisotropic-to-isotropic",
+              "title": "Interpolate Anisotropic to Isotropic",
+              "keywords": [
+                "resample",
+                "anisotropic",
+                "isotropic",
+                "deformation",
+                "slice interpolation"
+              ],
+              "source": {
+                "file": "resampleAnisotropicVoxels.py",
+                "symbol": "DeformationBasedMRIInterpolator.interpolate_anisotropic_to_isotropic",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Primary public method on DeformationBasedMRIInterpolator. Converts a 3D anisotropic MRI array to isotropic spacing along the thick axis by registering adjacent 2D slices with ANTs and synthesizing intermediate slices via scaled bidirectional deformation fields and intensity blending.",
+              "options": [
+                {
+                  "name": "image",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "Input 3D MRI volume."
+                },
+                {
+                  "name": "voxel_size",
+                  "type": "Tuple[float, float, float]",
+                  "default": "required",
+                  "description": "Voxel dimensions (x, y, z) in mm."
+                },
+                {
+                  "name": "target_axis",
+                  "type": "int | None",
+                  "default": "null",
+                  "description": "Axis index (0, 1, or 2) to interpolate. When null, auto-selects the axis with largest voxel size."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Validate 3D input; pick target_axis = argmax(voxel_size) if None. 2) Require exactly one axis at max size and two equal thin axes (1% tolerance). 3) target_voxel_size = min(thin axes); new slice count = round(N * thick/thin). 4) Build physical position arrays for original and target slices. 5) _bidirectional_deformation_interpolation: normalize slices to [-1,1] for ANTs; for each adjacent pair compute deform_A_to_B and deform_B_to_A via SyNOnly/SyN/Affine/Rigid; for interior target positions scale deformations by weight_A/weight_B, sample source slices with RegularGridInterpolator (linear), blend A_moved*w_B + B_moved*w_A; copy boundary slices unchanged.",
+                "math": "Physical positions: p_i = i \\cdot s_{axis}. Per-slice blend: I(p) = w_B \\cdot A_{moved} + w_A \\cdot B_{moved}.",
+                "diagram": "flowchart TD\n  A[3D anisotropic image] --> B[Validate axis anisotropy]\n  B --> C[Compute new slice grid]\n  C --> D[Register adjacent slice pairs ANTs]\n  D --> E[Scale deformation fields by distance weight]\n  E --> F[RegularGridInterpolator sample + blend]\n  F --> G[Isotropic 3D output]"
+              },
+              "related": [
+                "deformation-based-mri-interpolator",
+                "interpolate-mri-bidirectional"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Intermediate slices synthesized between thick original slices",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "interpolate-mri-bidirectional",
+              "title": "Interpolate MRI Bidirectional",
+              "keywords": [
+                "resample",
+                "convenience",
+                "anisotropic",
+                "isotropic",
+                "ants"
+              ],
+              "source": {
+                "file": "resampleAnisotropicVoxels.py",
+                "symbol": "interpolate_mri_bidirectional",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Module-level convenience wrapper that constructs a DeformationBasedMRIInterpolator and calls interpolate_anisotropic_to_isotropic, casting the result back to the input dtype. Default registration_type is 'SyN' (full SyN) and verbose is true, unlike the class default used in views.py.",
+              "options": [
+                {
+                  "name": "image_array",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "3D numpy array containing MRI data."
+                },
+                {
+                  "name": "voxel_sizes",
+                  "type": "Tuple[float, float, float]",
+                  "default": "required",
+                  "description": "Tuple of (x, y, z) voxel sizes in mm."
+                },
+                {
+                  "name": "registration_type",
+                  "type": "str",
+                  "default": "SyN",
+                  "description": "ANTs transform type: 'SyN' (recommended), 'Affine', or 'Rigid'."
+                },
+                {
+                  "name": "verbose",
+                  "type": "bool",
+                  "default": "true",
+                  "description": "Enable progress output during interpolation."
+                }
+              ],
+              "algorithm": {
+                "text": "interpolator = DeformationBasedMRIInterpolator(registration_type, verbose); return interpolator.interpolate_anisotropic_to_isotropic(image_array, voxel_sizes).astype(image_array.dtype).",
+                "math": "",
+                "diagram": "flowchart TD\n  A[interpolate_mri_bidirectional] --> B[Create DeformationBasedMRIInterpolator]\n  B --> C[interpolate_anisotropic_to_isotropic]\n  C --> D[Cast to input dtype]\n  D --> E[Return isotropic array]"
+              },
+              "related": [
+                "deformation-based-mri-interpolator",
+                "interpolate-anisotropic-to-isotropic"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "One-call API for bidirectional deformation resampling",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

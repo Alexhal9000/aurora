@@ -1,0 +1,672 @@
+{
+  "categories": [
+    {
+      "id": "preprocessing",
+      "title": "Preprocessing",
+      "subcategories": [
+        {
+          "id": "mesh-cleanup",
+          "title": "Mesh Cleanup",
+          "methods": [
+            {
+              "id": "cleanup-mesh",
+              "title": "Cleanup Mesh",
+              "keywords": [
+                "mesh",
+                "islands",
+                "connected components",
+                "artifact removal",
+                "gaussian blur",
+                "threshold"
+              ],
+              "source": {
+                "file": "preprocessingTools.py",
+                "symbol": "CleanupMeshView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Removes spurious disconnected foreground islands from a single voxel mesh or atlas volume by thresholding, connected-component labeling, and resetting removed voxels to the estimated background intensity. Useful after segmentation or thresholding when stray blobs, noise islands, or partial connections remain; optional Gaussian pre-smoothing and volume-based island filtering refine results. Rejected when the source edit is from elastic registration.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing extracted or atlas scan folders."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": null,
+                  "description": "Scan or atlas base name; threshold is read from its metadata JSON."
+                },
+                {
+                  "name": "edit",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Source NIfTI edit filename to clean; null uses the base scan file."
+                },
+                {
+                  "name": "gaussian_blur",
+                  "type": "number|null",
+                  "default": null,
+                  "description": "Gaussian sigma applied before island detection; 0 or null disables smoothing and post-noise cleanup."
+                },
+                {
+                  "name": "use_island_volume_threshold",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, keep all islands above a minimum volume fraction instead of keeping only the largest component."
+                },
+                {
+                  "name": "min_island_volume_percent",
+                  "type": "number",
+                  "default": 1.0,
+                  "description": "Minimum island size as a percentage of total foreground voxels; clamped to 0.1–30.0."
+                }
+              ],
+              "algorithm": {
+                "text": "Load the latest or specified NIfTI edit and read threshold from metadata. Optionally Gaussian-smooth a copy for island detection. Estimate background as the mode (or mean fallback) of subsampled voxels below threshold. Label connected components where smoothed data exceeds threshold. In default mode, remove every component except the largest by setting those voxels to the background value. In volume-threshold mode, remove components smaller than min_island_volume_percent of foreground. If Gaussian blur was used, also remove voxels above threshold in the original data that fall below threshold in the smoothed volume. Save a new *_cleaned edit plus lossy copy, and propagate masks and landmarks.",
+                "math": "background = mode(v | v < threshold); islands = {v | gaussian(v, σ) > threshold}; keep = argmax(size(C)) or {C | |C| ≥ p% · |foreground|}; v_removed ← background",
+                "diagram": "flowchart TD\n  A[Load NIfTI + threshold] --> B{Elastic edit?}\n  B -->|yes| X[Reject request]\n  B -->|no| C[Optional Gaussian blur]\n  C --> D[Estimate background below threshold]\n  D --> E[Label connected components]\n  E --> F{Multiple islands?}\n  F -->|no| G[No cleanup]\n  F -->|yes| H{Volume threshold mode?}\n  H -->|no| I[Keep largest island]\n  H -->|yes| J[Keep islands ≥ min volume %]\n  I --> K[Set removed voxels to background]\n  J --> K\n  K --> L{Gaussian used?}\n  L -->|yes| M[Remove blur-only noise voxels]\n  L -->|no| N[Save cleaned edit + lossy]\n  M --> N"
+              },
+              "related": [
+                "batch-cleanup-mesh",
+                "apply-threshold",
+                "homogenize-background"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Before and after mesh cleanup showing removal of small disconnected islands.",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "batch-cleanup-mesh",
+              "title": "Batch Cleanup Mesh",
+              "keywords": [
+                "batch",
+                "mesh cleanup",
+                "project-wide",
+                "preserved mesh",
+                "voxel mesh",
+                "islands"
+              ],
+              "source": {
+                "file": "preprocessingTools.py",
+                "symbol": "BatchCleanupMeshView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Runs mesh cleanup across all eligible scans in a project directory. Voxel-based scans use the same island-removal logic as Cleanup Mesh; preserved PLY meshes are routed to the preserved-mesh cleanup path. Skips elastic edits, already-cleaned edits, scans with no removable islands, and scans filtered by flag settings. Returns per-scan success, skip, or error results.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory whose extracted subfolders are processed."
+                },
+                {
+                  "name": "gaussian_blur",
+                  "type": "number|null",
+                  "default": null,
+                  "description": "Gaussian sigma forwarded to voxel mesh cleanup; null disables blur."
+                },
+                {
+                  "name": "use_island_volume_threshold",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, keep islands above the minimum volume fraction instead of only the largest island."
+                },
+                {
+                  "name": "min_island_volume_percent",
+                  "type": "number",
+                  "default": 1.0,
+                  "description": "Minimum retained island volume as a percentage of foreground; clamped to 0.1–30.0."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "string",
+                  "default": "off",
+                  "description": "Subject flag filter: off, exclude flagged scans, or only flagged scans."
+                }
+              ],
+              "algorithm": {
+                "text": "Enumerate non-faulty extracted scans, drop voxel scans with elastic registration, apply flag filter, then iterate. For preserved meshes, delegate to ApplyMeshCleanupView with latest edit. For voxel scans, load latest non-elastic, non-cleaned edit, run CleanupMeshView.clean_mesh, and save only when islands were actually removed. Emit WebSocket progress updates and aggregate results.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[List extracted scans] --> B[Apply flag filter]\n  B --> C{For each scan}\n  C --> D{Preserved PLY mesh?}\n  D -->|yes| E[Preserved mesh cleanup]\n  D -->|no| F{Elastic or already cleaned?}\n  F -->|yes| G[Skip]\n  F -->|no| H[Run clean_mesh]\n  H --> I{Islands removed?}\n  I -->|no| G\n  I -->|yes| J[Save cleaned edit + lossy]\n  E --> K[Collect result]\n  G --> K\n  J --> K"
+              },
+              "related": [
+                "cleanup-mesh"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Batch cleanup progress across multiple subjects in a project.",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "background",
+          "title": "Background",
+          "methods": [
+            {
+              "id": "homogenize-background",
+              "title": "Homogenize Background",
+              "keywords": [
+                "background",
+                "backfixed",
+                "intensity offset",
+                "batch",
+                "threshold shift",
+                "Set Background Value"
+              ],
+              "source": {
+                "file": "preprocessingTools.py",
+                "symbol": "HomogenizeBackgroundView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Subtracts a background intensity offset from all voxel-based scans so background voxels align near zero, then adjusts stored thresholds accordingly. When background_value is null, each scan's background is estimated automatically from values below threshold; when provided, that single value is applied to every eligible scan. Skips preserved PLY meshes, faulty scans, backfixed edits, and elastic-registered scans. Useful before registration or threshold alignment when scanners or reconstructions leave different background offsets.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing extracted scan folders."
+                },
+                {
+                  "name": "background_value",
+                  "type": "number|null",
+                  "default": null,
+                  "description": "Fixed background intensity to subtract from all scans; null triggers per-scan automatic estimation."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "string",
+                  "default": "off",
+                  "description": "Subject flag filter: off, exclude flagged scans, or only flagged scans."
+                }
+              ],
+              "algorithm": {
+                "text": "Collect eligible voxel scans and optionally run a first pass that estimates each scan's background as the mode of subsampled voxels below threshold (dtype-specific histogram logic for uint8 and uint16). Subtract the chosen background from every voxel with clipping to dtype bounds, save *_backfixed edits and lossy copies, subtract the same amount from metadata threshold, record backfixed_shift, and copy masks and landmarks unchanged.",
+                "math": "background = mode(v | 0 < v < threshold); v' = clip(v - background, dtype_min, dtype_max); threshold' = threshold - background",
+                "diagram": "flowchart TD\n  A[List eligible voxel scans] --> B{background_value provided?}\n  B -->|no| C[Phase 1: estimate background per scan]\n  B -->|yes| D[Use fixed background for all]\n  C --> E[Phase 2: subtract background]\n  D --> E\n  E --> F[Clip to dtype range]\n  F --> G[Save backfixed edit + lossy]\n  G --> H[Update threshold and backfixed_shift]"
+              },
+              "related": [
+                "save-background-values",
+                "remove-background",
+                "apply-threshold"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Background homogenization shifting low-intensity voxels toward zero before thresholding.",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "remove-background",
+              "title": "Remove Background",
+              "keywords": [
+                "background removal",
+                "backremoved",
+                "minimum value",
+                "batch",
+                "threshold"
+              ],
+              "source": {
+                "file": "preprocessingTools.py",
+                "symbol": "RemoveBackgroundView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Sets all voxels below each scan's metadata threshold to that scan's global minimum intensity, producing a flattened background without changing geometry. Processes all eligible voxel scans except the reference scan and scans already backremoved or elastically registered. Useful when a uniform low background is desired for visualization or downstream intensity handling while preserving foreground values.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing extracted scan folders."
+                },
+                {
+                  "name": "reference",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Reference scan name excluded from processing."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "string",
+                  "default": "off",
+                  "description": "Subject flag filter: off, exclude flagged scans, or only flagged scans."
+                }
+              ],
+              "algorithm": {
+                "text": "For each eligible scan, load the latest edit, read threshold from metadata, compute the volume minimum, assign min_value to all voxels strictly below threshold, save a new *_backremoved edit and lossy copy, and copy paired masks and landmarks without geometric change.",
+                "math": "v' = min(v) if v < threshold else v",
+                "diagram": "flowchart TD\n  A[List voxel scans except reference] --> B[Skip backremoved / elastic scans]\n  B --> C[Apply flag filter]\n  C --> D[Load latest edit + threshold]\n  D --> E[min_value = min(volume)]\n  E --> F[Set v < threshold to min_value]\n  F --> G[Save backremoved edit + lossy]"
+              },
+              "related": [
+                "homogenize-background",
+                "apply-threshold"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Background voxels collapsed to the scan minimum after threshold-based removal.",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "save-background-values",
+              "title": "Save Background Values",
+              "keywords": [
+                "background",
+                "manual correction",
+                "backfixed",
+                "per-scan",
+                "UI values"
+              ],
+              "source": {
+                "file": "preprocessingTools.py",
+                "symbol": "SaveBackgroundValuesView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Applies user-specified per-scan background offsets from the UI, subtracting each value from the corresponding volume and updating metadata thresholds. Scans with background 0 are skipped. Each corrected scan is saved as a new *_backfixed edit with lossy copy, adjusted threshold, and backfixed_shift. Useful when automatic background estimation needs manual refinement for individual subjects.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing extracted scan folders."
+                },
+                {
+                  "name": "values",
+                  "type": "object",
+                  "default": {},
+                  "description": "Map of scan_name to objects containing a numeric background field to subtract."
+                }
+              ],
+              "algorithm": {
+                "text": "Filter values to scans that include a background field and skip zero backgrounds. For each scan, load the latest edit, subtract the provided background using HomogenizeBackgroundView._homogenize_background, save *_backfixed output, reduce metadata threshold by the same amount, store backfixed_shift, generate lossy data, and copy masks and landmarks.",
+                "math": "v' = clip(v - background_scan, dtype_min, dtype_max); threshold' = threshold - background_scan",
+                "diagram": "flowchart TD\n  A[Receive per-scan background map] --> B[Skip background = 0]\n  B --> C[Load latest edit]\n  C --> D[Subtract background]\n  D --> E[Save backfixed edit + lossy]\n  E --> F[Update threshold and backfixed_shift]"
+              },
+              "related": [
+                "homogenize-background"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Manual per-scan background corrections applied from saved UI values.",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "intensity",
+          "title": "Intensity and Threshold",
+          "methods": [
+            {
+              "id": "apply-threshold",
+              "title": "Apply Threshold",
+              "keywords": [
+                "threshold",
+                "align thresholds",
+                "Otsu",
+                "Li",
+                "Kapur",
+                "histogram matching",
+                "percentile matching",
+                "reference scan"
+              ],
+              "source": {
+                "file": "preprocessingTools.py",
+                "symbol": "ApplyThresholdView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Computes and writes new segmentation thresholds into scan metadata without modifying voxel data. Supports copying a reference threshold, histogram-peak matching, percentile matching, and per-scan automatic methods (Otsu, Li, Kapur entropy). Can target all eligible voxel scans or only the selected scan, excluding preserved meshes, faulty scans, elastic registrations, and optionally the reference itself. Useful for harmonizing mesh extraction thresholds across a cohort before cleanup or registration.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing extracted scan folders."
+                },
+                {
+                  "name": "reference",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Reference scan name; required for same-threshold, histogram-matching, and percentile-matching methods."
+                },
+                {
+                  "name": "method",
+                  "type": "string",
+                  "default": "same-threshold",
+                  "description": "Threshold strategy: same-threshold, histogram-matching, percentile-matching, otsus-method, li-method, or kapur-entropy."
+                },
+                {
+                  "name": "onlyCurrentScan",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, update threshold only for selectedScan."
+                },
+                {
+                  "name": "selectedScan",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Scan name to threshold when onlyCurrentScan is true."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "string",
+                  "default": "off",
+                  "description": "Subject flag filter: off, exclude flagged scans, or only flagged scans."
+                }
+              ],
+              "algorithm": {
+                "text": "Load eligible voxel target scans and, for reference-based methods, Gaussian-smooth the reference volume and derive reference threshold, foreground volume, and variance. For each target scan, compute a threshold by method: copy reference value, shift reference threshold by histogram peak difference, match reference percentile rank, or run Otsu/Li/Kapur on smoothed scan data. Clamp below the scan minimum when needed, persist threshold to metadata JSON, and emit progress updates.",
+                "math": "same-threshold: T_scan = T_ref; percentile-matching: T_scan = P_scan(rank(T_ref in ref)); histogram-matching: T_scan = T_ref - (peak_ref - peak_scan); Kapur: maximize H_bg(T) + H_fg(T)",
+                "diagram": "flowchart TD\n  A[Select method] --> B{Needs reference?}\n  B -->|yes| C[Load reference + threshold]\n  B -->|no| D[Per-scan analysis only]\n  C --> E[For each target scan]\n  D --> E\n  E --> F{method}\n  F -->|same-threshold| G[Copy reference threshold]\n  F -->|histogram-matching| H[Shift by peak difference]\n  F -->|percentile-matching| I[Match percentile rank]\n  F -->|otsus/li/kapur| J[Auto-threshold scan]\n  G --> K[Write metadata threshold]\n  H --> K\n  I --> K\n  J --> K"
+              },
+              "related": [
+                "save-threshold-values",
+                "match-histogram",
+                "cleanup-mesh"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Aligned threshold values across scans using a reference subject.",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "match-histogram",
+              "title": "Match Histogram",
+              "keywords": [
+                "intensity normalization",
+                "histogram matching",
+                "peak align",
+                "tissue aware",
+                "percentile normalize",
+                "reference scan"
+              ],
+              "source": {
+                "file": "preprocessingTools.py",
+                "symbol": "MatchHistogramView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Normalizes voxel intensities across a project using several strategies: full foreground histogram matching to a reference, linear threshold alignment, tissue-aware soft-tissue and bone scaling, or standalone percentile clipping and rescaling. Saves new *_histmatched edits, updates thresholds in metadata, and skips preserved meshes, faulty scans, already histmatched scans, and elastic registrations. Useful before registration when scanners or reconstructions produce different intensity profiles.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing extracted scan folders."
+                },
+                {
+                  "name": "reference",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Reference scan name; required for reference-based methods."
+                },
+                {
+                  "name": "method",
+                  "type": "string",
+                  "default": "histogram_match",
+                  "description": "Normalization method: histogram_match, peak_align, tissue_aware, or percentile_normalize."
+                },
+                {
+                  "name": "percentile_low",
+                  "type": "number",
+                  "default": 2,
+                  "description": "Lower percentile used by percentile_normalize."
+                },
+                {
+                  "name": "percentile_high",
+                  "type": "number",
+                  "default": 98,
+                  "description": "Upper percentile used by percentile_normalize."
+                },
+                {
+                  "name": "onlyCurrentScan",
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, normalize only selectedScan."
+                },
+                {
+                  "name": "selectedScan",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Scan name to process when onlyCurrentScan is true."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "string",
+                  "default": "off",
+                  "description": "Subject flag filter: off, exclude flagged scans, or only flagged scans."
+                }
+              ],
+              "algorithm": {
+                "text": "histogram_match: match foreground voxel intensities to the reference foreground using skimage.exposure.match_histograms. peak_align: add (T_ref - T_scan) to all voxels and clip to dtype range. tissue_aware: detect soft-tissue and bone peaks in reference and scan foreground, linearly rescale each range separately. percentile_normalize: clip the full volume to [p_low, p_high] and linearly map to the dtype range, remapping threshold through the same transform; reference scan is included. All methods save histmatched edits, lossy copies, updated thresholds, and copied masks/landmarks.",
+                "math": "peak_align: v' = clip(v + T_ref - T_scan); percentile_normalize: v' = (clip(v, p_low, p_high) - p_low)/(p_high - p_low) · (max - min) + min",
+                "diagram": "flowchart TD\n  A[Choose method] --> B{percentile_normalize?}\n  B -->|yes| C[Clip + rescale each scan]\n  B -->|no| D[Load reference scan]\n  D --> E{method}\n  E -->|histogram_match| F[Match foreground histograms]\n  E -->|peak_align| G[Shift by threshold difference]\n  E -->|tissue_aware| H[Rescale soft tissue and bone ranges]\n  F --> I[Save histmatched edit]\n  G --> I\n  H --> I\n  C --> I"
+              },
+              "related": [
+                "apply-threshold",
+                "n4-bias-correction",
+                "homogenize-background"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Intensity normalization of target scans to a reference histogram.",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "n4-bias-correction",
+              "title": "N4 Bias Correction",
+              "keywords": [
+                "N4",
+                "bias field",
+                "intensity inhomogeneity",
+                "ANTs",
+                "MRI",
+                "batch"
+              ],
+              "source": {
+                "file": "preprocessingTools.py",
+                "symbol": "N4BiasCorrectionView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Corrects low-frequency intensity bias fields in voxel volumes using ANTs N4 bias field correction. Can process all eligible scans in a project or a single named scan. Skips preserved PLY meshes, scans that already have N4/N3 output edits, and elastic-registered scans. Useful for MRI or other acquisitions with shading or coil-intensity variation before thresholding, normalization, or registration.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing extracted scan folders."
+                },
+                {
+                  "name": "filename",
+                  "type": "string|null",
+                  "default": null,
+                  "description": "Optional single scan name; when set, only that scan is corrected."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "string",
+                  "default": "off",
+                  "description": "Subject flag filter for batch mode: off, exclude flagged scans, or only flagged scans."
+                },
+                {
+                  "name": "parameters",
+                  "type": "object",
+                  "default": {},
+                  "description": "Nested N4 tuning options passed to ANTs."
+                },
+                {
+                  "name": "parameters.shrink_factor",
+                  "type": "integer",
+                  "default": 4,
+                  "description": "Downsampling factor for bias-field estimation speed."
+                },
+                {
+                  "name": "parameters.convergence_iters",
+                  "type": "integer",
+                  "default": 50,
+                  "description": "Iterations per resolution level in the N4 convergence schedule."
+                },
+                {
+                  "name": "parameters.convergence_tol_exp",
+                  "type": "integer",
+                  "default": 7,
+                  "description": "Exponent for convergence tolerance: tol = 10^(-convergence_tol_exp)."
+                },
+                {
+                  "name": "parameters.spline_param",
+                  "type": "integer",
+                  "default": 200,
+                  "description": "B-spline control-point spacing parameter for the estimated bias field."
+                }
+              ],
+              "algorithm": {
+                "text": "Select eligible scans, load the latest edit as float32, run ants.n4_bias_field_correction with shrink factor, multi-level convergence settings, and spline spacing, clip the corrected volume back to the original dtype, save *_n4corrected full and lossy edits, and copy masks and landmarks unchanged.",
+                "math": "I_corrected(x) = I(x) / B(x), where B(x) is the estimated smooth bias field from iterative B-spline fitting",
+                "diagram": "flowchart TD\n  A[Select eligible scans] --> B[Load latest edit as float32]\n  B --> C[Run ANTs N4 bias correction]\n  C --> D[Clip to original dtype]\n  D --> E[Save n4corrected edit + lossy]\n  E --> F[Copy masks and landmarks]"
+              },
+              "related": [
+                "match-histogram",
+                "apply-threshold"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "N4 correction reducing smooth intensity shading across a volume.",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "save-threshold-values",
+              "title": "Save Threshold Values",
+              "keywords": [
+                "threshold",
+                "metadata",
+                "manual",
+                "per-scan",
+                "UI values"
+              ],
+              "source": {
+                "file": "preprocessingTools.py",
+                "symbol": "SaveThresholdValuesView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Persists user-edited threshold values from the UI into each scan's metadata JSON without modifying voxel data. Useful after manual threshold review in the viewer when values should be saved for mesh extraction, cleanup, or downstream preprocessing steps.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing extracted scan folders."
+                },
+                {
+                  "name": "values",
+                  "type": "object",
+                  "default": {},
+                  "description": "Map of scan_name to objects containing a numeric threshold field to write into metadata."
+                }
+              ],
+              "algorithm": {
+                "text": "For each scan entry in values, load extracted/{scan_name}/{scan_name}.json, update the threshold field when present, and save the metadata file. Missing metadata files are reported as errors; successful updates are returned in updated_scans.",
+                "math": "metadata.threshold ← user_threshold",
+                "diagram": ""
+              },
+              "related": [
+                "apply-threshold",
+                "cleanup-mesh",
+                "remove-background"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Manual threshold values saved to scan metadata from the UI.",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "metadata",
+          "title": "Metadata Utilities",
+          "methods": [
+            {
+              "id": "get-rotation-matrix",
+              "title": "Get Rotation Matrix",
+              "keywords": [
+                "rotation",
+                "orientation",
+                "metadata",
+                "rotated_by_matrix",
+                "identity matrix"
+              ],
+              "source": {
+                "file": "preprocessingTools.py",
+                "symbol": "GetRotationMatrixView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Reads the 3×3 rotation matrix stored in scan metadata under rotated_by_matrix.rotation_matrix, or returns the identity matrix when metadata is missing or no rotation was recorded. Useful for frontend visualization, coordinate transforms, or applying/displaying prior orientation corrections without reloading the full volume.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": null,
+                  "description": "Project root directory containing extracted scan folders."
+                },
+                {
+                  "name": "scan_name",
+                  "type": "string",
+                  "default": null,
+                  "description": "Scan whose metadata JSON is queried for rotated_by_matrix.rotation_matrix."
+                }
+              ],
+              "algorithm": {
+                "text": "Open extracted/{scan_name}/{scan_name}.json. If rotated_by_matrix.rotation_matrix exists, return it. Otherwise return the 3×3 identity matrix. Missing metadata also yields identity with a success response.",
+                "math": "R = metadata.rotated_by_matrix.rotation_matrix or I_3",
+                "diagram": "flowchart TD\n  A[Read scan metadata JSON] --> B{rotation_matrix present?}\n  B -->|yes| C[Return stored 3x3 matrix]\n  B -->|no| D[Return identity matrix]"
+              },
+              "related": [],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Rotation matrix retrieved from scan metadata for orientation-aware rendering.",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

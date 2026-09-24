@@ -1,0 +1,562 @@
+{
+  "categories": [
+    {
+      "id": "denoise-restore",
+      "title": "Denoise & Restore",
+      "subcategories": [
+        {
+          "id": "batch-denoising",
+          "title": "Batch Denoising",
+          "methods": [
+            {
+              "id": "denoise-all-scans",
+              "title": "Denoise All Scans",
+              "keywords": [
+                "denoise",
+                "gaussian",
+                "median",
+                "non-local means",
+                "nlm",
+                "total variation",
+                "wavelet",
+                "butterworth",
+                "batch",
+                "nifti"
+              ],
+              "source": {
+                "file": "denoiseTools.py",
+                "symbol": "DenoiseAllScansView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Applies a chosen denoising algorithm to every eligible voxel-based scan in a project directory, saving a new edit tagged _denoised with full and lossy NIfTI copies plus propagated masks and landmarks. Use this when scan data is noisy from acquisition or reconstruction and you want consistent filtering across subjects before segmentation, meshing, or visualization. Skips faulty scans, preserved PLY meshes, scans that already have a latest _denoised edit, and scans with elastic registration. Supports Gaussian blur, median filtering, Non-Local Means (2.5D CPU parallel, 3D CPU, or 3D GPU via nlm3d), Total Variation (Chambolle or Bregman), wavelet shrinkage, and Butterworth frequency filtering.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root containing extracted/ scan folders."
+                },
+                {
+                  "name": "algorithm",
+                  "type": "string",
+                  "default": "Gaussian",
+                  "description": "Denoising method: Gaussian, Median, NonLocalMeans, TotalVariationChambolle, TotalVariationBregman, Wavelet, or Butterworth."
+                },
+                {
+                  "name": "parameters",
+                  "type": "object",
+                  "default": "{}",
+                  "description": "Algorithm-specific settings (see individual keys below)."
+                },
+                {
+                  "name": "parameters.sigma",
+                  "type": "float",
+                  "default": "1.0 (Gaussian) / 0.1 (Wavelet)",
+                  "description": "Gaussian blur standard deviation, or wavelet noise estimate when algorithm is Wavelet."
+                },
+                {
+                  "name": "parameters.truncate",
+                  "type": "float",
+                  "default": "4.0",
+                  "description": "Gaussian filter truncate radius (Gaussian only)."
+                },
+                {
+                  "name": "parameters.h",
+                  "type": "float",
+                  "default": "0.1",
+                  "description": "NLM filter strength h on normalized [0,1] data (NonLocalMeans only)."
+                },
+                {
+                  "name": "parameters.template_size",
+                  "type": "int",
+                  "default": "7",
+                  "description": "NLM patch (template) diameter in voxels (NonLocalMeans only)."
+                },
+                {
+                  "name": "parameters.search_size",
+                  "type": "int",
+                  "default": "21",
+                  "description": "NLM search window radius in voxels (NonLocalMeans only)."
+                },
+                {
+                  "name": "parameters.mode",
+                  "type": "string",
+                  "default": "2.5D",
+                  "description": "NLM execution mode: 2.5D (multi-axis slab average), 3D_CPU (skimage), or 3D_GPU (PyTorch nlm3d)."
+                },
+                {
+                  "name": "parameters.weight",
+                  "type": "float",
+                  "default": "0.1",
+                  "description": "TV denoising weight (TotalVariationChambolle or TotalVariationBregman)."
+                },
+                {
+                  "name": "parameters.eps",
+                  "type": "float",
+                  "default": "0.002",
+                  "description": "TV stopping tolerance (TotalVariationChambolle or TotalVariationBregman)."
+                },
+                {
+                  "name": "parameters.max_num_iter",
+                  "type": "int",
+                  "default": "200",
+                  "description": "Maximum TV iterations (TotalVariationChambolle or TotalVariationBregman)."
+                },
+                {
+                  "name": "parameters.wavelet",
+                  "type": "string",
+                  "default": "db1",
+                  "description": "Wavelet basis name (Wavelet only)."
+                },
+                {
+                  "name": "parameters.level",
+                  "type": "int",
+                  "default": "1",
+                  "description": "Wavelet decomposition level (Wavelet only)."
+                },
+                {
+                  "name": "parameters.cutoff",
+                  "type": "float",
+                  "default": "0.05",
+                  "description": "Butterworth cutoff frequency ratio (Butterworth only)."
+                },
+                {
+                  "name": "parameters.order",
+                  "type": "int",
+                  "default": "2",
+                  "description": "Butterworth filter order (Butterworth only)."
+                },
+                {
+                  "name": "parameters.high_pass",
+                  "type": "bool",
+                  "default": "true",
+                  "description": "If true, apply high-pass Butterworth; else low-pass (Butterworth only)."
+                },
+                {
+                  "name": "parameters.squared_butterworth",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "Use squared Butterworth response (Butterworth only)."
+                },
+                {
+                  "name": "denoiseAutoMode",
+                  "type": "object",
+                  "default": "{}",
+                  "description": "Per-parameter auto-mode flags sent from the UI (currently logged but not applied server-side)."
+                },
+                {
+                  "name": "onlyCurrentScan",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "When true, restrict processing to selectedScan."
+                },
+                {
+                  "name": "selectedScan",
+                  "type": "string|null",
+                  "default": "null",
+                  "description": "Scan folder name to process when onlyCurrentScan is true."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "string",
+                  "default": "off",
+                  "description": "Subject flag filter mode (off / flagged-only / unflagged-only)."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Enumerate extracted scan folders, excluding faulty metadata and preserved meshes. 2) Optionally filter to one scan, apply flag filter, and skip scans whose latest edit is already _denoised or that have elastic registration. 3) For each remaining scan, load the latest NIfTI edit (or original). 4) Normalize intensities to [0,1] where required, run the selected denoiser, then rescale to the original dtype range. 5) NonLocalMeans with split=True parallelizes large volumes: 2.5D runs NLM along three axes and averages; 3D_GPU calls nlm3d on CUDA with OOM fallback. 6) Save {scan}_edit_{n}_denoised.nii.gz plus lossy copy, copy masks/landmarks, and broadcast WebSocket progress.",
+                "math": "Gaussian: G_\\sigma * I. NLM: \\hat{I}(p)=\\sum_q w(p,q) I(q) / \\sum_q w(p,q),\\; w(p,q)=\\exp\\!\\left(-\\frac{\\|P(p)-P(q)\\|^2}{2h^2}\\right). TV Chambolle/Bregman minimize \\|\\nabla I\\|_1 subject to fidelity. Wavelet BayesShrink soft-thresholds detail coefficients.",
+                "diagram": "flowchart TD\n  A[POST directory + algorithm] --> B[Filter eligible scans]\n  B --> C{onlyCurrentScan?}\n  C -->|yes| D[Single scan]\n  C -->|no| E[All scans]\n  D --> F[Load latest NIfTI]\n  E --> F\n  F --> G{algorithm}\n  G -->|Gaussian/Median/TV/Wavelet/Butterworth| H[skimage/scipy filter]\n  G -->|NonLocalMeans| I{mode}\n  I -->|2.5D| J[Parallel slab NLM + axis average]\n  I -->|3D_CPU| K[skimage denoise_nl_means]\n  I -->|3D_GPU| L[nlm3d CUDA + OOM fallback]\n  H --> M[Save _denoised edit + lossy + masks]\n  J --> M\n  K --> M\n  L --> M"
+              },
+              "related": [
+                "preview-denoise",
+                "gpu-nlm3d",
+                "restore-all-scans"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Before and after denoising on a cranial CT volume slice",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "denoise-preview",
+          "title": "Denoise Preview",
+          "methods": [
+            {
+              "id": "preview-denoise",
+              "title": "Preview Denoise",
+              "keywords": [
+                "denoise",
+                "preview",
+                "patch",
+                "slice",
+                "interactive",
+                "cache"
+              ],
+              "source": {
+                "file": "denoiseTools.py",
+                "symbol": "PreviewDenoiseView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Interactive preview endpoint that denoises a 100×100×100 voxel patch centered at user-specified coordinates and returns normalized center Z-slice pixels for raw and denoised data. Use this to tune denoising parameters in the Aurora UI before running batch Denoise All Scans. Raw patches are cached (max one entry) by scan name and coordinates so parameter sweeps skip repeated disk I/O; denoising is recomputed on every request so slider changes appear immediately.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root containing extracted/ scan folders."
+                },
+                {
+                  "name": "scan_name",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Scan folder name to preview."
+                },
+                {
+                  "name": "algorithm",
+                  "type": "string",
+                  "default": "Gaussian",
+                  "description": "Same algorithm names as DenoiseAllScansView."
+                },
+                {
+                  "name": "parameters",
+                  "type": "object",
+                  "default": "{}",
+                  "description": "Algorithm-specific settings for the preview patch."
+                },
+                {
+                  "name": "parameters.sigma",
+                  "type": "float",
+                  "default": "1.0 (Gaussian) / 0.1 (Wavelet)",
+                  "description": "Gaussian sigma or wavelet noise estimate."
+                },
+                {
+                  "name": "parameters.truncate",
+                  "type": "float",
+                  "default": "4.0",
+                  "description": "Gaussian truncate (Gaussian only)."
+                },
+                {
+                  "name": "parameters.h",
+                  "type": "float",
+                  "default": "0.1",
+                  "description": "NLM filter strength (NonLocalMeans only)."
+                },
+                {
+                  "name": "parameters.patch_size",
+                  "type": "int",
+                  "default": "7",
+                  "description": "NLM template patch size in voxels (NonLocalMeans only; maps to template_size internally)."
+                },
+                {
+                  "name": "parameters.patch_distance",
+                  "type": "int",
+                  "default": "11",
+                  "description": "NLM search distance in voxels (NonLocalMeans only; maps to search_size internally)."
+                },
+                {
+                  "name": "parameters.mode",
+                  "type": "string",
+                  "default": "2.5D",
+                  "description": "NLM mode passed to denoise_nl_means_module with split=False."
+                },
+                {
+                  "name": "parameters.weight",
+                  "type": "float",
+                  "default": "0.1 (Chambolle) / 5.0 (Bregman)",
+                  "description": "TV denoising weight."
+                },
+                {
+                  "name": "parameters.eps",
+                  "type": "float",
+                  "default": "0.0002 (Chambolle) / 0.001 (Bregman)",
+                  "description": "TV stopping tolerance."
+                },
+                {
+                  "name": "parameters.max_num_iter",
+                  "type": "int",
+                  "default": "200 (Chambolle) / 100 (Bregman)",
+                  "description": "Maximum TV iterations."
+                },
+                {
+                  "name": "parameters.wavelet",
+                  "type": "string",
+                  "default": "db1",
+                  "description": "Wavelet basis (Wavelet only)."
+                },
+                {
+                  "name": "parameters.level",
+                  "type": "int",
+                  "default": "1",
+                  "description": "Wavelet level (Wavelet only)."
+                },
+                {
+                  "name": "parameters.cutoff",
+                  "type": "float",
+                  "default": "0.005",
+                  "description": "Butterworth cutoff ratio (Butterworth only)."
+                },
+                {
+                  "name": "parameters.order",
+                  "type": "int",
+                  "default": "2",
+                  "description": "Butterworth order (Butterworth only)."
+                },
+                {
+                  "name": "parameters.high_pass",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "High-pass vs low-pass Butterworth (Butterworth only)."
+                },
+                {
+                  "name": "parameters.squared_butterworth",
+                  "type": "bool",
+                  "default": "true",
+                  "description": "Squared Butterworth response (Butterworth only)."
+                },
+                {
+                  "name": "denoiseAutoMode",
+                  "type": "object",
+                  "default": "{}",
+                  "description": "Per-parameter auto-mode flags from the UI (received but not applied server-side)."
+                },
+                {
+                  "name": "x",
+                  "type": "number",
+                  "default": "0",
+                  "description": "Patch center X coordinate in voxel space."
+                },
+                {
+                  "name": "y",
+                  "type": "number",
+                  "default": "0",
+                  "description": "Patch center Y coordinate in voxel space."
+                },
+                {
+                  "name": "z",
+                  "type": "number",
+                  "default": "0",
+                  "description": "Patch center Z coordinate in voxel space."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Build cache key from scan_name and integer (x,y,z). 2) On cache miss, load latest edit or original NIfTI and extract a 100³ patch (zero-padded at boundaries). 3) On cache hit, reuse the cached raw patch. 4) Delegate to DenoiseAllScansView denoise helpers with preview-specific parameter names (patch_size/patch_distance for NLM). 5) Extract the center Z slice from raw and denoised volumes, min-max normalize to uint8, rotate 90° CCW for display orientation, flatten to lists, and return slice_shape plus from_cache flag.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[POST coords + algorithm] --> B{Cache hit?}\n  B -->|no| C[Load NIfTI + extract 100³ patch]\n  B -->|yes| D[Use cached raw patch]\n  C --> E[Store raw patch in cache]\n  D --> F[Apply denoise algorithm]\n  E --> F\n  F --> G[Center Z slice raw + denoised]\n  G --> H[Normalize + rot90 + flatten]\n  H --> I[Return center_slice arrays]"
+              },
+              "related": [
+                "denoise-all-scans",
+                "gpu-nlm3d"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Side-by-side raw vs denoised center slice in the Aurora denoise preview panel",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "restoration",
+          "title": "Restoration",
+          "methods": [
+            {
+              "id": "restore-all-scans",
+              "title": "Restore All Scans",
+              "keywords": [
+                "restore",
+                "clahe",
+                "contrast",
+                "histogram equalization",
+                "mask",
+                "batch",
+                "nifti"
+              ],
+              "source": {
+                "file": "restoreTools.py",
+                "symbol": "RestoreAllScansView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Applies contrast restoration to eligible voxel scans and saves a new _restored edit with full and lossy NIfTI copies. Supports CLAHE and, via the same Restore tooltip, Weld mesh for preserved PLY subjects (BatchWeldMeshView / _welded edits). CLAHE locally boosts contrast while limiting noise amplification. Optionally restricts CLAHE to voxels inside a segmentation mask (prefer_mask). Skips faulty scans and scans whose latest edit is already _restored; Weld mesh skips voxel volumes and already-welded edits.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root containing extracted/ scan folders."
+                },
+                {
+                  "name": "algorithm",
+                  "type": "string",
+                  "default": "CLAHE",
+                  "description": "CLAHE, BiasCorrection (N4), or WeldMesh (preserved meshes; routed to /batch-weld-mesh/)."
+                },
+                {
+                  "name": "parameters",
+                  "type": "object",
+                  "default": "{}",
+                  "description": "Algorithm-specific settings."
+                },
+                {
+                  "name": "parameters.kernel_size",
+                  "type": "int",
+                  "default": "0",
+                  "description": "CLAHE local window size in voxels per axis. 0 means auto (skimage uses 1/8 of each dimension)."
+                },
+                {
+                  "name": "parameters.clip_limit",
+                  "type": "float",
+                  "default": "0.01",
+                  "description": "CLAHE clip limit controlling contrast amplification (higher = stronger)."
+                },
+                {
+                  "name": "parameters.nbins",
+                  "type": "int",
+                  "default": "256",
+                  "description": "Number of histogram bins for CLAHE."
+                },
+                {
+                  "name": "onlyCurrentScan",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "When true, restrict processing to selectedScan."
+                },
+                {
+                  "name": "selectedScan",
+                  "type": "string|null",
+                  "default": "null",
+                  "description": "Scan folder name when onlyCurrentScan is true."
+                },
+                {
+                  "name": "prefer_mask",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "When true with CLAHE, apply restoration only inside the segmentation mask; outside voxels keep original intensities."
+                },
+                {
+                  "name": "mask_label",
+                  "type": "int",
+                  "default": "1",
+                  "description": "Mask voxel value treated as foreground when prefer_mask is true."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "string",
+                  "default": "off",
+                  "description": "Subject flag filter mode (off / flagged-only / unflagged-only)."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Enumerate eligible voxel scans (same filtering pattern as denoise: faulty, meshes, flags, skip existing _restored). 2) Load latest NIfTI per scan and normalize to [0,1]. 3) Run skimage exposure.equalize_adapthist with kernel_size (auto when 0), clip_limit, and nbins. 4) Rescale restored values back to the original intensity range and dtype. 5) If prefer_mask, load the mask paired with the source edit and blend: restored inside mask_label voxels, original elsewhere. 6) Save {scan}_edit_{n}_restored.nii.gz, lossy copy, propagate masks and landmarks, broadcast progress.",
+                "math": "CLAHE clips histogram peaks at clip_limit times the mean bin count before cumulative mapping, limiting local contrast gain while adaptively equalizing each neighborhood.",
+                "diagram": "flowchart TD\n  A[POST directory + CLAHE params] --> B[Filter eligible scans]\n  B --> C[Load latest NIfTI]\n  C --> D[Normalize to 0-1]\n  D --> E[skimage equalize_adapthist]\n  E --> F{prefer_mask?}\n  F -->|yes| G[Blend with original outside mask_label]\n  F -->|no| H[Use full restored volume]\n  G --> I[Save _restored edit + lossy + masks]\n  H --> I"
+              },
+              "related": [
+                "denoise-all-scans"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Low-contrast scan slice before and after CLAHE restoration",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "gpu-non-local-means",
+          "title": "GPU Non-Local Means",
+          "methods": [
+            {
+              "id": "gpu-nlm3d",
+              "title": "GPU 3D Non-Local Means (nlm3d)",
+              "keywords": [
+                "nlm",
+                "non-local means",
+                "gpu",
+                "cuda",
+                "pytorch",
+                "denoise",
+                "3d",
+                "tiling",
+                "oom"
+              ],
+              "source": {
+                "file": "GPUTorchNLMDenoise.py",
+                "symbol": "nlm3d",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "PyTorch CUDA implementation of 3D Non-Local Means used when DenoiseAllScansView runs NonLocalMeans with mode 3D_GPU. Accepts a normalized [H,W,D] float tensor on GPU, compares patches in a search neighborhood, and returns a denoised volume. Automatically tries memory-efficient full-volume processing first; on CUDA out-of-memory it falls back to streaming tiled processing with adaptive tile size based on free VRAM. This is the backend engine behind high-quality 3D NLM on large cranial volumes.",
+              "options": [
+                {
+                  "name": "X",
+                  "type": "torch.Tensor [H,W,D]",
+                  "default": "required",
+                  "description": "Input 3D volume (typically float32, normalized 0–1, on CUDA)."
+                },
+                {
+                  "name": "kernel_size",
+                  "type": "int",
+                  "default": "3",
+                  "description": "Search neighborhood diameter: number of offset voxels along each axis (odd integer; denoiseTools passes 2*search_size+1 for split GPU path or search_size directly in non-split path)."
+                },
+                {
+                  "name": "std",
+                  "type": "float",
+                  "default": "1.0",
+                  "description": "Filter strength h (denoiseTools maps parameters.h here)."
+                },
+                {
+                  "name": "kernel_size_mean",
+                  "type": "int",
+                  "default": "3",
+                  "description": "Mean-filter patch diameter used before distance computation (denoiseTools maps parameters.template_size here)."
+                },
+                {
+                  "name": "sub_filter_size",
+                  "type": "int",
+                  "default": "256",
+                  "description": "Approximate number of neighbor offsets processed per streaming iteration in the memory-efficient path."
+                },
+                {
+                  "name": "debug",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "Enable verbose debug logging during NLM processing."
+                }
+              ],
+              "algorithm": {
+                "text": "nlm3d is an alias for apply_nonlocal_means_3d_with_fallback. Primary path: apply_nonlocal_means_3d_mem_efficient streams neighbor offsets through non_local_means_loop_index, comparing mean-filtered patches and weighting original unsmoothed neighbors by exp(-distance²/(2h²)) with skimage-style noise variance compensation. On RuntimeError containing 'out of memory', copies input to CPU, clears CUDA cache, picks tile size 96–160 based on free VRAM, and runs apply_nonlocal_means_3d_tiled: context-padded tiles are processed on GPU via _process_tile_streaming with per-offset streaming, then center results are stitched into the full volume.",
+                "math": "w(p,q)=\\exp\\!\\left(-\\frac{\\|P(p)-P(q)\\|^2}{2h^2}\\right),\\quad \\hat{I}(p)=\\frac{\\sum_q w(p,q)\\,I(q)}{\\sum_q w(p,q)}",
+                "diagram": "flowchart TD\n  A[nlm3d tensor on CUDA] --> B[apply_nonlocal_means_3d_mem_efficient]\n  B --> C{OOM?}\n  C -->|no| D[Return denoised volume]\n  C -->|yes| E[Move to CPU + empty_cache]\n  E --> F[Pick tile size from free VRAM]\n  F --> G[apply_nonlocal_means_3d_tiled]\n  G --> H[Stream offsets per tile]\n  H --> D"
+              },
+              "related": [
+                "denoise-all-scans",
+                "preview-denoise"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "3D NLM denoising on a large volume with automatic GPU tiling fallback",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

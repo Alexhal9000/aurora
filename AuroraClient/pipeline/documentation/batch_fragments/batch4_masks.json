@@ -1,0 +1,725 @@
+{
+  "categories": [
+    {
+      "id": "masks-labels",
+      "title": "Masks & Labels",
+      "subcategories": [
+        {
+          "id": "mask-io",
+          "title": "Mask I/O",
+          "methods": [
+            {
+              "id": "save-mask",
+              "title": "Save Mask",
+              "keywords": [
+                "mask",
+                "save",
+                "brush",
+                "nifti",
+                "full resolution",
+                "lossy",
+                "binary"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "SaveMaskView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Persists a painted or edited voxel mask from the Aurora canvas to disk as a NIfTI sidecar ({edit}.nii.mask.gz). Accepts either a compact binary upload or a legacy JSON uint8 array. Saves at the resolution you are currently editing (full or lossy) and automatically generates a complementary-resolution mask by nearest-neighbor zoom so both preview and export resolutions stay in sync.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory for the project or subject collection."
+                },
+                {
+                  "name": "filename",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Subject or scan folder name; use \"atlas\" for atlas masks."
+                },
+                {
+                  "name": "edit",
+                  "type": "str",
+                  "default": "null",
+                  "description": "Edit stem without .nii.gz (e.g. scan_edit_1). When omitted, defaults to the raw scan / scan_lossy pair."
+                },
+                {
+                  "name": "fullResolutionState",
+                  "type": "bool | str",
+                  "default": "false",
+                  "description": "True when the canvas is editing the full-resolution volume; false for the lossy preview volume. Multipart string values true/1/yes/on are accepted."
+                },
+                {
+                  "name": "maskData",
+                  "type": "file | list[int]",
+                  "default": "required",
+                  "description": "Flat uint8 voxel array in frontend order (depth, height, width with Y/Z flipped). Prefer multipart file upload; JSON integer list is supported for legacy clients."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Resolve source/target edit names from fullResolutionState and edit stem. 2) Load scan metadata to read resolution_factor from lossy_compression. 3) Reshape flat mask bytes to NIfTI (width, height, depth) with frontend axis flips. 4) Save source-resolution mask as {source_edit}.nii.mask.gz. 5) If the complementary image exists, scale the mask with scipy.ndimage.zoom (order=0) to that shape and save the paired mask.",
+                "math": "zoom_factors[i] = target_shape[i] / source_shape[i]; scaled = zoom(mask, zoom_factors, order=0)",
+                "diagram": "flowchart TD\n  A[Flat maskData] --> B{fullResolutionState?}\n  B -->|true| C[Save full-res mask]\n  B -->|false| D[Save lossy mask]\n  C --> E[Zoom to lossy shape]\n  D --> F[Zoom to full shape]\n  E --> G[Write .nii.mask.gz pair]\n  F --> G"
+              },
+              "related": [
+                "load-mask",
+                "upload-mask",
+                "apply-mask-to-image"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Canvas brush mask saved as full and lossy .nii.mask.gz sidecars",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "load-mask",
+              "title": "Load Mask",
+              "keywords": [
+                "mask",
+                "load",
+                "brush",
+                "binary",
+                "canvas"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "LoadMaskView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Loads a saved mask from disk back into the Aurora canvas. Returns raw uint8 bytes (application/octet-stream) instead of a JSON array for performance on large volumes. Response headers carry the mask filename and NIfTI dimensions so the frontend can reconstruct the flat brush buffer.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Subject or scan folder name; use \"atlas\" for atlas masks."
+                },
+                {
+                  "name": "edit",
+                  "type": "str",
+                  "default": "null",
+                  "description": "Edit stem without .nii.gz. When omitted, uses filename (full) or filename_lossy (lossy)."
+                },
+                {
+                  "name": "fullResolutionState",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "True to load the full-resolution mask; false for the lossy mask."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Derive mask_edit from edit and fullResolutionState (insert or strip _lossy as needed). 2) Temporarily rename .nii.mask.gz to .nii.gz for nibabel. 3) Load NIfTI, reverse frontend axis flips (Y/Z reversed, depth-major flatten), round to uint8. 4) Return raw bytes with X-Mask-Name and X-Mask-Dimensions headers. 5) Restore the custom extension.",
+                "math": "flat = round(data[:, ::-1, ::-1].transpose(2,1,0)).flatten(order='C')",
+                "diagram": "flowchart TD\n  A[Request edit + resolution] --> B[Resolve .nii.mask.gz path]\n  B --> C[Temp rename for nibabel]\n  C --> D[Load + axis invert]\n  D --> E[HttpResponse octet-stream]\n  E --> F[Restore extension]"
+              },
+              "related": [
+                "save-mask",
+                "download-mask"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Mask loaded from disk into the canvas brush layer",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "upload-mask",
+              "title": "Upload Mask",
+              "keywords": [
+                "mask",
+                "upload",
+                "nifti",
+                "import",
+                "external"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "UploadMaskView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Imports an external NIfTI mask file (.nii or .nii.gz) into a subject folder. Always stores the uploaded volume as the full-resolution mask and automatically downscales a complementary lossy mask when the lossy image exists, keeping both resolutions aligned for canvas editing.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Subject or scan folder name; use \"atlas\" for atlas masks."
+                },
+                {
+                  "name": "edit",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Lossy edit name (e.g. scan_lossy.nii.gz). Defaults to {filename}_lossy.nii.gz when empty or null."
+                },
+                {
+                  "name": "maskFile",
+                  "type": "file",
+                  "default": "required",
+                  "description": "Uploaded NIfTI mask; must end with .nii or .nii.gz."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Validate extension and derive full_edit / lossy_edit from edit. 2) Read resolution_factor from subject metadata. 3) Save uploaded NIfTI as {full_edit}.nii.mask.gz. 4) If {lossy_edit}.nii.gz exists, nearest-neighbor zoom the mask to lossy dimensions and save {lossy_edit}.nii.mask.gz.",
+                "math": "lossy_mask = zoom(full_mask, [L_i/F_i], order=0)",
+                "diagram": "flowchart TD\n  A[Uploaded .nii.gz] --> B[Save full-res mask]\n  B --> C{Lossy image exists?}\n  C -->|yes| D[Zoom mask to lossy shape]\n  C -->|no| E[Done]\n  D --> E"
+              },
+              "related": [
+                "save-mask",
+                "download-mask",
+                "delete-mask"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "External NIfTI mask imported and paired with a lossy downscale",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "download-mask",
+              "title": "Download Mask",
+              "keywords": [
+                "mask",
+                "download",
+                "export",
+                "nifti",
+                "full resolution"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "DownloadMaskView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Downloads the full-resolution mask file for a given edit as an attachment. Strips _lossy from the edit name so users always receive the native full-res sidecar regardless of which resolution they were viewing.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Subject or scan folder name; use \"atlas\" for atlas masks."
+                },
+                {
+                  "name": "edit",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Edit name (may include .nii.gz and/or _lossy). Defaults to {filename}.nii.gz when empty or null."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Strip .nii.gz and _lossy to get full_edit. 2) Locate {full_edit}.nii.mask.gz under extracted/{filename} or atlas/. 3) Temporarily rename to standard .nii.gz extension. 4) Stream file via FileResponse with Content-Disposition attachment header. 5) Restore custom extension.",
+                "math": null,
+                "diagram": "flowchart TD\n  A[edit param] --> B[Derive full_edit]\n  B --> C[Locate .nii.mask.gz]\n  C --> D[Temp rename + FileResponse]\n  D --> E[Restore extension]"
+              },
+              "related": [
+                "load-mask",
+                "upload-mask"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Full-resolution mask exported as a downloadable NIfTI sidecar",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "delete-mask",
+              "title": "Delete Mask",
+              "keywords": [
+                "mask",
+                "delete",
+                "remove",
+                "full resolution",
+                "lossy"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "DeleteMaskView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Removes both full-resolution and lossy mask sidecars for a given edit. Use this when clearing brush data before re-labeling or when discarding an obsolete mask without deleting the underlying image edits.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Subject or scan folder name; use \"atlas\" for atlas masks."
+                },
+                {
+                  "name": "edit",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Edit name (may include .nii.gz and/or _lossy). Defaults to {filename}.nii.gz when empty or null."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Derive full_edit and lossy_edit from edit. 2) Build paths for {full_edit}.nii.mask.gz and {lossy_edit}.nii.mask.gz. 3) Delete each file that exists. 4) Return 404 if neither file was found.",
+                "math": null,
+                "diagram": "flowchart TD\n  A[edit param] --> B[full + lossy mask paths]\n  B --> C[Delete existing files]\n  C --> D{Any deleted?}\n  D -->|yes| E[200 OK]\n  D -->|no| F[404]"
+              },
+              "related": [
+                "save-mask",
+                "copy-mask-to-reference"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Both full and lossy mask sidecars removed from the subject folder",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "copy-mask-to-reference",
+              "title": "Copy Mask to Reference",
+              "keywords": [
+                "mask",
+                "copy",
+                "reference",
+                "transfer",
+                "batch alignment"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "CopyMaskToReferenceView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Copies a saved mask from one subject scan to another (reference) scan in the same project. Copies both full-resolution and lossy sidecars when present, overwriting destination files atomically via a temp file. Use after rigid alignment when a mask drawn on one subject should seed labeling on a homologous reference.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory containing extracted/ subjects."
+                },
+                {
+                  "name": "selected_scan",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Source subject folder name."
+                },
+                {
+                  "name": "selected_edit_mask",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Source mask filename (typically the lossy mask name passed from the frontend)."
+                },
+                {
+                  "name": "reference_scan",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Destination subject folder name; must differ from selected_scan."
+                },
+                {
+                  "name": "reference_edit_mask",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Destination mask filename stem (lossy form from frontend)."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Reject if selected_scan equals reference_scan. 2) Locate full and lossy source masks under extracted/{selected_scan}/. 3) For each found mask, copy to extracted/{reference_scan}/ with the reference edit name (strip _lossy for full, keep for lossy). 4) Use shutil.copy2 to a .tmp file, verify size, then atomic os.replace. 5) Report copied and overwritten filenames.",
+                "math": null,
+                "diagram": "flowchart TD\n  A[Source scan + mask] --> B[Find full + lossy masks]\n  B --> C[Map to reference edit names]\n  C --> D[Atomic copy via .tmp]\n  D --> E[Return copied/overwritten list]"
+              },
+              "related": [
+                "save-mask",
+                "apply-mask-to-image"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Mask copied from a labeled subject to an aligned reference scan",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "list-mask-folders",
+              "title": "List Mask Folders",
+              "keywords": [
+                "mask",
+                "folders",
+                "list",
+                "batch",
+                "organization"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "ListMaskFoldersView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Returns the names of existing mask output folders under {directory}/masks/. Use this to populate UI dropdowns before applying or batch-applying masks, or to confirm whether a named mask collection already exists.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory whose masks/ subfolder will be listed."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Build path {directory}/masks/. 2) If the directory does not exist, return an empty list with count 0. 3) Otherwise list subdirectory names, sort alphabetically, and return mask_folders and count.",
+                "math": null,
+                "diagram": "flowchart TD\n  A[directory] --> B[masks/ exists?]\n  B -->|no| C[Empty list]\n  B -->|yes| D[List + sort subdirs]\n  D --> E[Return mask_folders]"
+              },
+              "related": [
+                "apply-mask-to-image",
+                "batch-apply-mask-to-scans"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Mask folder names listed from the project masks directory",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "apply-mask",
+          "title": "Apply Mask",
+          "methods": [
+            {
+              "id": "apply-mask-to-image",
+              "title": "Apply Mask to Image",
+              "keywords": [
+                "mask",
+                "apply",
+                "zero",
+                "crop",
+                "mask folder",
+                "edit_0"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "ApplyMaskToImageView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Applies a saved full-resolution mask to its corresponding image edit and writes a new masked dataset into masks/{mask_folder}/. Non-masked voxels are zeroed, the result is saved as edit_0 (preserving any edit suffix), a lossy preview is generated, metadata is copied without lossy_compression, and elastic transforms from the next edit are renumbered to edit_1 when present.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Subject or scan folder name; use \"atlas\" for atlas data."
+                },
+                {
+                  "name": "edit",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Source edit being masked (e.g. scan_lossy.nii.gz). Defaults to {filename}_lossy.nii.gz when empty or null."
+                },
+                {
+                  "name": "mask_folder",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Target folder name under masks/ where the masked copy will be stored."
+                },
+                {
+                  "name": "create_new",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "When true, logs initialization of a new mask folder (directory structure is always created as needed)."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Create masks/{mask_folder}/extracted/{filename}/ (or atlas/). 2) Copy project_settings.json once. 3) If the source edit has a following elastic edit, copy and rename elastic fwd/inv fields to edit_1. 4) Write an empty top-level {filename}.nii.gz placeholder. 5) Copy metadata minus lossy_compression. 6) Load full-res mask and image; zero voxels where mask == 0. 7) Save {filename}_edit_0{suffix}.nii.gz plus empty {filename}.nii.gz and {filename}_lossy.nii.gz placeholders. 8) Generate lossy edit_0 via RegistrationTools.save_as_lossy_nifti (fallback: scipy zoom).",
+                "math": "masked = image * (mask > 0)",
+                "diagram": "flowchart TD\n  A[Load mask + image] --> B[binary_mask = mask > 0]\n  B --> C[Zero outside mask]\n  C --> D[Save edit_0 full + lossy]\n  D --> E[Copy metadata + elastic to mask folder]"
+              },
+              "related": [
+                "batch-apply-mask-to-scans",
+                "list-mask-folders",
+                "save-mask"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Masked volume written to masks/{folder} as edit_0 with lossy companion",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "batch-apply-mask-to-scans",
+              "title": "Batch Apply Mask to Scans",
+              "keywords": [
+                "mask",
+                "batch",
+                "label",
+                "apply",
+                "dilation",
+                "flag filter",
+                "progress"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "BatchApplyMaskToScansView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Applies a single label value from each subject's latest full-resolution mask across all eligible scans in extracted/ (and atlas when present). Subjects without the label or without a mask are skipped. Optionally dilates the label region before zeroing everything outside it. Writes results into masks/{mask_folder}/ and broadcasts WebSocket progress updates.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory containing extracted/."
+                },
+                {
+                  "name": "label",
+                  "type": "int",
+                  "default": "required",
+                  "description": "Mask label value (0–255) to isolate and apply."
+                },
+                {
+                  "name": "mask_folder",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Target folder name under masks/."
+                },
+                {
+                  "name": "create_new",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "When true, explicitly creates the masks/{mask_folder}/ directory before processing."
+                },
+                {
+                  "name": "dilation",
+                  "type": "int",
+                  "default": "0",
+                  "description": "Morphological dilation of the label mask in voxels before applying (clamped 0–100)."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "str",
+                  "default": "off",
+                  "description": "Batch subject filter for flagged scans: \"off\" (all), \"exclude\" (skip flagged), or \"only\" (flagged only)."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Enumerate voxel subjects in extracted/ (+ atlas), excluding faulty scans, preserved meshes, and applying flagFilter. 2) For each subject, find the latest full-res .nii.mask.gz (no _lossy). 3) Skip if no mask or label not in unique values. 4) Build label_mask = (mask == label), optionally dilate. 5) Multiply image by label_mask; save as edit_0 under masks/{mask_folder}/extracted/{subject}/. 6) Copy metadata (no lossy_compression), create lossy edit_0, copy/rename elastic transforms and masked elastic copies when present. 7) Emit progress_group WebSocket events.",
+                "math": "masked = image * dilate(mask == label, dilation)",
+                "diagram": "flowchart TD\n  A[All subjects] --> B[Filter flags/meshes/faulty]\n  B --> C[Latest full-res mask]\n  C --> D{Label present?}\n  D -->|no| E[Skip]\n  D -->|yes| F[Optional dilation]\n  F --> G[Multiply + save edit_0]\n  G --> H[Next subject]"
+              },
+              "related": [
+                "apply-mask-to-image",
+                "batch-mask-out-scans",
+                "list-mask-folders"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Single label applied across all subjects into a shared mask folder",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "mask-out",
+          "title": "Mask Out",
+          "methods": [
+            {
+              "id": "mask-out-labels",
+              "title": "Mask Out Labels",
+              "keywords": [
+                "mask out",
+                "delete",
+                "isolate",
+                "labels",
+                "edit",
+                "landmarks",
+                "invert"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "MaskOutLabelsView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Creates a new in-place edit by zeroing voxels in the current image that match one or more mask labels (or, with invert=true, keeping only those voxels). Saves {filename}_edit_{N}_masked.nii.gz plus a lossy companion, copies and downsamples the mask to the new edit, and copies landmarks unchanged because geometry is not transformed.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Subject or scan folder name; use \"atlas\" for atlas data."
+                },
+                {
+                  "name": "edit",
+                  "type": "str",
+                  "default": "filename",
+                  "description": "Current edit name (e.g. scan_edit_2_elastic.nii.gz). Defaults to filename when omitted."
+                },
+                {
+                  "name": "labels",
+                  "type": "list[int]",
+                  "default": "required",
+                  "description": "Non-empty array of positive label integers to mask out (e.g. [1] or [1, 2, 3])."
+                },
+                {
+                  "name": "fullResolutionState",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "Resolution context from the frontend (mask and image are always loaded at full resolution regardless)."
+                },
+                {
+                  "name": "invert",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "False: zero labeled voxels (mask out). True: zero everything except labeled voxels (isolate)."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Load full-res mask and image for edit. 2) Build combined_mask = OR(mask == label) for all labels; error if zero voxels. 3) If invert: zero ~combined_mask; else zero combined_mask. 4) Find next free edit number N. 5) Save {filename}_edit_{N}_masked.nii.gz. 6) Create lossy version via RegistrationTools.save_as_lossy_nifti. 7) Copy source mask to new edit; downsample lossy mask by resolution_factor stride slices. 8) Copy landmarks and landmark_distances JSON without transformation.",
+                "math": "combined = OR_i (mask == label_i); output = image * (invert ? combined : ~combined)",
+                "diagram": "flowchart TD\n  A[labels + edit] --> B[Load full mask + image]\n  B --> C[combined_mask OR labels]\n  C --> D{invert?}\n  D -->|false| E[Zero labeled voxels]\n  D -->|true| F[Zero unlabeled voxels]\n  E --> G[Save edit_N_masked + lossy]\n  F --> G\n  G --> H[Copy mask + landmarks]"
+              },
+              "related": [
+                "batch-mask-out-scans",
+                "save-mask"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Labeled region removed or isolated into a new _masked edit",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "batch-mask-out-scans",
+              "title": "Batch Mask Out Scans",
+              "keywords": [
+                "mask out",
+                "batch",
+                "label",
+                "elastic",
+                "overwrite",
+                "dilation",
+                "flag filter"
+              ],
+              "source": {
+                "file": "maskOperations.py",
+                "symbol": "BatchMaskOutScansView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Runs mask-out on every eligible subject in extracted/ (and atlas) for a single label, creating new _masked edits in-place rather than in a mask subfolder. Handles elastic-edit insertion by bumping elastic files forward, supports optional dilation, and can overwrite an existing masked-before-elastic slot when overwrite=true. Skips mesh-only and flagged subjects per flagFilter.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Root data directory containing extracted/."
+                },
+                {
+                  "name": "label",
+                  "type": "int",
+                  "default": "required",
+                  "description": "Mask label value (0–255) to mask out or isolate."
+                },
+                {
+                  "name": "invert",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "False: zero labeled voxels. True: keep only labeled voxels."
+                },
+                {
+                  "name": "overwrite",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "When true, replace an existing masked edit inserted before elastic using the prior edit as source; when false, skip subjects where that insertion already exists."
+                },
+                {
+                  "name": "dilation",
+                  "type": "int",
+                  "default": "0",
+                  "description": "Morphological dilation of the label mask in voxels before applying (clamped 0–100)."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "str",
+                  "default": "off",
+                  "description": "Batch subject filter for flagged scans: \"off\", \"exclude\", or \"only\"."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Enumerate and filter subjects (faulty, mesh-only, flagFilter). 2) For each subject, detect next edit slot and whether latest edit is elastic or already masked. 3) Skip if masked insertion exists and overwrite=false. 4) Select source mask (latest, or edit before elastic/overwrite slot). 5) combined_mask = (mask == label), optional dilation; apply invert logic to image. 6) If elastic follows: bump elastic files E→E+1, insert masked at E, mask elastic copies in-place. 7) Save edit_N_masked + lossy, copy/downsample mask, copy landmarks. 8) Fix lossy_compression metadata after elastic bump. 9) Broadcast progress_group events.",
+                "math": "combined = dilate(mask == label, dilation); output[v] = 0 where (invert ? ~combined : combined)[v]",
+                "diagram": "flowchart TD\n  A[Each subject] --> B{Elastic is latest?}\n  B -->|yes| C[Bump elastic + insert masked before]\n  B -->|no| D[Use next edit slot]\n  C --> E[Apply label mask to image]\n  D --> E\n  E --> F[Save _masked edit + lossy]\n  F --> G[Copy mask + landmarks]"
+              },
+              "related": [
+                "mask-out-labels",
+                "batch-apply-mask-to-scans"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Batch label removal across subjects with elastic-edit slot management",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

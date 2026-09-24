@@ -1,0 +1,1019 @@
+{
+  "categories": [
+    {
+      "id": "mesh-tools",
+      "title": "Mesh Tools",
+      "subcategories": [
+        {
+          "id": "preserved-mesh-editing",
+          "title": "Preserved Mesh Editing",
+          "methods": [
+            {
+              "id": "mesh-edit-mixin",
+              "title": "Mesh Edit Mixin",
+              "keywords": [
+                "preserved mesh",
+                "ply edit",
+                "landmarks",
+                "metadata",
+                "edit chain",
+                "trimesh"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "MeshEditMixin",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Shared backend mixin for preserved PLY scan edits. Resolves source meshes from the edit chain on disk (filename_edit_N_operation.ply), loads and validates Trimesh geometry, writes new edits through PreservedMeshEditWriter (which also refreshes quick-grid projection PNGs), and propagates landmark JSON plus distance sidecars whenever topology or coordinates change. Edit filenames are the source of truth; the scan JSON stores mesh summaries and elastic metadata but not a full edit list.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root directory containing extracted/."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Scan stem name (folder under extracted/)."
+                },
+                {
+                  "name": "edit",
+                  "type": "string | null",
+                  "default": "latest",
+                  "description": "Specific PLY basename to use as input, or \"latest\" for the highest-numbered _edit_* PLY."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Locate subject dir at extracted/{filename}/ and load {filename}.json metadata. 2) Resolve source PLY via edit argument or latest glob match on {filename}_edit_*_*.ply. 3) Load geometry with trimesh (concatenate multi-body scenes). 4) After an operation, allocate the next edit number, write {filename}_edit_{N}_{operation}.ply via PreservedMeshEditWriter.save, update landmarks for the new stem when present, and append mesh_summary to JSON metadata.",
+                "math": "",
+                "diagram": "flowchart TD\n  A[HTTP ApplyMesh* request] --> B[Load metadata JSON]\n  B --> C[Resolve source PLY edit]\n  C --> D[Load Trimesh]\n  D --> E[Run mesh operation]\n  E --> F[PreservedMeshEditWriter.save]\n  F --> G[Propagate landmarks]\n  G --> H[Update scan JSON metadata]"
+              },
+              "related": [
+                "preserved-mesh-edit-writer",
+                "apply-mesh-crop",
+                "apply-mesh-slice",
+                "apply-mesh-rotation",
+                "apply-mesh-cleanup",
+                "apply-mesh-shell",
+                "apply-mesh-snap-to-mesh"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Preserved-mesh edit chain: base PLY plus numbered _edit_N_operation.ply files",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "preserved-mesh-edit-writer",
+              "title": "Preserved Mesh Edit Writer",
+              "keywords": [
+                "ply export",
+                "welded mesh",
+                "projection png",
+                "quick grid",
+                "mesh grid"
+              ],
+              "source": {
+                "file": "meshGridTools.py",
+                "symbol": "PreservedMeshEditWriter",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Canonical export path for every preserved-mesh PLY edit. Welds coincident vertices so downstream tools see one connected surface, writes the PLY to disk, then regenerates front and back isometric projection PNGs used by the quick-access mesh grid. All ApplyMesh* endpoints and mesh elastic registration save through this writer.",
+              "options": [
+                {
+                  "name": "mesh",
+                  "type": "trimesh.Trimesh",
+                  "default": "required",
+                  "description": "Mesh geometry to persist."
+                },
+                {
+                  "name": "output_path",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Absolute or relative path for the output .ply file."
+                }
+              ],
+              "algorithm": {
+                "text": "1) ensure_welded_trimesh merges duplicate vertex indices along shared edges. 2) Export PLY with trimesh. 3) Call ensure_mesh_projection_pngs(output_path, force=True) to render transparent front/back isometric PNGs beside the PLY.",
+                "math": "",
+                "diagram": "flowchart LR\n  A[Trimesh] --> B[Weld vertices]\n  B --> C[Export PLY]\n  C --> D[ensure_mesh_projection_pngs]\n  D --> E[Front + back PNG pair]"
+              },
+              "related": [
+                "mesh-edit-mixin",
+                "ensure-mesh-projection-pngs",
+                "generate-mesh-grid-preview-jpeg"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Front and back projection PNGs regenerated after each PLY edit",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "ensure-mesh-projection-pngs",
+              "title": "Ensure Mesh Projection PNGs",
+              "keywords": [
+                "projection",
+                "quick grid",
+                "thumbnail",
+                "vtk render",
+                "preserved mesh"
+              ],
+              "source": {
+                "file": "meshGridTools.py",
+                "symbol": "ensure_mesh_projection_pngs",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Creates or refreshes the front ({stem}_projection.png) and back ({stem}_projection_back.png) thumbnail pair for a preserved-mesh PLY when missing or stale. Skips work when PNG mtimes are newer than the PLY unless force=True.",
+              "options": [
+                {
+                  "name": "ply_path",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Path to the preserved-mesh .ply file."
+                },
+                {
+                  "name": "force",
+                  "type": "boolean",
+                  "default": "false",
+                  "description": "When true, regenerate PNGs even if they appear up to date."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Compare PLY mtime against both projection PNGs; return early if current. 2) load_centered_preserved_mesh for display-normalized vertices. 3) Render isometric VTK screenshots (opposite view signs for front vs back). 4) Save composited RGBA PNGs next to the PLY.",
+                "math": "",
+                "diagram": ""
+              },
+              "related": [
+                "preserved-mesh-edit-writer",
+                "generate-mesh-grid-preview-jpeg"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Isometric front/back projections used in the scan grid",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "generate-mesh-grid-preview-jpeg",
+              "title": "Generate Mesh Grid Preview JPEG",
+              "keywords": [
+                "grid preview",
+                "jpeg",
+                "quadrant",
+                "axial",
+                "sagittal",
+                "coronal"
+              ],
+              "source": {
+                "file": "meshGridTools.py",
+                "symbol": "generate_mesh_grid_preview_jpeg",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Builds a 2×2 JPEG mosaic (axial, isometric, sagittal, coronal orthographic renders) from a preserved-mesh PLY for richer grid or preview responses. Each quadrant is rendered at QUADRANT_RENDER_SIZE then pasted into a single composite image.",
+              "options": [
+                {
+                  "name": "ply_path",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Path to the preserved-mesh .ply file to preview."
+                }
+              ],
+              "algorithm": {
+                "text": "1) load_centered_preserved_mesh. 2) Render four orthographic/isometric VTK screenshots with fixed camera setups. 3) Resize each to a common quadrant size preserving aspect ratio. 4) Composite into a 2×2 RGB image and encode as JPEG bytes (GRID_PREVIEW_JPEG_QUALITY).",
+                "math": "",
+                "diagram": "flowchart TD\n  PLY[PLY path] --> C[Centered mesh]\n  C --> Q1[Axial]\n  C --> Q2[Isometric]\n  C --> Q3[Sagittal]\n  C --> Q4[Coronal]\n  Q1 --> G[2x2 JPEG mosaic]\n  Q2 --> G\n  Q3 --> G\n  Q4 --> G"
+              },
+              "related": [
+                "ensure-mesh-projection-pngs",
+                "preserved-mesh-edit-writer"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Four-quadrant mesh preview mosaic returned as JPEG bytes",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "mesh-edit-operations",
+          "title": "Mesh Edit HTTP Operations",
+          "methods": [
+            {
+              "id": "apply-mesh-crop",
+              "title": "Apply Mesh Crop",
+              "keywords": [
+                "crop",
+                "bounding box",
+                "clip",
+                "reorigin",
+                "preserved mesh",
+                "POST apply-mesh-crop"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "ApplyMeshCropView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Clips a preserved-mesh PLY to an axis-aligned bounding box and saves a new _cropped.ply edit. Expands the box by optional padding, re-originates surviving vertices so the crop minimum becomes the new origin, and drops landmarks outside the box while re-originating kept positions.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Scan stem to crop."
+                },
+                {
+                  "name": "edit",
+                  "type": "string | null",
+                  "default": "null",
+                  "description": "Source PLY basename; omit to use metadata mesh_file or latest edit."
+                },
+                {
+                  "name": "crop",
+                  "type": "number[6]",
+                  "default": "required",
+                  "description": "Two corners [x0,y0,z0,x1,y1,z1] in mesh mm; min/max are taken automatically."
+                },
+                {
+                  "name": "padding",
+                  "type": "number",
+                  "default": "0",
+                  "description": "Extra mm added outward on every axis before clipping."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Load source mesh. 2) Compute mins/maxs from crop corners ± padding. 3) Clip faces outside the box and shift vertices with reorigin_mesh_coords_after_mm_crop. 4) Write {filename}_edit_{N}_cropped.ply. 5) Filter and re-origin landmarks; copy subset of landmark distances.",
+                "math": "mins = min(corners[:3], corners[3:]) − padding; maxs = max(corners[:3], corners[3:]) + padding. After clip, v' = v − mins + padding.",
+                "diagram": ""
+              },
+              "related": [
+                "mesh-edit-mixin",
+                "apply-mesh-slice"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Axis-aligned crop box applied to a preserved craniofacial mesh",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "apply-mesh-slice",
+              "title": "Apply Mesh Slice",
+              "keywords": [
+                "slice",
+                "slicer",
+                "isolate",
+                "delete",
+                "plane clip",
+                "preview",
+                "POST apply-mesh-slice"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "ApplyMeshSliceView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Interactive slicer for preserved meshes and voxel volumes. Accepts a list of wedge operations (convex volumes defined by plane sets from volumes or outline rays). For preserved meshes, save=false returns a GLB preview without writing; save=true (or commit=true) writes _sliced.ply or _sliced.nii.gz depending on scan type. Landmarks are kept or removed according to the same wedge rules as geometry.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Scan stem."
+                },
+                {
+                  "name": "edit",
+                  "type": "string | null",
+                  "default": "null",
+                  "description": "Source edit basename."
+                },
+                {
+                  "name": "operations",
+                  "type": "object[]",
+                  "default": "required",
+                  "description": "Non-empty list of slicer operations (see action, volumes, outline_points, outline_rays)."
+                },
+                {
+                  "name": "save",
+                  "type": "boolean",
+                  "default": "false",
+                  "description": "When true, persist a sliced edit. Aliased by commit."
+                },
+                {
+                  "name": "commit",
+                  "type": "boolean",
+                  "default": "false",
+                  "description": "Truthy alias for save."
+                },
+                {
+                  "name": "operations[].action",
+                  "type": "string",
+                  "default": "required",
+                  "description": "\"isolate\" keeps geometry inside any wedge; \"delete\" removes geometry inside wedges."
+                },
+                {
+                  "name": "operations[].volumes",
+                  "type": "object[]",
+                  "default": "optional",
+                  "description": "Each volume supplies rays converted to plane sets; alternative to outline_points/outline_rays."
+                },
+                {
+                  "name": "operations[].outline_points",
+                  "type": "number[][]",
+                  "default": "optional",
+                  "description": "Outline vertex indices paired with outline_rays when volumes is omitted."
+                },
+                {
+                  "name": "operations[].outline_rays",
+                  "type": "object[]",
+                  "default": "optional",
+                  "description": "Ray definitions parallel to outline_points; triangulated into wedge plane sets."
+                }
+              ],
+              "algorithm": {
+                "text": "For each operation: build plane sets from volumes or triangulated outline rays. isolate: clip mesh to each wedge and concatenate survivors; delete: subtract convex volumes from the mesh. Repeat sequentially. Mesh path uses view-projected plane clipping; voxel path masks foreground voxels in physical mm. Preview mode returns decimated GLB via _mesh_preview_payload without writing files.",
+                "math": "Point p is inside a wedge when dot(p − origin_i, normal_i) ≥ 0 for all planes i in that wedge.",
+                "diagram": "flowchart TD\n  R[operations list] --> A{action}\n  A -->|isolate| I[Clip to wedge union]\n  A -->|delete| D[Subtract wedges]\n  I --> N[Next operation]\n  D --> N\n  N --> S{save?}\n  S -->|no| P[GLB preview]\n  S -->|yes| W[Write _sliced edit]"
+              },
+              "related": [
+                "mesh-edit-mixin",
+                "apply-mesh-crop"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Slicer wedge defined by view-projected planes isolating part of a mesh",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "apply-mesh-rotation",
+              "title": "Apply Mesh Rotation",
+              "keywords": [
+                "rotation",
+                "babylon",
+                "manual align",
+                "preserved mesh",
+                "POST apply-mesh-rotation"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "ApplyMeshRotationView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Applies a manual rotation from the Babylon 3D viewer to a preserved-mesh PLY and saves _rotated.ply. Converts the Babylon 3×3 display matrix (Y/Z axis flip relative to stored PLY coordinates) into raw mesh space, rotates vertices about quick_mesh_properties.center (or surface centroid fallback), and rotates landmark positions identically.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Scan stem."
+                },
+                {
+                  "name": "edit",
+                  "type": "string | null",
+                  "default": "null",
+                  "description": "Source PLY basename."
+                },
+                {
+                  "name": "rotation",
+                  "type": "object",
+                  "default": "required",
+                  "description": "Babylon rotation payload; rotation._m must contain keys 0,1,2,4,5,6,8,9,10 forming a 3×3 matrix."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Extract 3×3 matrix from rotation._m. 2) Map to raw mesh basis: R_raw = diag(1,−1,−1) · R_babylon · diag(1,−1,−1). 3) Rotate vertices: v' = (v − c) @ R_raw + c. 4) Apply same transform to landmarks. 5) Write _rotated.ply and store rotation matrices in edit metadata.",
+                "math": "v' = (v − c) R_{raw} + c, where c is rotation_center from quick_mesh_properties.",
+                "diagram": ""
+              },
+              "related": [
+                "mesh-edit-mixin",
+                "apply-mesh-crop"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Manual rotation applied in the viewer then committed as a preserved-mesh edit",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "apply-mesh-cleanup",
+              "title": "Apply Mesh Cleanup",
+              "keywords": [
+                "cleanup",
+                "connected components",
+                "islands",
+                "disconnected mesh",
+                "POST apply-mesh-cleanup"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "ApplyMeshCleanupView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Removes disconnected mesh islands from a preserved PLY, keeping the largest surface-area component by default or all components above a minimum area fraction. Writes _cleaned.ply when components are removed; returns skipped status when the mesh is already a single component or cleanup preconditions fail (e.g. post-elastic edits).",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Scan stem."
+                },
+                {
+                  "name": "edit",
+                  "type": "string",
+                  "default": "latest",
+                  "description": "Source PLY basename; defaults to latest edit."
+                },
+                {
+                  "name": "use_island_volume_threshold",
+                  "type": "boolean",
+                  "default": "false",
+                  "description": "When true, keep every component whose surface area ≥ min_island_volume_percent of total area."
+                },
+                {
+                  "name": "min_island_volume_percent",
+                  "type": "number",
+                  "default": "1.0",
+                  "description": "Minimum component area as percent of total surface area (clipped to 0.1–30)."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Build face adjacency graph via scipy connected_components on welded edges. 2) Score each component by surface area. 3) Select keep_indices (largest only, or all above threshold). 4) Drop faces from removed components, remove_unreferenced_vertices. 5) Drop landmarks whose nearest face was removed. 6) Save _cleaned.ply.",
+                "math": "min_area = (min_island_volume_percent / 100) × Σ surface_area_i.",
+                "diagram": ""
+              },
+              "related": [
+                "mesh-edit-mixin",
+                "apply-mesh-shell"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Small floating islands removed from a thresholded mesh",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "apply-mesh-shell",
+              "title": "Apply Mesh Shell",
+              "keywords": [
+                "outer shell",
+                "get_outer_mesh",
+                "alpaca",
+                "complex volume",
+                "POST apply-mesh-shell"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "ApplyMeshShellView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Extracts the externally visible outer surface and saves it as a new edit. For preserved meshes: alpaca.get_outer_mesh on the PLY → _shell.ply. For voxel scans: marching cubes at threshold, outer-shell extraction, rasterize to a thickened volume mask (~10 voxel dilation), and save _shell.nii.gz plus lossy preview. Landmarks far from the shell surface are dropped.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Scan stem."
+                },
+                {
+                  "name": "edit",
+                  "type": "string | null",
+                  "default": "null",
+                  "description": "Source edit basename."
+                },
+                {
+                  "name": "gaussian_blur",
+                  "type": "number | null",
+                  "default": "null",
+                  "description": "Optional Gaussian sigma applied to voxel volume before marching cubes (voxel path only)."
+                }
+              ],
+              "algorithm": {
+                "text": "Preserved mesh: load PLY → alpaca.get_outer_mesh → trimesh cleanup → PreservedMeshEditWriter. Voxel: load NIfTI → optional blur → marching_cubes → outer shell → rasterize shell to binary mask → dilate 10 iterations → keep original intensities inside mask → write full-res and lossy NIfTI edits.",
+                "math": "",
+                "diagram": "flowchart TD\n  M{preserved mesh?}\n  M -->|yes| P[alpaca.get_outer_mesh on PLY]\n  M -->|no| V[MC + outer shell + rasterize]\n  P --> S[Save _shell.ply]\n  V --> T[Save _shell.nii.gz]"
+              },
+              "related": [
+                "apply-mesh-cleanup",
+                "mesh-elastic-registration"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Nested iso-surface reduced to a single outer shell suitable for NR-ICP",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "apply-mesh-snap-to-mesh",
+              "title": "Apply Mesh Snap to Mesh",
+              "keywords": [
+                "snap",
+                "landmarks",
+                "closest point",
+                "outer shell",
+                "POST apply-mesh-snap-to-mesh"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "ApplyMeshSnapToMeshView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Projects landmark positions onto the nearest point on the preserved-mesh surface (optionally the outer shell only), overwriting the scan's landmark JSON in place. Recomputes per-landmark distances and writes scan metadata statistics (mean/std, outlier counts vs voxel_size).",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "filename",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Scan stem."
+                },
+                {
+                  "name": "edit",
+                  "type": "string",
+                  "default": "latest",
+                  "description": "PLY edit whose stem selects {stem}_landmarks.json."
+                },
+                {
+                  "name": "use_outer_shell",
+                  "type": "boolean",
+                  "default": "true",
+                  "description": "When true, snap against alpaca.get_outer_mesh of the loaded PLY."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Load mesh (outer shell optional). 2) Read landmarks for edit stem. 3) alpaca.calculate_landmarks_closest_points moves each landmark to the nearest triangle surface point. 4) Write updated landmarks JSON and {stem}_landmark_distances.json with snap_distance array. 5) Update metadata.landmarks summary fields.",
+                "math": "snap_distance_i = ||p_i − closest_point_i||_2.",
+                "diagram": ""
+              },
+              "related": [
+                "mesh-edit-mixin",
+                "apply-mesh-shell"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Landmarks moved from float positions onto the mesh surface",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "mesh-elastic-registration",
+          "title": "Mesh Elastic Registration",
+          "methods": [
+            {
+              "id": "mesh-elastic-registration-mixin",
+              "title": "Mesh Elastic Registration Mixin",
+              "keywords": [
+                "NR-ICP",
+                "nricp",
+                "amberg",
+                "preserved mesh",
+                "elastic",
+                "outer shell"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "MeshElasticRegistrationMixin",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Implements Non-Rigid ICP (trimesh nricp_amberg) for preserved PLY subjects, mirroring voxel ElasticRegistrationView but keeping fixed vertex topology. Presets cover facial single-sheet surfaces and complex_mesh_volume (outer-shell-only NR-ICP with k-NN displacement upsampling). Optional template masking crops subjects to a warped reference ROI before the final elastic pass. Guidepoints, when present, initialize a Procrustes pose only.",
+              "options": [
+                {
+                  "name": "mode",
+                  "type": "string",
+                  "default": "custom",
+                  "description": "Preset: \"facial\", \"complex_mesh_volume\", or \"custom\"."
+                },
+                {
+                  "name": "mesh_elastic_custom_options.steps",
+                  "type": "number[3][]",
+                  "default": "[[0.01,0.5,10],…]",
+                  "description": "Custom mode only: up to 6 rows [stiffness, normal_weight, max_iter]. Landmark weight is always 0."
+                },
+                {
+                  "name": "mesh_elastic_custom_options.gamma",
+                  "type": "number",
+                  "default": "1.0",
+                  "description": "Custom mode NR-ICP gamma (0.01–10)."
+                },
+                {
+                  "name": "mesh_elastic_custom_options.eps",
+                  "type": "number",
+                  "default": "0.0001",
+                  "description": "Custom mode convergence epsilon (1e-6–1)."
+                },
+                {
+                  "name": "distance_threshold",
+                  "type": "number",
+                  "default": "0.10",
+                  "description": "Custom mode correspondence cutoff in mm (0.01–0.5). Presets supply their own values."
+                },
+                {
+                  "name": "use_vertex_normals",
+                  "type": "boolean",
+                  "default": "true",
+                  "description": "Enable normal terms in NR-ICP stages."
+                },
+                {
+                  "name": "use_outer_shell",
+                  "type": "boolean",
+                  "default": "false",
+                  "description": "Extract outer shell on reference (and honor preset defaults)."
+                },
+                {
+                  "name": "outer_shell_only",
+                  "type": "boolean",
+                  "default": "false",
+                  "description": "Register decimated outer shells; upsample displacements back to full topology."
+                },
+                {
+                  "name": "auto_extract_subject_outer_shell",
+                  "type": "boolean",
+                  "default": "false",
+                  "description": "Persist _shell.ply before NR-ICP; requires outer_shell_only=true."
+                },
+                {
+                  "name": "mask_subject_with_template",
+                  "type": "boolean",
+                  "default": "false",
+                  "description": "Warp reference template to subject ROI and crop subject geometry (facial preset option)."
+                },
+                {
+                  "name": "mask_pad_centroid_fraction",
+                  "type": "number",
+                  "default": "0.04",
+                  "description": "Parallel-to-surface pad as a fraction of reference centroid size (0.005–0.20): max(|normal offset|, tangential exterior), a smooth along-surface ROI without the rounded isotropic rim tube."
+                },
+                {
+                  "name": "tps_alpha_spacing_fraction",
+                  "type": "number",
+                  "default": "0.25",
+                  "description": "TPS regularization spacing fraction when TPS displacement propagation is used."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Load reference surface in registration frame (preserved mesh → shared mm; voxel → marching cubes). 2) Persist mesh_elastic_reference_ply in reference JSON. 3) For each eligible subject: optionally shell/mask, gather guidepoints for Procrustes init, run decimated NR-ICP (_run_mesh_nricp, cap ≈35000 verts). 4) Assert elastic output preserves source topology. 5) Save _elastic.ply, compute surface metrics, set elastic_to metadata.",
+                "math": "NR-ICP stages use stiffness w_s, normal weight w_n, landmark weight w_l=0. Surface score = 1 − fraction(distances > 6×voxel_size_mm).",
+                "diagram": "flowchart TD\n  Ref[Load reference surface] --> Persist[Save mesh_elastic_reference.ply metadata]\n  Subj[For each subject] --> Shell{outer shell?}\n  Shell -->|auto| SH[Write _shell.ply]\n  Shell -->|skip| Mask\n  SH --> Mask{template mask?}\n  Mask -->|yes| MK[Write _masked.ply]\n  Mask -->|no| NR[NR-ICP]\n  MK --> NR\n  NR --> EL[Write _elastic.ply + metrics]"
+              },
+              "related": [
+                "mesh-elastic-registration",
+                "load-mesh-elastic-reference-surface",
+                "compute-mesh-to-reference-surface-distances"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Subject mesh elastically deformed onto reference while preserving vertex indices",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "mesh-elastic-registration",
+              "title": "Mesh Elastic Registration",
+              "keywords": [
+                "batch elastic",
+                "NR-ICP",
+                "preserved mesh",
+                "POST mesh-elastic-registration",
+                "WebSocket progress"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "MeshElasticRegistrationView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Batch HTTP endpoint (POST mesh-elastic-registration/) that runs mesh elastic registration on all preserved-mesh subjects in a project. Skips the reference, faulty scans, subjects that already have an _elastic.ply edit, and applies flagFilter. Streams WebSocket progress to progress_group and returns a count of successful registrations.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "reference",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Reference scan stem (or atlas) to register toward."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "string",
+                  "default": "off",
+                  "description": "Subject flag filter passed to apply_flag_filter (same as voxel elastic registration)."
+                },
+                {
+                  "name": "mode",
+                  "type": "string",
+                  "default": "custom",
+                  "description": "Elastic preset or custom; see MeshElasticRegistrationMixin options."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Partition extracted folders into preserved-mesh scans. 2) Filter subjects (not reference, not faulty, no existing elastic edit, flag filter). 3) Load and persist reference surface. 4) Loop subjects with progress messages. 5) On success write _elastic.ply and elastic_surface_distance / elastic_error metadata. 6) Return 200 with registered count or 500 if all failed.",
+                "math": "",
+                "diagram": ""
+              },
+              "related": [
+                "mesh-elastic-registration-mixin",
+                "apply-mesh-shell",
+                "prepare-heatmap-reference-mesh"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Batch elastic registration progress streamed over WebSocket",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "load-mesh-elastic-reference-surface",
+              "title": "Load Mesh Elastic Reference Surface",
+              "keywords": [
+                "reference surface",
+                "mesh_elastic_reference.ply",
+                "marching cubes",
+                "registration heatmap"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "load_mesh_elastic_reference_surface",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Loads the reference triangle mesh used for mesh-elastic metrics and registration heatmaps. Resolution order: mesh_elastic_reference_ply from JSON (written at registration), preserved-mesh mesh_file PLY, dedicated voxel reference PLY basename, or marching-cubes fallback from the latest full-res NIfTI. Preserved-mesh results are mapped into the registration frame via mesh_elastic_reference_in_registration_frame.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "reference",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Reference scan stem or \"atlas\"."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Open reference JSON (atlas.json or {reference}.json). 2) Try mesh_elastic_reference_ply on disk. 3) Else try preserved mesh_file PLY. 4) Else try {reference}_mesh_elastic_reference.ply. 5) Else marching cubes latest NIfTI with Gaussian σ=1, threshold from metadata, axes 0↔2 swap, reversed face winding.",
+                "math": "",
+                "diagram": ""
+              },
+              "related": [
+                "prepare-heatmap-reference-mesh",
+                "compute-mesh-to-reference-surface-distances",
+                "mesh-elastic-registration"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Reference surface shared by elastic metrics and heatmap views",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "prepare-heatmap-reference-mesh",
+              "title": "Prepare Heatmap Reference Mesh",
+              "keywords": [
+                "heatmap",
+                "decimation",
+                "vertex cap",
+                "cache",
+                "dense distances"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "prepare_heatmap_reference_mesh",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Builds a display-budget reference mesh for per-vertex heatmap coloring on preserved-mesh subjects. The full-resolution mesh_elastic_reference.ply stays on disk for landmark propagation; this function decimates to vertex_cap (matching the subject display budget) and caches vertices/faces as NPZ beside the source PLY for fast reuse in MarchingCubesView dense distance computation.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "reference",
+                  "type": "string",
+                  "default": "required",
+                  "description": "Elastic reference stem (elastic_to)."
+                },
+                {
+                  "name": "vertex_cap",
+                  "type": "integer",
+                  "default": "required",
+                  "description": "Maximum reference vertices for heatmap queries (same cap as subject display mesh)."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Resolve full reference via load path or marching-cubes fallback. 2) Return cached NPZ if vertex_cap and source mtime match. 3) Decimate full mesh to vertex_cap with _decimate_trimesh_to_vertex_cap. 4) Save {cache_stem}_heatmap_ref_v{cap}_vertices.npz and faces NPZ. 5) Return in-memory Trimesh for distance queries.",
+                "math": "",
+                "diagram": "flowchart LR\n  Full[Full reference PLY] --> Dec[Decimate to vertex_cap]\n  Dec --> Cache[NPZ cache]\n  Cache --> Q[Open3D closest-point queries]"
+              },
+              "related": [
+                "compute-mesh-to-reference-surface-distances",
+                "load-mesh-elastic-reference-surface"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Decimated reference used for fast vertex heatmaps while full PLY remains for landmarks",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "compute-mesh-to-reference-surface-distances",
+              "title": "Compute Mesh to Reference Surface Distances",
+              "keywords": [
+                "surface distance",
+                "Open3D",
+                "RaycastingScene",
+                "heatmap",
+                "closest point"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "compute_mesh_to_reference_surface_distances",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Computes unsigned Euclidean distance from each query vertex to the nearest point on a reference triangle mesh using Open3D RaycastingScene (same approach as MarchingCubesView dense_distances for voxels). Used for preserved-mesh heatmap coloring, elastic surface metrics, and template-mask quality checks. Processes vertices in chunks for memory efficiency.",
+              "options": [
+                {
+                  "name": "query_vertices",
+                  "type": "np.ndarray (N, 3)",
+                  "default": "required",
+                  "description": "Subject vertex positions in registration mm."
+                },
+                {
+                  "name": "reference_mesh",
+                  "type": "trimesh.Trimesh",
+                  "default": "required",
+                  "description": "Reference surface mesh (often decimated for heatmaps)."
+                },
+                {
+                  "name": "label",
+                  "type": "string | null",
+                  "default": "null",
+                  "description": "Optional log label for timing messages."
+                },
+                {
+                  "name": "chunk_size",
+                  "type": "integer",
+                  "default": "100000",
+                  "description": "Number of query vertices per Open3D batch."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Build Open3D TriangleMesh from reference vertices/faces. 2) Create RaycastingScene and add triangles. 3) For each chunk of query_vertices, call compute_closest_points. 4) Store ||query − closest||₂ per vertex.",
+                "math": "d_i = min_{q ∈ surface} ||v_i − q||_2 (unsigned closest-point distance).",
+                "diagram": ""
+              },
+              "related": [
+                "prepare-heatmap-reference-mesh",
+                "mesh-elastic-surface-metric"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Per-vertex distance field colored on an elastically registered subject mesh",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "mesh-elastic-surface-metric",
+              "title": "Mesh Elastic Surface Metric",
+              "keywords": [
+                "elastic score",
+                "surface distance",
+                "error threshold",
+                "registration quality"
+              ],
+              "source": {
+                "file": "meshBasedTools.py",
+                "symbol": "mesh_elastic_surface_metric",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Summarizes a distance array into the scalar scores stored on elastic subjects: fraction of vertices above threshold, elastic_surface_distance (1 minus that fraction), and mean distance in mm. Threshold is typically 6× reference voxel size, matching voxel ElasticRegistrationView surface scoring.",
+              "options": [
+                {
+                  "name": "distances",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "Per-vertex distances to reference surface in mm."
+                },
+                {
+                  "name": "error_threshold_mm",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Acceptance threshold in mm (usually 6 × voxel_size)."
+                }
+              ],
+              "algorithm": {
+                "text": "above_fraction = count(d > threshold) / N; surface_score = 1 − above_fraction; mean_distance = mean(d). Empty input returns (0, 0, 0).",
+                "math": "score = 1 − (1/N) Σ 𝕀(d_i > τ); mean = (1/N) Σ d_i.",
+                "diagram": ""
+              },
+              "related": [
+                "compute-mesh-to-reference-surface-distances",
+                "mesh-elastic-registration"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Elastic surface distance score derived from vertex-to-reference distances",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

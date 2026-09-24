@@ -1,0 +1,205 @@
+# Aurora Documentation Update Prompt
+# Copy this entire file into an LLM coding-agent session after changing documented code.
+#
+# Human-facing how-to for the three scenarios (change / add / remove):
+#   see WORKFLOW.md in this same folder.
+
+## Goal
+Keep the Aurora living documentation in sync with the backend source. Documentation lives in:
+  Aurora/AuroraClient/pipeline/documentation/docs_index.json
+Managed by:
+  Aurora/AuroraClient/pipeline/documentationManager.py
+
+## Steps (do these in order)
+
+1. Run the change checker from the AuroraClient directory (or any cwd — the script resolves paths):
+     python Aurora/AuroraClient/pipeline/documentation/check_docs.py
+   Or hit GET http://<aurora-host>:<port>/docs/check-changes/
+
+2. For each stale entry in the report:
+   a. Read `old_hash` / `new_hash` and the `new_source` block (verbatim current code).
+   b. Do NOT re-read the whole source file unless the change spans symbols outside this entry.
+   c. Update ONLY the affected prose fields in docs_index.json for that entry:
+        - summary
+        - options[]  (inputs: name / type / default / description)
+        - outputs[] (outputs: name / type / description — from Response/return values; omit invented fields)
+        - algorithm.text / algorithm.math / algorithm.references / algorithm.diagram
+          (see Algorithm math rules + Library backends / references below)
+        - related[]  (entry ids)
+        - video / images[] if still accurate
+   d. Leave `source.file` and `source.symbol` unchanged unless the symbol was renamed/moved.
+   e. If the symbol was renamed or moved, update `source.file` / `source.symbol` accordingly.
+   f. After prose is updated, mark the entry current:
+        python Aurora/AuroraClient/pipeline/documentation/check_docs.py --mark <entry_id>
+      Or call DocumentationManager.mark_updated(entry_id).
+
+3. If a method was added:
+   - Add a new method object under the correct category/subcategory in docs_index.json.
+   - Set source.file (relative to pipeline/) and source.symbol (e.g. "ALPACA.align_landmarks_to_mesh").
+   - Leave source.hash empty; then run:
+        python Aurora/AuroraClient/pipeline/documentation/check_docs.py --seed
+   - Author summary / options / outputs / algorithm / related / optional video & images (path:null = placeholder).
+
+4. If a method was removed:
+   - Delete its method object from docs_index.json.
+   - Remove its id from any other entry's related[].
+
+5. Prefer the live source and the change report over Code_Summaries or paper drafts — those may be outdated.
+
+## Entry schema reminder
+{
+  "id": "alpaca-align-landmarks-to-mesh",
+  "title": "Align Landmarks to Mesh",
+  "keywords": ["alpaca", "icp", "ransac"],
+  "source": { "file": "ALPACA.py", "symbol": "ALPACA.align_landmarks_to_mesh", "hash": "...", "lastChecked": "ISO-8601" },
+  "summary": "Plain-language overview + why useful...",
+  "options": [{ "name": "...", "type": "...", "default": "...", "description": "..." }],
+  "outputs": [{ "name": "...", "type": "...", "description": "..." }],
+  "algorithm": {
+    "text": "Step-by-step prose. Put [[references]] where a library method grid should appear.",
+    "math": [
+      {
+        "equation": "v' = R(v - c) + c",
+        "caption": "v: input coordinate; R: rotation; c: center; v': transformed coordinate."
+      }
+    ],
+    "references": [
+      {
+        "id": "gaussian",
+        "label": "Gaussian",
+        "blurb": "Isotropic Gaussian smoothing.",
+        "library": "SciPy",
+        "symbol": "scipy.ndimage.gaussian_filter",
+        "url": "https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.gaussian_filter.html"
+      }
+    ],
+    "diagram": "flowchart TD\\n  A-->B"
+  },
+  "related": ["other-entry-id"],
+  "video": { "youtubeId": "..." } | null,
+  "images": [{ "caption": "...", "path": null }]
+}
+
+## Algorithm math rules (required)
+Equations must earn their place. Prefer clear prose over decorative formulas.
+
+1. **Judgement first**
+   - Include math only when it clarifies what the algorithm is doing (a transform, objective, threshold rule, metric, etc.).
+   - If a simple sentence is clearer than a formula, set `"math": []` and put the idea in `algorithm.text`.
+   - If several related identities help, use multiple array entries (one idea each). Do not cram a catalog into one string.
+
+2. **Schema**
+   - `algorithm.math` is an **array** of `{ "equation": "<TeX or plain>", "caption": "<symbol legend>" }`.
+   - Legacy single strings are discouraged; convert when you touch an entry.
+   - Empty: `"math": []`.
+
+3. **One equation per entry / per line**
+   - Never write two assignments on one line separated by commas (`a = …, b = …`).
+   - Never rely on `\\quad` to jam parallel equations together — split into two objects.
+   - Related definitions (e.g. NLM weight, then NLM estimate) are separate array entries, each with its own caption.
+
+4. **Captions**
+   - Every equation needs a short caption that defines each symbol/term in plain language
+     (e.g. `"I: image; B: bias field; x: voxel."`).
+   - Captions render in small type under the formula in the docs panel.
+   - **Named constants must include their current literal value** from the live source
+     (e.g. `usable_dim = 508` with `MESH_MAX_VOXEL_CUBE = 512`, `MESH_VOXEL_PADDING = 2`).
+     Do not introduce a symbol like `usable_dim` without saying what it evaluates to today.
+     If the constant changes in code, update the caption when marking the entry current.
+
+5. **Placement**
+   - Write `algorithm.text` so key terms from the equations appear in the relevant sentence;
+     the UI places each formula after the sentence that mentions it.
+   - Prefer KaTeX/LaTeX (`\\hat{I}`, `\\frac`, `\\cdot`, `\\times`). Plain unicode is OK as a fallback.
+
+6. **Lint**
+   - After editing math / references, run:
+       python3 Aurora/AuroraClient/pipeline/documentation/check_docs.py --lint-math
+   - Soft warnings also print on a normal `check_docs.py` report.
+
+## Preferred scientific wording source
+When authoring or refreshing educational `summary`, `algorithm.text`, and `algorithm.math`,
+prefer clear formulations from the Hallgrimsson Aurora methods draft when they match the
+live implementation:
+
+  /home/alejandro/Documents/Hallgrimsson_Image_Processing_Paper/Final_Paper/draft.md
+
+Use the paper for: atlas mean-deformation / intensity math, forward/inverse field conventions,
+Dice and six-voxel surface-distance metrics, ALPACA Poisson budget and outer-shell visibility,
+anisotropic SyN slice blending weights, semi-landmark cutting-plane + Dijkstra + arc-length
+steps, N4/CLAHE/percentile-normalization defaults, and similar method descriptions.
+Always verify defaults and symbols against `--extract` / live source; if the paper and code
+disagree, **code wins**. Do not copy paper TODOs or results placeholders into the docs.
+
+## Placeholder / stub detection (required)
+Never leave or re-introduce boilerplate like:
+  "HTTP APIView `FooView` in views.py. Validates request fields, performs filesystem..."
+That text means the entry was seeded but not authored. When you touch an entry (or when
+`check_docs.py` reports stale), replace stub summary/algorithm with real educational prose
+from the live `--extract` source: what the user does, numbered algorithm steps, real options,
+and outputs. Empty `math: []` / `diagram: ""` is fine when not insightful; empty prose is not.
+
+When Aurora mostly dispatches to an external library (Denoise, Restore/CLAHE, etc.):
+
+1. **Do not paste the library’s internal equations** into `algorithm.math`. Set `"math": []`
+   unless Aurora itself defines a transform/metric worth showing.
+2. Document Aurora’s orchestration in numbered `algorithm.text` steps (enumerate → filter →
+   load → normalize → **apply selected backend** → save/progress).
+3. Add `algorithm.references`: an array of clickable cards linking to official docs
+   **or** an in-house docs entry:
+   ```json
+   {
+     "id": "stable-kebab-id",
+     "label": "UI / algorithm name",
+     "blurb": "One short line: what it is for + library vs Aurora-owned",
+     "library": "scikit-image | SciPy | Aurora (in-house) | …",
+     "symbol": "package.module.function",
+     "url": "https://… official docs deep link",
+     "entryId": "optional-internal-docs-entry-id"
+   }
+   ```
+   - External library backends: set `url` (and omit `entryId`).
+   - Aurora-owned backends (e.g. 3D GPU NLM): set `entryId` to the related docs entry
+     and `library` to something like `"Aurora (in-house)"`. Prefer `entryId` over inventing
+     a fake external URL. Do not paste third-party equations for in-house code either —
+     link to the dedicated entry (which may have Aurora-specific math).
+4. **Placement marker (required when references is non-empty):** insert the exact token
+   `[[references]]` in `algorithm.text` on the step that says a backend is applied, e.g.:
+   `5) Apply the user-selected denoising method … [[references]] 6) …`
+   The docs UI replaces that token with the method grid. Without the marker the grid falls
+   back to the end of the Algorithm section (lint will warn).
+5. When code gains/removes a backend, update `references[]` and the step that lists methods
+   so they stay in sync with the live `algorithm == '…'` / `mode == '…'` branches.
+   For NonLocalMeans specifically: 2.5D and 3D_CPU use `skimage.restoration.denoise_nl_means`;
+   3D_GPU uses Aurora `GPUTorchNLMDenoise.nlm3d` (document both cards).
+6. Example entry: `denoise-all-scans` (see also related `gpu-nlm3d`).
+
+## Rules
+- Keep summaries educational and scenario-oriented (when would a user reach for this?).
+- Keep algorithm.text in simple terms for routine tools; for major multi-branch tools
+  (Align to reference, Elastic registration mesh/voxel) expand algorithm.text so each
+  decision branch explains how the user goal is achieved (inputs → evidence → transform →
+  artifacts).
+- Use Mermaid flowchart markup for algorithm.diagram (no custom diagram language).
+- Always quote Mermaid node/edge labels that contain /, |, commas, spaces, or punctuation:
+    Bad:  E[/Volumes, /mnt]   C -->|Linux| F[path]
+    Good: E["/Volumes, /mnt"]  C -->|"Linux"| F["path"]
+  Unquoted [/text/] is parsed as a parallelogram shape and causes lexical errors.
+- Images with path:null render as UI placeholders — leave them until assets exist.
+- Do not invent API options or outputs that are not in the extracted source.
+  options[] = request params / method args (inputs). outputs[] = Response JSON keys or method return values.
+- Transcript / curated entries use `"source": { "kind": "transcript", ... }` and are skipped by
+  `check_docs.py` hash tracking. Tutorial chapters live under
+  `pipeline/documentation/tutorial_transcript/` (from Tutorial.rag.jsonl).
+- Token-efficient: edit only stale entries; do not rewrite the whole index.
+- **UI naming (required):** Entry `title` must match the Aurora frontend label for that tool.
+  Canonical map: `pipeline/documentation/UI_TITLE_MAP.txt`
+  Frontend source: `AURORA_PROCESSING_TOOL_DEFS` in `BHTools/frontend/src/components/aurora/mainAurora.js`
+  Examples:
+    match-histogram → "Intensity Normalization" (not "Match Histogram")
+    homogenize-background → "Background Offset Correction"
+    apply-threshold → "Align Thresholds"
+    denoise-all-scans → "Denoise"
+  Keep stable kebab `id`s; only change `title` when the UI renames. If multiple backend
+  endpoints back one UI button, disambiguate with a short suffix in parentheses
+  (e.g. "Apply masks (single)") and document which endpoint the primary button calls.

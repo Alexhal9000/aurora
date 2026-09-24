@@ -1,0 +1,5 @@
+Tutorial transcript sources
+===========================
+- Primary (timed): youtube_timed_transcript.json  (YouTube captions for qWIXwDOJEUc)
+- Legacy RAG (chapter outline only): Tutorial.rag.jsonl
+- Interactive seek times come from YouTube caption `start` values, not interpolated chapter spans.

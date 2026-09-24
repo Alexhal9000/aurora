@@ -1,0 +1,890 @@
+{
+  "categories": [
+    {
+      "id": "rigid-elastic-registration",
+      "title": "Rigid & Elastic Registration",
+      "subcategories": [
+        {
+          "id": "rigid-batch-alignment",
+          "title": "Rigid Batch Alignment",
+          "methods": [
+            {
+              "id": "align-to-reference",
+              "title": "Align to Reference",
+              "keywords": [
+                "rigid alignment",
+                "reference scan",
+                "ALPACA",
+                "ANTs",
+                "guidepoints",
+                "DINO-Reg",
+                "batch",
+                "preserved mesh"
+              ],
+              "source": {
+                "file": "rigidAlignment.py",
+                "symbol": "AlignToReferenceView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Batch-rigidly aligns every eligible moving subject in a project to a chosen reference scan or atlas. Use this as the first geometric normalization step before elastic registration or morphometric landmarking: it resamples subjects to the reference voxel spacing, applies a rigid transform (ALPACA mesh matching, manual homologous guidepoints, ANTs rigid registration, or DINO-Reg intensity correspondences), writes a new *_edit_*_aligned* volume or PLY edit, propagates paired masks and landmarks, and stores alignment parameters in scan metadata for later inversion. Skips faulty scans, scans already aligned, scans locked by completed elastic registration, and optionally flagged subjects.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Project root directory containing extracted/ and optionally atlas/."
+                },
+                {
+                  "name": "reference",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Reference subject name or atlas identifier to align all moving scans against."
+                },
+                {
+                  "name": "method",
+                  "type": "str",
+                  "default": "alpaca",
+                  "description": "Alignment engine: alpaca (automatic mesh-based), manual-guidepoints (Kabsch from paired guidepoints), ants (ANTs Rigid on normalized volumes; voxel-only), gpu-rigid (FireANTs GPU rigid with local CC; voxel-only), or dino-reg (axial DINOv3 + joint PCA + mutual-NN RANSAC correspondences, then Kabsch; voxel-only)."
+                },
+                {
+                  "name": "scaling",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "When true, estimate and apply a uniform scale factor so subject size matches the reference before rotation."
+                },
+                {
+                  "name": "outer_surface",
+                  "type": "bool",
+                  "default": "false",
+                  "description": "ALPACA-only: prefer outer-shell mesh extraction instead of decimating very large meshes."
+                },
+                {
+                  "name": "interpolation",
+                  "type": "str",
+                  "default": "linear",
+                  "description": "Voxel resampling during rigid warp: linear (order 1) or nearest (order 0)."
+                },
+                {
+                  "name": "flagFilter",
+                  "type": "str",
+                  "default": "off",
+                  "description": "Batch flag filter mode controlling which flagged subjects are included."
+                },
+                {
+                  "name": "gpu_rigid_options",
+                  "type": "object",
+                  "default": "{}",
+                  "description": "Nested GPU Rigid (FireANTs) tuning object; parsed by normalize_gpu_rigid_options when method is gpu-rigid."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Load the reference (latest NIfTI edit or preserved PLY mesh) and build a reference canvas at reference voxel spacing. 2) Enumerate moving subjects, skipping faulty, already-aligned, elastic-locked, and flag-filtered scans. 3) For each subject, resample to reference spacing and branch on method: ALPACA extracts meshes and computes a rigid transform; manual-guidepoints solves Kabsch from homologous guidepoint pairs; ANTs performs centroid pre-alignment, half-resolution Rigid registration, then applies the transform at full resolution with intensity restoration; DINO-Reg encodes axial DINOv3 features, jointly PCA-projects moving+fixed tokens, finds mutual-NN patch correspondences, estimates a rigid with similarity-weighted RANSAC/Kabsch, then applies the same pad/rotate/embed warp as manual guidepoints. This method utilizes DINOv3, developed by Meta AI, licensed under the DINOv3 License Agreement. 4) Embed the warped volume in the reference grid (or save transformed PLY vertices), add a background border gap, write lossy previews, propagate masks/landmarks, and record alignment_calculated_parameters in metadata.",
+                "math": "Manual guidepoints use Procrustes/Kabsch: H = X^T Y, SVD(H) = U Σ V^T, R = V U^T with a reflection correction so det(R) = +1.",
+                "diagram": "flowchart TD\\n  A[POST directory + reference] --> B[Load reference volume or PLY]\\n  B --> C[Filter moving scans]\\n  C --> D{method}\\n  D -->|alpaca| E[Mesh rigid via ALPACA]\\n  D -->|manual-guidepoints| F[Kabsch from guidepoints]\\n  D -->|ants| G[Centroid + ANTs Rigid]\\n  D -->|gpu-rigid| GR[Centroid + FireANTs Rigid]\\n  D -->|dino-reg| DR[Axial DINOv3 + joint PCA + mutual-NN RANSAC]\\n  E --> H[Resample embed in reference canvas]\\n  F --> H\\n  G --> H\\n  GR --> H\\n  DR --> H\\n  H --> I[Save aligned edit lossy preview landmarks masks]"
+              },
+              "related": [
+                "normalize-ants-rigid-options",
+                "alpaca-align-landmarks-to-mesh",
+                "invert-alignment-landmarks",
+                "registration-tools-overview"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Batch rigid alignment places each subject into the reference scan coordinate frame before elastic registration",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "normalize-ants-rigid-options",
+              "title": "Normalize ANTs Rigid Options",
+              "keywords": [
+                "ANTs",
+                "rigid registration",
+                "aff_metric",
+                "iterations",
+                "request parsing"
+              ],
+              "source": {
+                "file": "rigidAlignment.py",
+                "symbol": "normalize_ants_rigid_options",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Parses and validates the ants_rigid_options object sent with Align to Reference when method is ants. Invalid or missing fields fall back to safe defaults and are clipped to allowed ranges so the UI can expose advanced ANTs tuning without risking unstable registration parameters.",
+              "options": [
+                {
+                  "name": "request_data",
+                  "type": "dict",
+                  "default": "required",
+                  "description": "Full POST body; reads request_data['ants_rigid_options'] when present."
+                },
+                {
+                  "name": "ants_rigid_options.aff_metric",
+                  "type": "str",
+                  "default": "mattes",
+                  "description": "ANTs affine metric; allowed: mattes, GC, meansquares."
+                },
+                {
+                  "name": "ants_rigid_options.aff_iterations",
+                  "type": "list[int]",
+                  "default": "[1000, 800, 600, 100]",
+                  "description": "Per-level iteration counts; each value clipped to 0–5000."
+                },
+                {
+                  "name": "ants_rigid_options.aff_shrink_factors",
+                  "type": "list[int]",
+                  "default": "[6, 4, 2, 1]",
+                  "description": "Multi-resolution shrink factors; each value clipped to 1–16."
+                },
+                {
+                  "name": "ants_rigid_options.aff_smoothing_sigmas",
+                  "type": "list[int]",
+                  "default": "[3, 2, 1, 0]",
+                  "description": "Gaussian smoothing sigmas per level; each value clipped to 0–8."
+                },
+                {
+                  "name": "ants_rigid_options.aff_sampling",
+                  "type": "int",
+                  "default": "48",
+                  "description": "Metric sampling percentage; clipped to 8–256."
+                },
+                {
+                  "name": "ants_rigid_options.aff_random_sampling_rate",
+                  "type": "float",
+                  "default": "1.0",
+                  "description": "Random subsampling rate for metric evaluation; clipped to 0.01–1.0."
+                },
+                {
+                  "name": "ants_rigid_options.grad_step",
+                  "type": "float",
+                  "default": "0.15",
+                  "description": "Gradient step size; clipped to 0.001–1.0."
+                },
+                {
+                  "name": "ants_rigid_options.use_histogram_matching",
+                  "type": "bool",
+                  "default": "true",
+                  "description": "Enable ANTs histogram matching between fixed and moving images."
+                },
+                {
+                  "name": "ants_rigid_options.singleprecision",
+                  "type": "bool",
+                  "default": "true",
+                  "description": "Run ANTs registration and apply_transforms in single precision."
+                }
+              ],
+              "algorithm": {
+                "text": "Extract ants_rigid_options from the request dict (or use empty dict). Validate aff_metric against an allow-list. Clip each numeric field to documented min/max bounds; replace invalid tuples with hard-coded defaults. Return a normalized dict consumed directly by ants.registration and ants.apply_transforms in AlignToReferenceView.",
+                "math": "",
+                "diagram": "flowchart TD\\n  A[request_data] --> B{ants_rigid_options dict?}\\n  B -->|no| C[Use empty dict]\\n  B -->|yes| D[Read each field]\\n  C --> E[Clip and default]\\n  D --> E\\n  E --> F[Return normalized opts]"
+              },
+              "related": [
+                "align-to-reference",
+                "registration-tools-min-max-normalize",
+                "registration-tools-restore-range"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "User-facing ANTs rigid tuning exposed via the ants_rigid_options POST field",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "landmark-inversion-export",
+          "title": "Landmark Inversion & Export",
+          "methods": [
+            {
+              "id": "invert-alignment-landmarks",
+              "title": "Invert Alignment Landmarks",
+              "keywords": [
+                "landmarks",
+                "inverse transform",
+                "pre-alignment",
+                "morphometrics",
+                "multi-bone alignment"
+              ],
+              "source": {
+                "file": "rigidAlignment.py",
+                "symbol": "InvertAlignmentLandmarksView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Inverts landmarks placed on rigidly aligned scans back into a shared pre-alignment coordinate space (physical mm at reference voxel spacing). Use this after rigid alignment when you need landmark coordinates comparable across subjects or across multiple bones aligned separately from the same scan — for example before statistical shape analysis or when exporting homologous points that were placed on aligned volumes.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Project root directory."
+                },
+                {
+                  "name": "scan_names",
+                  "type": "list[str]",
+                  "default": "null",
+                  "description": "Optional subset of subject names to process; all extracted subjects when omitted."
+                },
+                {
+                  "name": "output_suffix",
+                  "type": "str",
+                  "default": "pre_alignment",
+                  "description": "Suffix for output filenames: {scan_name}_{output_suffix}_landmarks.json."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Resolve subject list (explicit scan_names or all extracted folders), skipping faulty scans unless they are the reference. 2) For the reference subject, copy the latest edit landmarks unchanged. 3) For aligned subjects, load alignment_calculated_parameters from metadata and pick the latest landmark file from edits before any elastic edit. 4) Apply the inverse rigid pipeline: canvas mm → reference voxels, inverse rotation about the stored rotation center, subtract padding, undo scale_match, convert back to mm. 5) Write {scan}_{output_suffix}_landmarks.json and return per-subject status.",
+                "math": "padded_voxel = R^T (canvas_voxel − canvas_centroid) + rotation_center; pre_scale_voxel = (padded_voxel − padding_low) / scale_match; output_mm = pre_scale_voxel × reference_voxel_size.",
+                "diagram": "flowchart TD\\n  A[POST directory] --> B[Resolve subjects]\\n  B --> C{reference subject?}\\n  C -->|yes| D[Copy latest edit landmarks]\\n  C -->|no| E[Load alignment_calculated_parameters]\\n  E --> F[Pick pre-elastic landmark edit]\\n  F --> G[Inverse rotation padding scale]\\n  D --> H[Write pre_alignment landmarks JSON]\\n  G --> H"
+              },
+              "related": [
+                "align-to-reference",
+                "export-inverted-landmarks"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Landmarks on aligned volumes mapped back to a shared pre-alignment mm frame for cross-subject comparison",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "export-inverted-landmarks",
+              "title": "Export Inverted Landmarks",
+              "keywords": [
+                "CSV export",
+                "landmarks",
+                "pre-alignment",
+                "morphometrics",
+                "spreadsheet"
+              ],
+              "source": {
+                "file": "rigidAlignment.py",
+                "symbol": "ExportInvertedLandmarksView",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Collects inverted pre-alignment landmark files from every non-faulty subject and returns them as a downloadable CSV spreadsheet. Run this after Invert Alignment Landmarks when you need landmark coordinates in R, Python, or external morphometrics tools — each row is one subject with landmark_x/y/z columns.",
+              "options": [
+                {
+                  "name": "directory",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Project root directory containing extracted/."
+                },
+                {
+                  "name": "output_suffix",
+                  "type": "str",
+                  "default": "pre_alignment",
+                  "description": "Suffix matching inverted landmark files: {scan_name}_{output_suffix}_landmarks.json."
+                }
+              ],
+              "algorithm": {
+                "text": "1) List all subject folders under extracted/, skipping faulty scans. 2) For each subject, load {scan}_{output_suffix}_landmarks.json if present. 3) Flatten landmark positions into columns (landmark_i_x/y/z; semi_ prefix for semi-automatic landmarks). 4) Build a pandas DataFrame sorted by subject name, write a timestamped CSV to .temp/, and stream it as a FileResponse attachment.",
+                "math": "",
+                "diagram": "flowchart TD\\n  A[POST directory + output_suffix] --> B[Scan extracted subjects]\\n  B --> C[Load inverted landmark JSON]\\n  C --> D[Flatten to x y z columns]\\n  D --> E[Build DataFrame]\\n  E --> F[Write CSV and download]"
+              },
+              "related": [
+                "invert-alignment-landmarks"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Per-subject inverted landmarks exported as a wide CSV for external analysis",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "registration-tools",
+          "title": "Registration Tools",
+          "methods": [
+            {
+              "id": "registration-tools-overview",
+              "title": "RegistrationTools",
+              "keywords": [
+                "registration utilities",
+                "ANTs",
+                "normalization",
+                "lossy compression",
+                "landmarks",
+                "background"
+              ],
+              "source": {
+                "file": "registrationTools.py",
+                "symbol": "RegistrationTools",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Shared helper class used across rigid alignment, elastic registration, rotation/crop views, preprocessing, and mask pipelines. It centralizes intensity normalization for ANTs, background estimation, lossy NIfTI preview generation, affine-to-displacement-field conversion for elastic initialization, and landmark coordinate propagation through geometric edits.",
+              "options": [],
+              "algorithm": {
+                "text": "RegistrationTools is a stateless utility class instantiated where needed (e.g. AlignToReferenceView.registration_tools). Methods are composed in registration workflows: estimate background → normalize to [-1,1] for ANTs → register → restore original intensity range → save lossy previews and transform landmark sidecars.",
+                "math": "",
+                "diagram": "flowchart TD\\n  A[Volume or landmarks] --> B[Background estimation]\\n  B --> C[min_max_normalize]\\n  C --> D[ANTs registration]\\n  D --> E[restore_range]\\n  E --> F[save_as_lossy_nifti + landmark transforms]"
+              },
+              "related": [
+                "align-to-reference",
+                "registration-tools-calculate-affine-field",
+                "registration-tools-save-lossy-nifti"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "RegistrationTools bridges intensity handling, ANTs I/O, previews, and landmark geometry across Aurora pipelines",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "registration-tools-get-background-value",
+              "title": "Get Background Value",
+              "keywords": [
+                "background",
+                "histogram",
+                "intensity",
+                "border pixels",
+                "segmentation threshold"
+              ],
+              "source": {
+                "file": "registrationTools.py",
+                "symbol": "RegistrationTools.get_background_value",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Estimates the tissue-background intensity level from a 3D volume. Used before padding, resampling, and ANTs normalization so empty regions are filled with a statistically consistent background rather than zero or an arbitrary constant.",
+              "options": [
+                {
+                  "name": "image_data",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "3D volume array."
+                },
+                {
+                  "name": "mode",
+                  "type": "str",
+                  "default": "peak-no-zero",
+                  "description": "Estimation strategy: peak-no-zero (Gaussian-smoothed histogram peaks) or border (2-voxel shell histogram)."
+                },
+                {
+                  "name": "threshold",
+                  "type": "number",
+                  "default": "null",
+                  "description": "Optional intensity cutoff for border mode; voxels above threshold are excluded from the border shell."
+                }
+              ],
+              "algorithm": {
+                "text": "peak-no-zero: Gaussian smooth (sigma=3), find histogram peaks, pick the lowest-intensity among the two highest-frequency peaks, return the mean intensity in that bin. border: Gaussian smooth (sigma=1), collect 2-voxel-thick border voxels (optionally masked by threshold), return histogram mode or mean when variance is low.",
+                "math": "",
+                "diagram": "flowchart TD\\n  A[image_data] --> B{mode}\\n  B -->|peak-no-zero| C[Smooth histogram peaks]\\n  B -->|border| D[Sample 2px border shell]\\n  C --> E[Pick background intensity]\\n  D --> E"
+              },
+              "related": [
+                "registration-tools-overview",
+                "registration-tools-get-adjusted-background-value"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Background intensity estimated from histogram peaks or image borders before registration padding",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "registration-tools-get-adjusted-background-value",
+              "title": "Get Adjusted Background Value",
+              "keywords": [
+                "background",
+                "normalization",
+                "linear mapping",
+                "ANTs"
+              ],
+              "source": {
+                "file": "registrationTools.py",
+                "symbol": "RegistrationTools.get_adjusted_background_value",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Maps a background intensity from the original value range into a new normalized range (typically [-1, 1] for ANTs). Use alongside min_max_normalize so padded and transformed regions keep the correct background level after intensity rescaling.",
+              "options": [
+                {
+                  "name": "background_value",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Background intensity in the original image range."
+                },
+                {
+                  "name": "image_data",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "Source volume used to determine original min/max."
+                },
+                {
+                  "name": "new_min",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Target minimum of the normalized range."
+                },
+                {
+                  "name": "new_max",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Target maximum of the normalized range."
+                }
+              ],
+              "algorithm": {
+                "text": "Linearly map background_value from [min(image_data), max(image_data)] to [new_min, new_max] using the same scaling as min_max_normalize.",
+                "math": "adjusted = (background − min(image)) / (max(image) − min(image)) × (new_max − new_min) + new_min",
+                "diagram": ""
+              },
+              "related": [
+                "registration-tools-min-max-normalize",
+                "registration-tools-restore-range"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Background level remapped to match ANTs normalized intensity range",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "registration-tools-min-max-normalize",
+              "title": "Min–Max Normalize",
+              "keywords": [
+                "normalization",
+                "intensity",
+                "ANTs",
+                "memory efficient"
+              ],
+              "source": {
+                "file": "registrationTools.py",
+                "symbol": "RegistrationTools.min_max_normalize",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Linearly rescales voxel intensities to a target range while preserving relative contrast. This is the standard preprocessing step before ANTs rigid and elastic registration in Aurora, which expect numerically stable floating-point images (commonly [-1, 1]).",
+              "options": [
+                {
+                  "name": "image",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "Input volume."
+                },
+                {
+                  "name": "new_min",
+                  "type": "number",
+                  "default": "0",
+                  "description": "Target minimum after normalization."
+                },
+                {
+                  "name": "new_max",
+                  "type": "number",
+                  "default": "1",
+                  "description": "Target maximum after normalization."
+                }
+              ],
+              "algorithm": {
+                "text": "Compute image min/max; if equal, return a constant array at new_min. Otherwise copy to float32, subtract min, divide by range, scale to [new_min, new_max], and clip in place.",
+                "math": "out = (image − min) / (max − min) × (new_max − new_min) + new_min",
+                "diagram": ""
+              },
+              "related": [
+                "registration-tools-restore-range",
+                "normalize-ants-rigid-options"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Volumes normalized to a fixed range before ANTs registration",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "registration-tools-restore-range",
+              "title": "Restore Range",
+              "keywords": [
+                "denormalization",
+                "intensity",
+                "ANTs output",
+                "original dtype"
+              ],
+              "source": {
+                "file": "registrationTools.py",
+                "symbol": "RegistrationTools.restore_range",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Inverse of min_max_normalize: maps a normalized registered volume back to the subject's original intensity range. Applied after ANTs apply_transforms so saved NIfTI edits retain familiar HU or grayscale values for thresholding and visualization.",
+              "options": [
+                {
+                  "name": "image",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "Normalized volume to restore."
+                },
+                {
+                  "name": "original_min",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Original intensity minimum to recover."
+                },
+                {
+                  "name": "original_max",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Original intensity maximum to recover."
+                }
+              ],
+              "algorithm": {
+                "text": "Normalize the current array to [0, 1], scale to [original_min, original_max], and clip in place — mirroring min_max_normalize in reverse.",
+                "math": "restored = (image − min) / (max − min) × (original_max − original_min) + original_min",
+                "diagram": ""
+              },
+              "related": [
+                "registration-tools-min-max-normalize",
+                "align-to-reference"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Registered volumes mapped back to the subject native intensity range before saving",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "registration-tools-save-lossy-nifti",
+              "title": "Save as Lossy NIfTI",
+              "keywords": [
+                "lossy compression",
+                "JPEG",
+                "preview",
+                "downsample",
+                "metadata"
+              ],
+              "source": {
+                "file": "registrationTools.py",
+                "symbol": "RegistrationTools.save_as_lossy_nifti",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Creates a downsampled, JPEG-compressed 8-bit NIfTI preview plus an isometric projection PNG, and appends scale metadata to the subject JSON. Used after alignment, elastic registration, rotation, crop, and preprocessing so the web viewer can load fast previews without storing full-resolution lossless copies.",
+              "options": [
+                {
+                  "name": "image_data",
+                  "type": "np.ndarray",
+                  "default": "required",
+                  "description": "Full-resolution 3D volume to compress."
+                },
+                {
+                  "name": "voxel_size",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Voxel spacing in mm for the output affine."
+                },
+                {
+                  "name": "json_file",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Path to subject metadata JSON; lossy_compression entry is appended."
+                },
+                {
+                  "name": "output_file",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Destination path for the lossy .nii.gz file."
+                }
+              ],
+              "algorithm": {
+                "text": "1) Read resolution_factor from json lossy_compression metadata (default 2). 2) Mean-pool voxels with block_reduce after edge padding. 3) Linearly map pooled data to 0–255, JPEG-compress each axial slice (quality 70), preserving exact zeros. 4) Generate isometric projection PNG(s) via VTK raycasting with weighted-sum fallback. 5) Save NIfTI and append scale_factor, zero_point_shift, resolution_factor to lossy_compression in JSON.",
+                "math": "",
+                "diagram": "flowchart TD\\n  A[Full-res volume] --> B[Mean-pool by resolution_factor]\\n  B --> C[Map to 8-bit]\\n  C --> D[JPEG per slice]\\n  C --> E[Isometric projection PNG]\\n  D --> F[Save lossy NIfTI]\\n  F --> G[Update JSON metadata]"
+              },
+              "related": [
+                "registration-tools-overview",
+                "align-to-reference"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Lossy NIfTI previews with projection thumbnails for fast browser rendering",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "registration-tools-calculate-affine-field",
+              "title": "Calculate Affine Transform as Field",
+              "keywords": [
+                "affine registration",
+                "displacement field",
+                "ANTs",
+                "SyN",
+                "elastic initialization"
+              ],
+              "source": {
+                "file": "registrationTools.py",
+                "symbol": "RegistrationTools.calculate_affine_transform_as_field",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Runs ANTs Affine registration between fixed and moving images, converts the resulting 4×4 transform into a dense 3D displacement field, and returns paths to both the .mat affine and the field .nii.gz. Used as an initial transform for elastic (SyN) registration so large gross misalignments are corrected before deformable matching.",
+              "options": [
+                {
+                  "name": "fixed_image_data",
+                  "type": "ants.ANTsImage",
+                  "default": "required",
+                  "description": "Fixed (reference) ANTs image."
+                },
+                {
+                  "name": "moving_image_data",
+                  "type": "ants.ANTsImage",
+                  "default": "required",
+                  "description": "Moving ANTs image to align to fixed."
+                }
+              ],
+              "algorithm": {
+                "text": "1) ants.registration with type_of_transform Affine (GC metric, multi-level iterations). 2) Read the .mat transform, build a per-voxel physical coordinate grid from fixed image spacing/origin/direction. 3) Apply the affine to each grid point and subtract original coordinates to form a displacement field in mm. 4) Run a minimal SyNOnly registration to obtain a template field header, inject the computed displacements, save, and return affine and field paths.",
+                "math": "displacement(p) = (A p + t) − p for each physical coordinate p on the fixed grid.",
+                "diagram": "flowchart TD\\n  A[Fixed + moving ANTs images] --> B[Affine registration]\\n  B --> C[Build physical voxel grid]\\n  C --> D[Apply affine per voxel]\\n  D --> E[Subtract to displacement field]\\n  E --> F[Write field NIfTI + return paths]"
+              },
+              "related": [
+                "registration-tools-overview",
+                "registration-tools-min-max-normalize"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Affine transform converted to a displacement field for elastic registration initialization",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "registration-tools-load-nifti-mask-data",
+              "title": "Load NIfTI Mask Data",
+              "keywords": [
+                "mask",
+                "NIfTI",
+                "nii.mask.gz",
+                "elastic registration"
+              ],
+              "source": {
+                "file": "registrationTools.py",
+                "symbol": "RegistrationTools.load_nifti_mask_data",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Loads binary or label mask voxel data from disk, with a workaround for non-standard *.nii.mask.gz double-suffix paths that NiBabel cannot sniff directly. Used when elastic registration incorporates reference and moving masks to constrain the metric.",
+              "options": [
+                {
+                  "name": "mask_path",
+                  "type": "str",
+                  "default": "required",
+                  "description": "Filesystem path to the mask NIfTI file."
+                }
+              ],
+              "algorithm": {
+                "text": "Attempt nib.load(mask_path).get_fdata(); on ImageFileError, copy to a temporary *_mask_temp.nii.gz path, load from the temp file, and delete the temp copy.",
+                "math": "",
+                "diagram": ""
+              },
+              "related": [
+                "registration-tools-overview"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Mask volumes loaded reliably even with Aurora non-standard .nii.mask.gz naming",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "registration-tools-transform-landmarks-by-rotation",
+              "title": "Transform Landmarks by Rotation",
+              "keywords": [
+                "landmarks",
+                "rotation",
+                "crop",
+                "coordinate propagation"
+              ],
+              "source": {
+                "file": "registrationTools.py",
+                "symbol": "RegistrationTools.transform_landmarks_by_rotation",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Propagates landmark coordinates through the same rotation, embedding offset, and final crop applied to a volume during manual rotation edits. Keeps landmark sidecars synchronized with geometric edits so downstream alignment and morphometrics stay consistent.",
+              "options": [
+                {
+                  "name": "landmarks_list",
+                  "type": "list",
+                  "default": "required",
+                  "description": "Landmarks as [x,y,z] mm arrays or dicts with position and landmark_type."
+                },
+                {
+                  "name": "voxel_size",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Voxel spacing in mm."
+                },
+                {
+                  "name": "rotation_matrix",
+                  "type": "np.ndarray (3,3)",
+                  "default": "required",
+                  "description": "Rotation matrix applied to the volume."
+                },
+                {
+                  "name": "center_box",
+                  "type": "array-like (3,)",
+                  "default": "required",
+                  "description": "Rotation center in voxel space."
+                },
+                {
+                  "name": "origin_offset",
+                  "type": "array-like (3,)",
+                  "default": "required",
+                  "description": "Embedding offset subtracted before rotation."
+                },
+                {
+                  "name": "final_bbox_min",
+                  "type": "array-like (3,)",
+                  "default": "required",
+                  "description": "Minimum crop bounds in voxel space."
+                },
+                {
+                  "name": "final_bbox_max",
+                  "type": "array-like (3,)",
+                  "default": "required",
+                  "description": "Maximum crop bounds in voxel space."
+                },
+                {
+                  "name": "embedding_offset",
+                  "type": "array-like (3,)",
+                  "default": "required",
+                  "description": "Offset converting landmarks into the target embedding frame."
+                }
+              ],
+              "algorithm": {
+                "text": "For each landmark: convert mm → voxels, subtract embedding_offset, rotate about origin_offset, test inclusion in [final_bbox_min, final_bbox_max), subtract crop origin, convert back to mm. Landmarks outside the crop are excluded; survivors retain landmark_type.",
+                "math": "v' = R (v − origin_offset); keep if final_bbox_min ≤ v' < final_bbox_max.",
+                "diagram": "flowchart TD\\n  A[Landmarks in mm] --> B[To voxel space]\\n  B --> C[Apply embedding offset]\\n  C --> D[Rotate]\\n  D --> E{Inside crop?}\\n  E -->|yes| F[Subtract crop origin to mm]\\n  E -->|no| G[Exclude landmark]"
+              },
+              "related": [
+                "registration-tools-transform-landmarks-by-crop",
+                "invert-alignment-landmarks"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Landmark coordinates updated to follow volume rotation and cropping",
+                  "path": null
+                }
+              ]
+            },
+            {
+              "id": "registration-tools-transform-landmarks-by-crop",
+              "title": "Transform Landmarks by Crop",
+              "keywords": [
+                "landmarks",
+                "crop",
+                "padding",
+                "coordinate propagation"
+              ],
+              "source": {
+                "file": "registrationTools.py",
+                "symbol": "RegistrationTools.transform_landmarks_by_crop",
+                "hash": "",
+                "lastChecked": null
+              },
+              "summary": "Updates landmark positions after a volumetric crop and padding operation. Used when subjects are cropped to a region of interest so landmark JSON sidecars remain aligned with the edited volume geometry.",
+              "options": [
+                {
+                  "name": "landmarks_list",
+                  "type": "list",
+                  "default": "required",
+                  "description": "Landmarks as [x,y,z] mm arrays or dicts with position and landmark_type."
+                },
+                {
+                  "name": "voxel_size",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Voxel spacing in mm."
+                },
+                {
+                  "name": "z_min",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Crop minimum along axis 0 (voxel indices)."
+                },
+                {
+                  "name": "z_max",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Crop maximum along axis 0 (voxel indices)."
+                },
+                {
+                  "name": "y_min",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Crop minimum along axis 1 (voxel indices)."
+                },
+                {
+                  "name": "y_max",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Crop maximum along axis 1 (voxel indices)."
+                },
+                {
+                  "name": "x_min",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Crop minimum along axis 2 (voxel indices)."
+                },
+                {
+                  "name": "x_max",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Crop maximum along axis 2 (voxel indices)."
+                },
+                {
+                  "name": "padding",
+                  "type": "number",
+                  "default": "required",
+                  "description": "Padding added in voxels after cropping."
+                }
+              ],
+              "algorithm": {
+                "text": "Convert each landmark from mm to voxels; if inside the crop box [z_min,z_max) × [y_min,y_max) × [x_min,x_max), subtract crop origin, add padding offset, convert back to mm and retain landmark_type; otherwise exclude the landmark.",
+                "math": "v_crop = v − [z_min, y_min, x_min] + padding (per axis).",
+                "diagram": "flowchart TD\\n  A[Landmarks in mm] --> B[To voxels]\\n  B --> C{Inside crop ROI?}\\n  C -->|yes| D[Subtract crop origin add padding]\\n  D --> E[Back to mm]\\n  C -->|no| F[Exclude]"
+              },
+              "related": [
+                "registration-tools-transform-landmarks-by-rotation"
+              ],
+              "video": null,
+              "images": [
+                {
+                  "caption": "Landmarks reindexed after crop and padding to match the edited volume",
+                  "path": null
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
