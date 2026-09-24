@@ -36,6 +36,26 @@ class ProgressConsumer(AsyncWebsocketConsumer):
                 payload[extra_key] = event[extra_key]
         await self.send(text_data=json.dumps(payload))
 
+class FoundationDownloadConsumer(AsyncWebsocketConsumer):
+    async def connect(self):
+        await self.channel_layer.group_add("ai_models_group", self.channel_name)
+        await self.accept()
+
+    async def disconnect(self, close_code):
+        await self.channel_layer.group_discard("ai_models_group", self.channel_name)
+
+    async def send_download_progress(self, event):
+        await self.send(text_data=json.dumps({
+            "type": "download_progress",
+            "active": event.get("active"),
+            "model_id": event.get("model_id"),
+            "filename": event.get("filename"),
+            "bytes_done": event.get("bytes_done") or 0,
+            "bytes_total": event.get("bytes_total") or 0,
+            "error": event.get("error"),
+        }))
+
+
 class MemoryConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         await self.accept()

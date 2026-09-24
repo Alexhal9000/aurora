@@ -51,6 +51,7 @@ _STATE: Dict[str, Any] = {
     "bytes_total": 0,
     "error": None,
     "thread": None,
+    "last_broadcast": 0.0,
 }
 
 
@@ -78,6 +79,36 @@ def normalize_lab_origin(origin: str) -> str:
 def _disk_free(path: Path) -> int:
     path.mkdir(parents=True, exist_ok=True)
     return shutil.disk_usage(path).free
+
+
+def _broadcast_progress(force: bool = False) -> None:
+    now = time.monotonic()
+    with _LOCK:
+        last = float(_STATE.get("last_broadcast") or 0)
+        if not force and (now - last) < 0.25:
+            return
+        _STATE["last_broadcast"] = now
+        snapshot = _progress_snapshot()
+    try:
+        from asgiref.sync import async_to_sync
+        from channels.layers import get_channel_layer
+        channel_layer = get_channel_layer()
+        if channel_layer is None:
+            return
+        payload = snapshot or {
+            "active": False,
+            "model_id": None,
+            "filename": None,
+            "bytes_done": 0,
+            "bytes_total": 0,
+            "error": None,
+        }
+        async_to_sync(channel_layer.group_send)(
+            "ai_models_group",
+            {"type": "send_download_progress", **payload},
+        )
+    except Exception:
+        logger.debug("Could not broadcast AI model download progress", exc_info=True)
 
 
 def _progress_snapshot() -> Dict[str, Any]:
@@ -173,7 +204,9 @@ def start_download(model_ids: List[str], token: str, lab_origin: str, user_name:
             daemon=True,
         )
         _STATE["thread"] = thread
+        _STATE["last_broadcast"] = 0.0
         thread.start()
+    _broadcast_progress(force=True)
 
 
 def cancel_download() -> None:
@@ -188,14 +221,17 @@ def _run_download(model_ids: List[str], token: str, origin: str, user_name: str)
         record_accepted_terms(model_ids, user_name=user_name)
         with _LOCK:
             _STATE["error"] = None
+        _broadcast_progress(force=True)
     except Exception as exc:
         logger.exception("Foundation model download failed")
         with _LOCK:
             _STATE["error"] = str(exc)
+        _broadcast_progress(force=True)
     finally:
         with _LOCK:
             _STATE["active"] = False
             _STATE["thread"] = None
+        _broadcast_progress(force=True)
 
 
 def _download_one(model_id: str, token: str, origin: str) -> None:
@@ -252,6 +288,7 @@ def _download_file(
                 downloaded += len(chunk)
                 with _LOCK:
                     _STATE["bytes_done"] = int(_STATE["bytes_done"] or 0) + len(chunk)
+                _broadcast_progress()
     if downloaded != expected_size:
         try:
             part_path.unlink()

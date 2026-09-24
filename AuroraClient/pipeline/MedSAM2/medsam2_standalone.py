@@ -52,13 +52,10 @@ class MedSAM2Segmenter:
             work_dir: Working directory for config resolution. Defaults to script directory.
             force_cpu: If True, force CPU mode regardless of CUDA availability
         """
-        # Default checkpoint: Documents foundation first, then the in-tree copy.
+        # Default checkpoint: Documents/Aurora AI Models/foundation/medsam2 only.
         if checkpoint_path is None:
-            try:
-                from pipeline.aiModels.foundation_models import MEDSAM2_ID, resolve_model_path
-                checkpoint_path = str(resolve_model_path(MEDSAM2_ID))
-            except Exception:
-                checkpoint_path = os.path.join(MODELS_DIR, "MedSAM2_latest.pt")
+            from pipeline.aiModels.foundation_models import MEDSAM2_ID, resolve_model_path
+            checkpoint_path = str(resolve_model_path(MEDSAM2_ID))
         
         self.checkpoint_path = checkpoint_path
         self.config_path = config_path

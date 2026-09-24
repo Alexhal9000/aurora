@@ -11,23 +11,42 @@ here. Installers for Ubuntu, Windows, and macOS are attached to
 
 ## Installers
 
-Download the installer for your operating system from the release that
-matches the version you want, for example `v1.8.6`. Each release tag also marks
-the exact backend source that shipped in those installers.
+The version cited in the Aurora article is **1.8.7**. These links stay up;
+later wizard releases are extra, not replacements:
+
+- [Release v1.8.7](https://github.com/Alexhal9000/aurora/releases/tag/v1.8.7)
+- [Ubuntu `.deb`](https://github.com/Alexhal9000/aurora/releases/download/v1.8.7/aurora-tools_1.8.7_amd64.deb)
+- [Windows `.exe`](https://github.com/Alexhal9000/aurora/releases/download/v1.8.7/aurora_1.8.7_setup.exe)
+- [macOS `.pkg`](https://github.com/Alexhal9000/aurora/releases/download/v1.8.7/aurora_1.8.7_macos.pkg)
+
+Every later GitHub release is also kept. Each tag marks the backend that
+shipped in that version's installers. The lab site requires **1.8.7 or newer**.
 
 ## AI models
 
 Foundation model weights are not in this repository. After you install
 Aurora and sign in, the app can download the models you agree to use.
 
+## Documentation
+
+The methods are explained step by step, with algorithm notes, parameters and
+animated figures, in the Aurora documentation:
+
+- [Interactive documentation](https://www.hallgrimssonlab.ca/MainAurora/documentation):
+  the same docs panel as in the desktop app, readable online without installing Aurora.
+- [Single-page corpus](https://www.hallgrimssonlab.ca/static/frontend/aurora-docs-corpus.html):
+  all entries on one page, easy to search or cite. Also available as
+  [plain text](https://www.hallgrimssonlab.ca/static/frontend/aurora-docs-corpus.txt) and
+  [JSON](https://www.hallgrimssonlab.ca/static/frontend/aurora-docs-corpus.json).
+
 ## Reading the source
 
 This snapshot is for inspection, not for running the desktop app. The user
 interface is not here, so `manage.py` alone will not give you Aurora.
 
-The analysis logic lives under `AuroraClient/pipeline/` (registration,
-segmentation, mesh tools, documentation corpus). Each GitHub release tag is
-the backend that shipped in that version's installers.
+The analysis logic lives under `AuroraClient/pipeline/`, and the documentation
+entries above point to the methods implemented there. Each GitHub release tag
+is the backend that shipped in that version's installers.
 
 `requirements.txt` and `requirements-macos.txt` list the Python packages that
 version used. They are a record of the stack, not a setup recipe.

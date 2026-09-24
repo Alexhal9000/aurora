@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from .paths import models_root
 
-ENV_IGNORE_LEGACY = "AURORA_IGNORE_LEGACY_MODELS"
 MISSING_HINT = "Download it from the header menu: AI models"
 
 LICENSES_DIR = Path(__file__).resolve().parent / "licenses"
-PIPELINE_DIR = Path(__file__).resolve().parent.parent
-LEGACY_MODELS_DIR = PIPELINE_DIR / "MedSAM2" / "models"
 
 MEDSAM2_ID = "medsam2"
 DINOV3_ID = "dinov3_vitl16"
@@ -23,8 +19,7 @@ MEDSAM2_SPEC: Dict[str, Any] = {
     "id": MEDSAM2_ID,
     "display_name": "MedSAM2",
     "subdir": "medsam2",
-    "legacy_relpath": "MedSAM2_latest.pt",
-    "legacy_is_dir": False,
+    "is_dir": False,
     "files": [
         {
             "name": "MedSAM2_latest.pt",
@@ -51,8 +46,7 @@ DINOV3_SPEC: Dict[str, Any] = {
     "id": DINOV3_ID,
     "display_name": "DINOv3 ViT-L/16",
     "subdir": "dinov3_vitl16",
-    "legacy_relpath": "dinov3-vitl16-pretrain-lvd1689m",
-    "legacy_is_dir": True,
+    "is_dir": True,
     "files": [
         {
             "name": "model.safetensors",
@@ -120,20 +114,12 @@ def get_spec(model_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def ignore_legacy_models() -> bool:
-    return os.environ.get(ENV_IGNORE_LEGACY, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _legacy_path(spec: Dict[str, Any]) -> Path:
-    return LEGACY_MODELS_DIR / spec["legacy_relpath"]
-
-
 def _foundation_path(spec: Dict[str, Any]) -> Path:
     return foundation_dir() / spec["subdir"]
 
 
 def _files_present(directory: Path, spec: Dict[str, Any]) -> bool:
-    if spec.get("legacy_is_dir"):
+    if spec.get("is_dir"):
         if not directory.is_dir():
             return False
         return all((directory / item["name"]).is_file() and (directory / item["name"]).stat().st_size == item["size"] for item in spec["files"])
@@ -149,19 +135,16 @@ def _files_present(directory: Path, spec: Dict[str, Any]) -> bool:
 
 
 def resolve_model_dir(model_id: str) -> Path:
-    """Directory that contains the model's files, or the expected foundation path."""
+    """Directory that contains the model's files under Documents/Aurora AI Models/foundation."""
     spec = get_spec(model_id)
     if spec is None:
         raise KeyError(f"Unknown foundation model {model_id!r}")
-    candidates = [_foundation_path(spec)]
-    if not ignore_legacy_models():
-        candidates.append(_legacy_path(spec))
-    for candidate in candidates:
-        if _files_present(candidate, spec):
-            if candidate.is_file():
-                return candidate.parent
-            return candidate
-    return _foundation_path(spec)
+    candidate = _foundation_path(spec)
+    if _files_present(candidate, spec):
+        if candidate.is_file():
+            return candidate.parent
+        return candidate
+    return candidate
 
 
 def resolve_model_file(model_id: str, filename: Optional[str] = None) -> Path:
@@ -178,7 +161,7 @@ def resolve_model_path(model_id: str) -> Path:
     spec = get_spec(model_id)
     if spec is None:
         raise KeyError(f"Unknown foundation model {model_id!r}")
-    if spec.get("legacy_is_dir"):
+    if spec.get("is_dir"):
         return resolve_model_dir(model_id)
     return resolve_model_file(model_id)
 

@@ -138,7 +138,9 @@ class DocumentationManager:
         Full machine-readable documentation corpus from the same docs_index.json root.
 
         Includes method prose and tutorial transcript segments. Strips live-source
-        metadata (paths/hashes) that crawlers and external LLM tools do not need.
+        metadata (paths/hashes) that crawlers and external LLM tools do not need,
+        but keeps ``source.kind``: the online docs page renders transcript and
+        curated entries differently from method entries.
         """
         index = self.load_index()
         categories: List[Dict[str, Any]] = []
@@ -149,7 +151,9 @@ class DocumentationManager:
                 methods: List[Dict[str, Any]] = []
                 for method in subcategory.get("methods", []):
                     entry = deepcopy(method)
-                    entry.pop("source", None)
+                    source = entry.pop("source", None)
+                    if isinstance(source, dict) and source.get("kind"):
+                        entry["source"] = {"kind": source["kind"]}
                     methods.append(entry)
                     method_count += 1
                 subs.append({

@@ -1,11 +1,10 @@
 """Lazy CUDA singleton for the DINOv3 ViT-L/16 encoder used by DINO-Reg.
 
 This method utilizes DINOv3, developed by Meta AI, licensed under the DINOv3
-License Agreement. A copy of that license is at ``LICENSE.md`` in this folder
-and next to the bundled weights under ``pipeline/MedSAM2/models/``.
+License Agreement. A copy of that license is at ``LICENSE.md`` in this folder.
 
 Weights are the Hugging Face ``facebook/dinov3-vitl16-pretrain-lvd1689m``
-snapshot, stored offline under ``MedSAM2/models/dinov3-vitl16-pretrain-lvd1689m``.
+snapshot, stored under ``Documents/Aurora AI Models/foundation/dinov3_vitl16``.
 """
 
 from __future__ import annotations
@@ -14,12 +13,6 @@ import os
 
 from ..aiModels.foundation_models import DINOV3_ID, ModelMissingError, resolve_model_path
 
-MEDSAM2_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "MedSAM2")
-)
-MODELS_DIR = os.path.join(MEDSAM2_DIR, "models")
-DEFAULT_MODEL_DIR = os.path.join(MODELS_DIR, "dinov3-vitl16-pretrain-lvd1689m")
-DEFAULT_CHECKPOINT = DEFAULT_MODEL_DIR  # directory; kept for call-site compatibility
 PATCH_SIZE = 16
 HF_MODEL_ID = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 
@@ -32,8 +25,12 @@ class DinoRegError(RuntimeError):
 
 
 def default_checkpoint_path() -> str:
-    """Resolved DINOv3 snapshot directory (Documents foundation, then legacy tree)."""
+    """Resolved DINOv3 snapshot directory under Documents/Aurora AI Models/foundation."""
     return str(resolve_model_path(DINOV3_ID))
+
+
+# Older imports treated this as a path string; resolve at call time like MedSAM2.
+DEFAULT_CHECKPOINT = default_checkpoint_path
 
 
 def ensure_dino_reg_cuda():
