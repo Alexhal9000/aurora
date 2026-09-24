@@ -20,16 +20,17 @@ the exact backend source that shipped in those installers.
 Foundation model weights are not in this repository. After you install
 Aurora and sign in, the app can download the models you agree to use.
 
-## Development
+## Reading the source
 
-```bash
-python3.13 -m venv venv
-source venv/bin/activate
-pip install torch torchvision   # choose the build for your CPU/GPU from pytorch.org
-pip install -r requirements.txt
-cd AuroraClient
-python manage.py migrate
-```
+This snapshot is for inspection, not for running the desktop app. The user
+interface is not here, so `manage.py` alone will not give you Aurora.
+
+The analysis logic lives under `AuroraClient/pipeline/` (registration,
+segmentation, mesh tools, documentation corpus). Each GitHub release tag is
+the backend that shipped in that version's installers.
+
+`requirements.txt` and `requirements-macos.txt` list the Python packages that
+version used. They are a record of the stack, not a setup recipe.
 
 ## License
 
