@@ -138,11 +138,57 @@ CHANNEL_LAYERS = {
 
 # Database
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
+#
+# Local Aurora does not store users, scans, or project data here — those live on
+# BHTools and the filesystem. Django still needs sqlite for its own tables
+# (sessions / contenttypes / admin). Keep that file in a user-writable data dir
+# so packaged Linux (/opt, root-owned) and future Django models both work.
+
+
+_PACKAGED_LINUX_ROOT = Path("/opt/aurora-tools")
+
+
+def _ensure_dir(path: Path) -> Path:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def _aurora_data_dir() -> Path:
+    env_dir = os.environ.get("AURORA_DATA_DIR", "").strip()
+    if env_dir:
+        return _ensure_dir(Path(env_dir))
+    if _PACKAGED_LINUX_ROOT in BASE_DIR.parents or BASE_DIR.parent == _PACKAGED_LINUX_ROOT:
+        return _ensure_dir(Path.home() / ".aurora")
+    if os.access(BASE_DIR, os.W_OK):
+        return BASE_DIR
+    return _ensure_dir(Path.home() / ".aurora")
+
+
+def _aurora_sqlite_path() -> Path:
+    env_path = os.environ.get("AURORA_SQLITE_PATH", "").strip()
+    if env_path:
+        chosen = Path(env_path)
+        _ensure_dir(chosen.parent)
+        return chosen
+
+    chosen = _aurora_data_dir() / "db.sqlite3"
+    packaged = BASE_DIR / "db.sqlite3"
+    if chosen != packaged and packaged.exists() and not chosen.exists():
+        try:
+            import shutil
+            shutil.copy2(packaged, chosen)
+        except OSError:
+            pass
+    return chosen
+
 
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': _aurora_sqlite_path(),
     }
 }
 

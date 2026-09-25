@@ -19,6 +19,17 @@ from AuroraClient import routing
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'AuroraClient.settings')
 
+django_asgi_app = get_asgi_application()
+
+
+def _ensure_django_schema():
+    """Create/update Django's own tables. Safe no-op when the schema is current."""
+    from django.core.management import call_command
+    call_command('migrate', interactive=False, verbosity=0)
+
+
+_ensure_django_schema()
+
 
 def print_startup_message():
     """Print professional startup message with welcome banner and clickable URL."""
@@ -48,7 +59,7 @@ threading.Thread(target=print_startup_message, daemon=True).start()
 
 
 application = ProtocolTypeRouter({
-    "http": get_asgi_application(),
+    "http": django_asgi_app,
     "websocket": AuthMiddlewareStack(
         URLRouter(
             routing.websocket_urlpatterns
