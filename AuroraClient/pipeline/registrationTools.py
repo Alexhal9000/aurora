@@ -496,7 +496,7 @@ class RegistrationTools():
         
         return result
 
-    def save_as_lossy_nifti(self, image_data, voxel_size, json_file, output_file):
+    def save_as_lossy_nifti(self, image_data, voxel_size, json_file, output_file, stored_scale=1.0, stored_offset=0.0):
         # Load existing metadata
         with open(json_file, 'r') as jf:
             json_metadata = json.load(jf)
@@ -623,6 +623,17 @@ class RegistrationTools():
 
         lossy_list.append(new_entry)
         json_metadata["lossy_compression"] = lossy_list
+
+        # Copy the previous reverse map, or compose it when this edit rescales
+        # stored intensities (stored_new = stored_scale * stored_old + stored_offset).
+        # A legacy single dict is promoted to a per-file list here.
+        from .intensityMapping import record_intensity_value_mapping
+        record_intensity_value_mapping(
+            json_metadata,
+            os.path.basename(output_file),
+            stored_scale=stored_scale,
+            stored_offset=stored_offset,
+        )
 
         with open(json_file, 'w') as jf:
             json.dump(json_metadata, jf, indent=4)

@@ -72,6 +72,84 @@ os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(psutil.cpu_count(logica
 
 alpaca = ALPACA()
 
+# Longest axis kept when measuring post-threshold centroid size. Spacing is
+# multiplied by the stride so the size stays in the original physical units.
+_CENTROID_SIZE_MAX_AXIS = 256
+
+
+def centroid_size(points):
+    """RMS distance from the centroid, matching mesh ``centroid_size`` elsewhere."""
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] == 0:
+        return 0.0
+    centered = pts - np.mean(pts, axis=0)
+    return float(np.sqrt(np.mean(np.sum(centered * centered, axis=1))))
+
+
+def centroid_size_scale_factor(reference_points, subject_points):
+    """Uniform scale that brings the subject centroid size onto the reference."""
+    ref_cs = centroid_size(reference_points)
+    sub_cs = centroid_size(subject_points)
+    if ref_cs <= 0.0 or sub_cs <= 0.0 or not np.isfinite(ref_cs) or not np.isfinite(sub_cs):
+        return 1.0
+    scale = float(ref_cs / sub_cs)
+    if not np.isfinite(scale) or scale <= 0.0:
+        return 1.0
+    return scale
+
+
+def post_threshold_mesh_vertices(volume, level, spacing, smooth=False, max_axis=_CENTROID_SIZE_MAX_AXIS):
+    """
+    Physical-unit vertices of the isosurface at ``level``.
+
+    Volumes whose longest axis exceeds ``max_axis`` are strided, and spacing is
+    scaled by that stride, so centroid size stays in the original millimeters.
+    """
+    volume = np.asarray(volume)
+    if volume.ndim != 3 or volume.size == 0:
+        return None
+    spacing = float(spacing)
+    level = float(level)
+    longest = int(max(volume.shape))
+    stride = max(1, int(np.ceil(longest / float(max_axis))))
+    sampled = volume[::stride, ::stride, ::stride] if stride > 1 else volume
+    if sampled.shape[0] < 2 or sampled.shape[1] < 2 or sampled.shape[2] < 2:
+        return None
+    if smooth:
+        sampled = gaussian_filter(np.asarray(sampled, dtype=np.float32), sigma=1.0)
+    step = spacing * stride
+    try:
+        verts, _, _, _ = measure.marching_cubes(
+            np.ascontiguousarray(sampled),
+            level=level,
+            spacing=(step, step, step),
+        )
+    except (ValueError, RuntimeError) as exc:
+        print(f"Post-threshold centroid-size mesh failed: {exc}")
+        return None
+    if verts is None or len(verts) == 0:
+        return None
+    return np.asarray(verts, dtype=np.float64)
+
+
+def zoom_volume_to_scale(scan_data, scale_match, background_value, order=1):
+    """
+    Resample ``scan_data`` about the array origin so its physical size matches
+    ``scale_match``, leaving voxel spacing unchanged. Near-identity scales are
+    left unapplied.
+    """
+    scale_match = float(scale_match)
+    if not np.isfinite(scale_match) or scale_match <= 0.0 or abs(scale_match - 1.0) < 1e-4:
+        return scan_data, 1.0
+    zoomed = ndimage.zoom(
+        scan_data,
+        scale_match,
+        order=int(order),
+        mode='constant',
+        cval=background_value,
+    )
+    return zoomed, scale_match
+
 
 def has_elastic_registration(scan_name, directory):
     """
@@ -2519,10 +2597,11 @@ def build_alignment_rigid_provenance(
     gpu_rigid_opts=None,
     gpu_initializer=None,
     dino_reg_result=None,
+    scale_factor=None,
 ):
     """
     Serializable rigid-alignment provenance for Scientific Report Methods and audit trails.
-    All methods produce rotation + translation only (no deformable warp in this step).
+    Rotation + translation, optionally preceded by one isotropic centroid-size scale.
     """
     method_norm = str(method or "").strip()
     provenance = {
@@ -2532,6 +2611,14 @@ def build_alignment_rigid_provenance(
         "outer_surface": bool(outer_surface),
         "interpolation": str(interpolation or "linear"),
     }
+    if scaling:
+        provenance["scaling_method"] = (
+            "guidepoint_centroid_size"
+            if method_norm.lower() == "manual-guidepoints"
+            else "post_threshold_centroid_size"
+        )
+        if scale_factor is not None and np.isfinite(float(scale_factor)):
+            provenance["scale_factor"] = float(scale_factor)
     if method_norm.lower() == "ants" and isinstance(ants_rigid_opts, dict):
         serializable = {}
         for key, val in ants_rigid_opts.items():
@@ -3332,6 +3419,11 @@ class AlignToReferenceView(APIView):
         scan_metadata["alignment_method"] = method
         if isinstance(alignment_rigid_provenance, dict):
             scan_metadata["alignment_rigid_provenance"] = alignment_rigid_provenance
+        mesh_scale = (transform_summary or {}).get("scale") if isinstance(transform_summary, dict) else None
+        if mesh_scale is not None and float(mesh_scale) != 1.0:
+            scan_metadata["alignment_scale"] = float(mesh_scale)
+        else:
+            scan_metadata.pop("alignment_scale", None)
         existing_mesh_metadata = scan_metadata.get("mesh_metadata")
         if not isinstance(existing_mesh_metadata, dict):
             existing_mesh_metadata = {}
@@ -3792,6 +3884,10 @@ class AlignToReferenceView(APIView):
         # Add method parameter with default value 'alpaca'
         method = request.data.get('method', 'alpaca')
         scaling = request.data.get('scaling', False)
+        if isinstance(scaling, str):
+            scaling = scaling.strip().lower() in ('1', 'true', 'yes', 'on')
+        else:
+            scaling = bool(scaling)
         outer_surface = request.data.get('outer_surface', False)
         scale_match = 1
         # Linking is the opt-in: children skipped by the batch inherit the main's transform.
@@ -4122,6 +4218,32 @@ class AlignToReferenceView(APIView):
                 )
 
 
+        # One post-threshold mesh for every voxel subject. Preserved meshes use
+        # their vertices directly; manual guidepoints use the points themselves.
+        reference_size_vertices = None
+        if (
+            scaling
+            and str(method).lower() != 'manual-guidepoints'
+            and not reference_is_preserved_mesh
+            and reference_data is not None
+        ):
+            reference_size_vertices = post_threshold_mesh_vertices(
+                reference_data,
+                reference_threshold,
+                reference_voxel_size,
+                smooth=False,
+            )
+            if reference_size_vertices is None:
+                print(
+                    "Scaling is on, but the reference post-threshold mesh could not be measured. "
+                    "Subject sizes will be left unchanged."
+                )
+            else:
+                print(
+                    f"Reference post-threshold centroid size: "
+                    f"{centroid_size(reference_size_vertices):.6f}"
+                )
+
         # Track linked-scan propagation results
         linked_propagation_results = []
 
@@ -4132,6 +4254,7 @@ class AlignToReferenceView(APIView):
                 gpu_initializer_record = None
                 dino_reg_result = None
                 print(f"Processing scan {idx + 1}/{total_scans}: {scan_name}")
+                scale_match = 1.0
 
                 # Find the latest edit for this scan. For voxel subjects the
                 # existing NIfTI path below still uses latest NIfTI edits; for
@@ -4273,7 +4396,13 @@ class AlignToReferenceView(APIView):
                                         sib_metadata['alignment_to'] = reference
                                         sib_metadata['alignment_shift'] = 0
                                         sib_metadata['alignment_method'] = method
+                                        if sib_metadata.get('voxel_size') is not None:
+                                            sib_metadata['alignment_previous_voxel_size'] = sib_metadata['voxel_size']
                                         sib_metadata['voxel_size'] = reference_voxel_size
+                                        if scale_match != 1:
+                                            sib_metadata['alignment_scale'] = float(scale_match)
+                                        else:
+                                            sib_metadata.pop('alignment_scale', None)
                                         if 'alignment_calculated_parameters' in scan_metadata:
                                             sib_metadata['alignment_calculated_parameters'] = scan_metadata['alignment_calculated_parameters']
                                         if 'alignment_rigid_provenance' in scan_metadata:
@@ -4340,6 +4469,24 @@ class AlignToReferenceView(APIView):
                         moving_vertices_for_align = moving_vertices
 
                     guidepoints_origin = None
+                    # Initial size match, then rigid alignment. Manual guidepoints
+                    # scale from the points themselves further down.
+                    if (
+                        scaling
+                        and method.lower() != "manual-guidepoints"
+                        and reference_vertices is not None
+                    ):
+                        raw_scale = centroid_size_scale_factor(
+                            reference_vertices, moving_vertices_for_align
+                        )
+                        if abs(raw_scale - 1.0) >= 1e-4:
+                            scale_match = raw_scale
+                            print(
+                                f"Centroid-size scale for preserved mesh {scan_name}: {scale_match:.6f}"
+                            )
+                            moving_vertices_for_align = (
+                                np.asarray(moving_vertices_for_align, dtype=np.float64) * scale_match
+                            )
 
                     if method.lower() == "alpaca":
                         if reference_vertices is None or reference_faces is None:
@@ -4350,7 +4497,7 @@ class AlignToReferenceView(APIView):
                             moving_vertices_for_align,
                             moving_faces,
                             os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"),
-                            scaling_mode=scaling,
+                            scaling_mode=False,
                             outer_surface=outer_surface,
                         )
                         # align_landmarks_to_mesh's 'transformation_matrix' field intentionally
@@ -4367,6 +4514,8 @@ class AlignToReferenceView(APIView):
                         )
                         transformed_vertices = alpaca.apply_rigid_transform(moving_vertices_for_align, transformation_matrix)
                         _, source_guidepoints = self._load_guidepoints_for_stem(directory, scan_name, latest_edit_stem)
+                        if source_guidepoints is not None and float(scale_match) != 1.0:
+                            source_guidepoints = np.asarray(source_guidepoints, dtype=np.float64) * float(scale_match)
                         transformed_guidepoints = (
                             alpaca.apply_rigid_transform(source_guidepoints, transformation_matrix)
                             if source_guidepoints is not None else None
@@ -4377,7 +4526,7 @@ class AlignToReferenceView(APIView):
                             guidepoints_origin = "manual"
                         transform_summary = {
                             "matrix": transformation_matrix.tolist(),
-                            "scale": float(transformation_data.get("scale", 1.0)),
+                            "scale": float(scale_match),
                         }
                     else:
                         _, subject_guidepoints = self._load_guidepoints_for_stem(directory, scan_name, latest_edit_stem)
@@ -4401,13 +4550,17 @@ class AlignToReferenceView(APIView):
                         working_vertices = moving_vertices_for_align
                         working_guidepoints = subject_guidepoints
                         if scaling:
-                            reference_gp_centroid = np.mean(reference_guidepoints, axis=0)
-                            subject_gp_centroid = np.mean(subject_guidepoints, axis=0)
-                            reference_mean_distance = np.mean(np.linalg.norm(reference_guidepoints - reference_gp_centroid, axis=1))
-                            subject_mean_distance = np.mean(np.linalg.norm(subject_guidepoints - subject_gp_centroid, axis=1))
-                            scale_match = float(reference_mean_distance / subject_mean_distance) if subject_mean_distance > 0 else 1.0
-                            working_vertices = moving_vertices_for_align * scale_match
-                            working_guidepoints = subject_guidepoints * scale_match
+                            raw_scale = centroid_size_scale_factor(
+                                reference_guidepoints, subject_guidepoints
+                            )
+                            if abs(raw_scale - 1.0) >= 1e-4:
+                                scale_match = raw_scale
+                                print(
+                                    f"Guidepoint centroid-size scale for preserved mesh {scan_name}: "
+                                    f"{scale_match:.6f}"
+                                )
+                                working_vertices = np.asarray(moving_vertices_for_align, dtype=np.float64) * scale_match
+                                working_guidepoints = np.asarray(subject_guidepoints, dtype=np.float64) * scale_match
 
                         subject_centroid = np.mean(working_guidepoints, axis=0)
                         reference_centroid = np.mean(reference_guidepoints, axis=0)
@@ -4455,7 +4608,8 @@ class AlignToReferenceView(APIView):
                         )
 
                     alignment_rigid_provenance = build_alignment_rigid_provenance(
-                        method, scaling, outer_surface, interpolation, ants_rigid_opts, ants_initializer_record
+                        method, scaling, outer_surface, interpolation, ants_rigid_opts, ants_initializer_record,
+                        scale_factor=scale_match,
                     )
 
                     new_edit_number, output_path = self._save_preserved_aligned_mesh(
@@ -4532,12 +4686,15 @@ class AlignToReferenceView(APIView):
                                         sib_vertices_for_align = sib_vertices
 
                                     if method.lower() == "alpaca":
+                                        sib_input = np.asarray(sib_vertices_for_align, dtype=np.float64) * float(scale_match)
                                         sib_transformed = alpaca.apply_rigid_transform(
-                                            sib_vertices_for_align, transformation_matrix
+                                            sib_input, transformation_matrix
                                         )
                                         _, sib_gps = self._load_guidepoints_for_stem(
                                             directory, sibling_name, sib_latest_stem
                                         )
+                                        if sib_gps is not None and float(scale_match) != 1.0:
+                                            sib_gps = np.asarray(sib_gps, dtype=np.float64) * float(scale_match)
                                         sib_transformed_gps = (
                                             alpaca.apply_rigid_transform(sib_gps, transformation_matrix)
                                             if sib_gps is not None else None
@@ -4671,7 +4828,41 @@ class AlignToReferenceView(APIView):
                     print("Resampling done, the data type is ", scan_data.dtype)
 
                 nifti_img = None
-                cleanup_memory()                            
+                cleanup_memory()
+
+                # Initial size match, after voxel spacing already matches the reference.
+                # Manual guidepoints scale from the points themselves in that branch.
+                # The volume is zoomed once here; later warps must not zoom again.
+                if scaling and method.lower() != 'manual-guidepoints':
+                    subject_size_vertices = post_threshold_mesh_vertices(
+                        scan_data,
+                        threshold,
+                        voxel_size,
+                        smooth=True,
+                    )
+                    reference_points_for_scale = reference_size_vertices
+                    if reference_points_for_scale is None and reference_vertices is not None:
+                        reference_points_for_scale = reference_vertices
+                    if reference_points_for_scale is None or subject_size_vertices is None:
+                        print(
+                            f"Skipping centroid-size scale for {scan_name}: "
+                            "post-threshold mesh could not be measured"
+                        )
+                    else:
+                        raw_scale = centroid_size_scale_factor(
+                            reference_points_for_scale, subject_size_vertices
+                        )
+                        scan_data, scale_match = zoom_volume_to_scale(
+                            scan_data,
+                            raw_scale,
+                            background_value,
+                            order=interpolation_order,
+                        )
+                        if scale_match != 1.0:
+                            print(
+                                f"Centroid-size scale for {scan_name}: {scale_match:.6f} "
+                                "(post-threshold mesh, after voxel-size match)"
+                            )
 
                 # Now branch based on the alignment method
                 padded_scan_centroid = None
@@ -4754,24 +4945,18 @@ class AlignToReferenceView(APIView):
                     else:
                         print("not simplifying mesh")
                     
-                    # Get the transformation matrix using ALPACA
-                    transformation_data = alpaca.align_landmarks_to_mesh(reference_vertices, reference_faces, vertices, faces, os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), scaling_mode=scaling, outer_surface=outer_surface)
+                    # Size was already matched by the centroid-size resample above.
+                    # ALPACA stays rigid: rotation and translation only.
+                    transformation_data = alpaca.align_landmarks_to_mesh(reference_vertices, reference_faces, vertices, faces, os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), scaling_mode=False, outer_surface=outer_surface)
                     with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
                         scan_metadata = json.load(jf)
                     transformation_matrix = transformation_data['transformation_matrix']
                     target_centroid = transformation_data['target_centroid']
-                    source_centroid = transformation_data['source_centroid']    
-                    scale_match = transformation_data['scale']                
+                    source_centroid = transformation_data['source_centroid']
 
                     # Convert centroids from physical space to voxel space
                     target_centroid = target_centroid / voxel_size
-                    source_centroid = source_centroid / voxel_size
-
-                    # Scale scan data to match the scaling calculated by ALPACA (True size of current subject will be lost)
-                    if scale_match != 1:
-                        print("Scaling the scan data by a factor of ", scale_match)
-                        scan_data = ndimage.zoom(scan_data, scale_match, order=1, mode='constant', cval=background_value)
-                    
+                    source_centroid = source_centroid / voxel_size 
                     # Get rotation and translation
                     rotation = transformation_matrix[:3, :3]
                     # Convert translation from physical space to voxel space
@@ -4976,19 +5161,6 @@ class AlignToReferenceView(APIView):
                                 'current': idx + 1,
                             }
                         )     
-
-                    # === Scale matching ===
-                    if scaling:
-                        reference_vertices, _, _, _ = measure.marching_cubes(reference_data[::2, ::2, ::2], level=reference_threshold, spacing=(reference_voxel_size*2, reference_voxel_size*2, reference_voxel_size*2))
-                        scan_vertices, _, _, _ = measure.marching_cubes(scan_data[::2, ::2, ::2], level=threshold, spacing=(reference_voxel_size*2, reference_voxel_size*2, reference_voxel_size*2))
-                        scale_match = np.mean(np.linalg.norm(reference_vertices, axis=1)) / np.mean(np.linalg.norm(scan_vertices, axis=1))
-                        print("Scale match: ", scale_match)
-
-                        scan_data = ndimage.zoom(scan_data, scale_match, order=1, mode='constant', cval=background_value)
-
-                        reference_vertices = None
-                        scan_vertices = None
-                        cleanup_memory()
 
                     # === Union canvas (content-mask centroids, paste not shift) ===
                     _ants_rigid_log(scan_name, "union canvas layout starting")
@@ -5458,7 +5630,7 @@ class AlignToReferenceView(APIView):
                                 "reference_shape": reference_shape,
                                 "reference_voxel_size": reference_voxel_size,
                                 "original_voxel_size": original_voxel_size,
-                                "scale_match": 1.0,
+                                "scale_match": float(scale_match),
                             },
                         )
                         scan_data = None
@@ -5533,7 +5705,10 @@ class AlignToReferenceView(APIView):
 
                         print(f"After scipy rigid warp: {np.min(transformed_data)} to {np.max(transformed_data)}")
 
-                        # Same scipy embedding metadata as manual guidepoints / DINO-Reg.
+                        # Volume was size-matched before registration, so the warp
+                        # itself did not zoom. Record that factor for landmarks.
+                        if isinstance(warp.get('embed'), dict):
+                            warp['embed']['scale_match'] = float(scale_match)
                         self.store_alignment_embedding(method, warp['embed'])
 
                 # -------------------------------------------------------------------------------------------------------
@@ -5541,111 +5716,52 @@ class AlignToReferenceView(APIView):
                 # -------------------------------------------------------------------------------------------------------
                 
                 elif method.lower() == 'manual-guidepoints':
-                    
-                    # Calculate scaling factor if scaling is enabled
-                    scale_match = 1
-                    alternative = 1
-                    if scaling and alternative == 0:
-                        # Send progress update for scaling calculation
-                        channel_layer = get_channel_layer()
-                        if channel_layer is not None:
-                            progress = ((idx+(3/9)) / total_scans)
-                            async_to_sync(channel_layer.group_send)(
-                                'progress_group',
-                                {
-                                    'type': 'send_progress',
-                                    'progress': progress,
-                                    'scan_name': scan_name,
-                                    'custom_message': f'Calculating scaling factor for {scan_name}...',
-                                    'total': total_scans,
-                                    'current': idx + 1,
-                                }
-                            )
-                        
-                        # Generate meshes with marching cubes
-                        reference_vertices, reference_faces, _, _ = measure.marching_cubes(
-                            reference_data, level=reference_threshold, 
-                            spacing=(reference_voxel_size, reference_voxel_size, reference_voxel_size)
+                    channel_layer = get_channel_layer()
+                    if channel_layer is not None:
+                        progress = ((idx+(3/9)) / total_scans)
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Preparing guidepoint-based alignment for {scan_name}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
                         )
-                        reference_faces = reference_faces[:, ::-1]  # Invert faces for consistent orientation
-                        
-                        scan_vertices, scan_faces, _, _ = measure.marching_cubes(
-                            scan_data, level=threshold, 
-                            spacing=(voxel_size, voxel_size, voxel_size)
-                        )
-                        scan_faces = scan_faces[:, ::-1]  # Invert faces for consistent orientation
-                        
-                        # Use the existing get_outer_mesh function from ALPACA class
-                        reference_outer_vertices, reference_outer_faces = alpaca.get_outer_mesh(reference_vertices, reference_faces)
-                        scan_outer_vertices, scan_outer_faces = alpaca.get_outer_mesh(scan_vertices, scan_faces)
-                        
-                        # Calculate centroids of outer shell vertices
-                        reference_outer_centroid = np.mean(reference_outer_vertices, axis=0)
-                        scan_outer_centroid = np.mean(scan_outer_vertices, axis=0)
-                        
-                        # Center the shells at origin
-                        reference_outer_centered = reference_outer_vertices - reference_outer_centroid
-                        scan_outer_centered = scan_outer_vertices - scan_outer_centroid
-                        
-                        # Calculate mean absolute distances from centroid
-                        reference_mean_distance = np.mean(np.linalg.norm(reference_outer_centered, axis=1))
-                        scan_mean_distance = np.mean(np.linalg.norm(scan_outer_centered, axis=1))
-                        
-                        # Calculate scaling factor
-                        scale_match = reference_mean_distance / scan_mean_distance
-                        print(f"Calculated scaling factor: {scale_match}")
-                        
-                        # Clean up
-                        reference_vertices = reference_faces = scan_vertices = scan_faces = None
-                        reference_outer_vertices = reference_outer_faces = None
-                        scan_outer_vertices = scan_outer_faces = None
-                        reference_outer_centered = scan_outer_centered = None
-                        cleanup_memory()
-                         
-                    else:
-                        # Send progress update for guidepoint-based alignment
-                        channel_layer = get_channel_layer()
-                        if channel_layer is not None:
-                            progress = ((idx+(3/9)) / total_scans)
-                            async_to_sync(channel_layer.group_send)(
-                                'progress_group',
-                                {
-                                    'type': 'send_progress',
-                                    'progress': progress,
-                                    'scan_name': scan_name,
-                                    'custom_message': f'Preparing guidepoint-based alignment for {scan_name}...',
-                                    'total': total_scans,
-                                    'current': idx + 1,
-                                }
-                            )
-                    
-                   
-                    
+
                     # Load subject guidepoints (from the latest edit or original if no edits)
                     if latest_edit >= 0:
-                        # Look for guidepoints from the latest edit
                         subject_guidepoints_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*_guidepoints.json"))
                     else:
-                        # No edits exist, look for original guidepoints
                         subject_guidepoints_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_guidepoints.json"))
-                    
+
                     if len(subject_guidepoints_path) > 0:
                         subject_guidepoints_path = subject_guidepoints_path[0]
                     else:
                         print(f"No guidepoints found for subject {scan_name}, skipping")
                         continue
-                    
-                    # Load subject guidepoints
+
                     with open(subject_guidepoints_path, 'r') as f:
                         subject_guidepoints = np.array(json.load(f))
-                    
-                    # Verify shape consistency
+
                     if reference_guidepoints.shape != subject_guidepoints.shape:
                         print(f"Guidepoint arrays for reference and subject {scan_name} have different shapes")
                         print(f"Reference: {reference_guidepoints.shape}, Subject: {subject_guidepoints.shape}")
                         continue
-                    
-                    # Send progress update for alignment calculation
+
+                    if scaling:
+                        raw_scale = centroid_size_scale_factor(reference_guidepoints, subject_guidepoints)
+                        scan_data, scale_match = zoom_volume_to_scale(
+                            scan_data,
+                            raw_scale,
+                            background_value,
+                            order=interpolation_order,
+                        )
+                        subject_guidepoints = np.asarray(subject_guidepoints, dtype=np.float64) * float(scale_match)
+                        print(f"Guidepoint centroid-size scale for {scan_name}: {scale_match:.6f}")
+
                     channel_layer = get_channel_layer()
                     if channel_layer is not None:
                         progress = ((idx+(4/9)) / total_scans)
@@ -5661,26 +5777,8 @@ class AlignToReferenceView(APIView):
                             }
                         )
 
-                    if scaling and alternative == 1:
-                        # Scale the subject, reference and their guidepoints by the scale_match calculated by mean distance to guidepoint centroid
-                        guidepoints_reference_centroid = np.mean(reference_guidepoints, axis=0)
-                        guidepoints_scan_centroid = np.mean(subject_guidepoints, axis=0)
-
-                        # Mean distance to guidepoint centroid
-                        reference_mean_distance = np.mean(np.linalg.norm(reference_guidepoints - guidepoints_reference_centroid, axis=1))
-                        scan_mean_distance = np.mean(np.linalg.norm(subject_guidepoints - guidepoints_scan_centroid, axis=1))
-
-                        # Calculate scaling factor
-                        scale_match = reference_mean_distance / scan_mean_distance
-                        print(f"Calculated scaling factor: {scale_match}")
-
-                        # Scale the guidepoints
-                        subject_guidepoints = subject_guidepoints * scale_match
-
-                        # Scale image data by the same scaling factor
-                        scan_data = ndimage.zoom(scan_data, scale_match, order=1, mode='constant', cval=background_value)
-                        
-
+                    # Points and volume are already scaled. Passing the factor
+                    # again would zoom the volume a second time.
                     warp = self._apply_rigid_warp_from_point_pairs(
                         scan_data,
                         reference_data,
@@ -5693,7 +5791,7 @@ class AlignToReferenceView(APIView):
                         interpolation_order,
                         border_width,
                         original_voxel_size,
-                        scale_match=scale_match,
+                        scale_match=1.0,
                         scan_name=scan_name,
                     )
                     if warp is None:
@@ -5732,12 +5830,13 @@ class AlignToReferenceView(APIView):
                     scan_data = None
                     cleanup_memory()
 
+                    if isinstance(warp.get('embed'), dict):
+                        warp['embed']['scale_match'] = float(scale_match)
                     self.store_alignment_embedding('manual-guidepoints', warp['embed'])
 
                 elif method.lower() == 'dino-reg':
                     from .dinoRegRigid import DinoRegError, find_dino_reg_rigid_pose
 
-                    scale_match = 1
                     channel_layer = get_channel_layer()
                     if channel_layer is not None:
                         progress = ((idx+(3/9)) / total_scans)
@@ -5846,7 +5945,7 @@ class AlignToReferenceView(APIView):
                         border_width,
                         original_voxel_size,
                         reference_voxel_size,
-                        scale_match=scale_match,
+                        scale_match=1.0,
                         residual_translation=residual_translation,
                         scan_name=scan_name,
                     )
@@ -5891,6 +5990,8 @@ class AlignToReferenceView(APIView):
 
                     scan_data = None
                     cleanup_memory()
+                    if isinstance(warp.get('embed'), dict):
+                        warp['embed']['scale_match'] = float(scale_match)
                     self.store_alignment_embedding('dino-reg', warp['embed'])
 
                 else:
@@ -6071,12 +6172,15 @@ class AlignToReferenceView(APIView):
                     gpu_rigid_opts if method.lower() == 'gpu-rigid' else None,
                     gpu_initializer_record if method.lower() == 'gpu-rigid' else None,
                     dino_reg_result if method.lower() == 'dino-reg' else None,
+                    scale_factor=scale_match,
                 )
                 # Use original_voxel_size: voxel_size may have been overwritten when resampling to reference spacing
                 scan_metadata['alignment_previous_voxel_size'] = original_voxel_size
                 scan_metadata['voxel_size'] = reference_voxel_size
                 if scale_match != 1:
-                    scan_metadata['alignment_scale'] = scale_match
+                    scan_metadata['alignment_scale'] = float(scale_match)
+                else:
+                    scan_metadata.pop('alignment_scale', None)
                 
                 # Store calculated alignment parameters for future landmark inversion
                 # Determine padding variable based on method
@@ -6541,7 +6645,13 @@ class AlignToReferenceView(APIView):
                                     sib_metadata['alignment_to'] = reference
                                     sib_metadata['alignment_shift'] = 0
                                     sib_metadata['alignment_method'] = method
+                                    if sib_metadata.get('voxel_size') is not None:
+                                        sib_metadata['alignment_previous_voxel_size'] = sib_metadata['voxel_size']
                                     sib_metadata['voxel_size'] = reference_voxel_size
+                                    if scale_match != 1:
+                                        sib_metadata['alignment_scale'] = float(scale_match)
+                                    else:
+                                        sib_metadata.pop('alignment_scale', None)
                                     if 'alignment_calculated_parameters' in scan_metadata:
                                         sib_metadata['alignment_calculated_parameters'] = scan_metadata['alignment_calculated_parameters']
                                     if 'alignment_rigid_provenance' in scan_metadata:

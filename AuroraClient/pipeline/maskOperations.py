@@ -37,6 +37,7 @@ from .batch_flag_filter import load_flagged_subject_names, apply_flag_filter, no
 from .linkedScans import filter_out_linked_children, get_same_shape_siblings, latest_edit_stem
 from .coordinateFrames import (
     is_preserved_mesh_metadata,
+    load_extracted_scan_metadata,
     partition_voxel_and_preserved_mesh_scans,
     voxel_only_all_meshes_message,
     voxel_only_no_eligible_targets_message,
@@ -98,6 +99,61 @@ def _parse_mask_dilation(request_data):
     return max(0, min(100, v))
 
 
+def _filter_to_only_current_subject(directory, subject_dirs, only_current_scan, selected_scan, tool_name):
+    """
+    When only_current_scan is set, narrow subject_dirs to selected_scan (including atlas).
+    Returns (subject_dirs, error_response_or_None).
+    """
+    if not (only_current_scan and selected_scan):
+        if only_current_scan and not selected_scan:
+            return None, Response(
+                {"error": "onlyCurrentScan flag set but no selectedScan provided"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return subject_dirs, None
+
+    if selected_scan == "atlas":
+        atlas_dir = os.path.join(directory, "atlas")
+        if not os.path.isdir(atlas_dir):
+            return None, Response(
+                {"error": f'Selected scan "atlas" not found in directory'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if "atlas" not in subject_dirs:
+            # Atlas may have been excluded (e.g. faulty); still allow explicit selection
+            # only when the atlas directory exists and was in the candidate list before
+            # flag/mesh filters — if it never made it into subject_dirs, reject.
+            return None, Response(
+                {"error": f'Selected scan "atlas" is not an eligible target for {tool_name}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return ["atlas"], None
+
+    try:
+        selected_metadata = load_extracted_scan_metadata(directory, selected_scan)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None, Response(
+            {"error": f'Selected scan "{selected_scan}" not found in directory'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if is_preserved_mesh_metadata(selected_metadata):
+        return None, Response(
+            {
+                "error": (
+                    f'Selected scan "{selected_scan}" is a preserved PLY mesh. '
+                    f'{tool_name} only works with voxel-based volumes.'
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if selected_scan not in subject_dirs:
+        return None, Response(
+            {"error": f'Selected scan "{selected_scan}" is not an eligible target for {tool_name}'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return [selected_scan], None
+
+
 def _dilate_binary_mask(mask_bool, iterations):
     """Expand a boolean 3D mask by `iterations` morphological steps (0 = no-op)."""
     if iterations <= 0:
@@ -106,6 +162,38 @@ def _dilate_binary_mask(mask_bool, iterations):
     if not np.any(m):
         return m
     return binary_dilation(m, iterations=int(iterations))
+
+
+def _resize_mask_between_lossy_and_full(arr, target_shape):
+    """
+    Resize a label mask between the lossy and full-res grids of the same scan.
+
+    Lossy volumes are built from rf×rf×rf blocks (edge-padded on the high side), so
+    lossy voxel j covers full-res voxels [j*rf, (j+1)*rf). Axes whose sizes fit that
+    block relation are resized exactly (repeat up, stride down); scipy zoom aligns
+    first/last voxel centers instead, which shifts masks by one or more full-res
+    voxels toward index 0 on odd-sized axes. Other size pairs fall back to zoom.
+    """
+    out = arr
+    for axis, (src, dst) in enumerate(zip(arr.shape, target_shape)):
+        if src == dst:
+            continue
+        rf = max(1, int(round(max(src, dst) / min(src, dst))))
+        if dst > src and -(-dst // rf) == src:
+            out = np.repeat(out, rf, axis=axis)
+        elif dst < src and -(-src // rf) == dst:
+            out = np.take(out, np.arange(dst) * rf, axis=axis)
+        else:
+            factors = [dst / src if a == axis else 1.0 for a in range(out.ndim)]
+            out = zoom(out, factors, order=0)
+
+    if out.shape == tuple(target_shape):
+        return out
+    # Crop or pad the high side (repeat can overshoot by up to rf - 1 voxels)
+    result = np.zeros(target_shape, dtype=arr.dtype)
+    slices = tuple(slice(0, min(out.shape[i], target_shape[i])) for i in range(len(target_shape)))
+    result[slices] = out[slices]
+    return result
 
 
 class SaveMaskView(APIView):
@@ -330,24 +418,8 @@ class SaveMaskView(APIView):
             )
     
     def safe_zoom(self, arr, target_shape):
-        """Scale array to target shape using the same approach as ElasticRegistrationView"""
-        from scipy.ndimage import zoom
-        
-        # Calculate zoom factors for each dimension
-        zoom_factors = [target_shape[i] / arr.shape[i] for i in range(len(target_shape))]
-        
-        # Apply zoom with nearest neighbor interpolation for masks
-        scaled_arr = zoom(arr, zoom_factors, order=0)  # order=0 for nearest neighbor
-        
-        # Ensure the output has exactly the target shape
-        if scaled_arr.shape != target_shape:
-            # Crop or pad if necessary
-            result = np.zeros(target_shape, dtype=arr.dtype)
-            slices = tuple(slice(0, min(scaled_arr.shape[i], target_shape[i])) for i in range(len(target_shape)))
-            result[slices] = scaled_arr[slices]
-            return result
-        
-        return scaled_arr
+        """Scale a mask to the complementary lossy/full-res grid without shifting it."""
+        return _resize_mask_between_lossy_and_full(arr, target_shape)
 
 class LoadMaskView(APIView):
     def post(self, request):
@@ -601,24 +673,8 @@ class UploadMaskView(APIView):
             )
     
     def safe_zoom(self, arr, target_shape):
-        """Scale array to target shape using the same approach as SaveMaskView"""
-        from scipy.ndimage import zoom
-        
-        # Calculate zoom factors for each dimension
-        zoom_factors = [target_shape[i] / arr.shape[i] for i in range(len(target_shape))]
-        
-        # Apply zoom with nearest neighbor interpolation for masks
-        scaled_arr = zoom(arr, zoom_factors, order=0)  # order=0 for nearest neighbor
-        
-        # Ensure the output has exactly the target shape
-        if scaled_arr.shape != target_shape:
-            # Crop or pad if necessary
-            result = np.zeros(target_shape, dtype=arr.dtype)
-            slices = tuple(slice(0, min(scaled_arr.shape[i], target_shape[i])) for i in range(len(target_shape)))
-            result[slices] = scaled_arr[slices]
-            return result
-        
-        return scaled_arr
+        """Scale a mask to the complementary lossy/full-res grid without shifting it."""
+        return _resize_mask_between_lossy_and_full(arr, target_shape)
 
 class DownloadMaskView(APIView):
     def post(self, request):
@@ -1358,6 +1414,8 @@ class BatchApplyMaskToScansView(APIView):
         - create_new (bool): Whether to create a new folder
         - dilation (int, optional): Morphological dilation of the label mask in voxels (0–100, default 0)
         - propagate_linked (bool, optional): If true, apply same mask to same-shape linked children
+        - onlyCurrentScan (bool, optional): If true, apply only to selectedScan
+        - selectedScan (str, optional): Subject name (including atlas or reference) when onlyCurrentScan is true
     
     Response:
         {
@@ -1377,9 +1435,15 @@ class BatchApplyMaskToScansView(APIView):
         mask_folder = request.data.get('mask_folder')
         create_new = request.data.get('create_new', False)
         dilation = _parse_mask_dilation(request.data)
-        flag_filter = normalize_flag_filter_value(request.data.get('flagFilter', 'off'))
+        only_current_scan = bool(request.data.get('onlyCurrentScan', False))
+        selected_scan = request.data.get('selectedScan', None)
+        flag_filter = normalize_flag_filter_value(
+            request.data.get('flagFilter', 'off'),
+            only_current_scan=only_current_scan,
+        )
         # Linking is the opt-in: children skipped by the batch inherit the main's mask.
-        propagate_linked = bool(request.data.get('propagate_linked', True))
+        # When targeting only the selected subject, never fan out to linked children.
+        propagate_linked = bool(request.data.get('propagate_linked', True)) and not only_current_scan
         
         # Validate required parameters
         if not all([directory is not None, label is not None, mask_folder]):
@@ -1433,9 +1497,16 @@ class BatchApplyMaskToScansView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            subject_dirs, only_current_error = _filter_to_only_current_subject(
+                directory, subject_dirs, only_current_scan, selected_scan, 'Apply masks'
+            )
+            if only_current_error is not None:
+                return only_current_error
+
             flagged_set = load_flagged_subject_names(directory)
             subject_dirs = apply_flag_filter(subject_dirs, flagged_set, flag_filter)
-            subject_dirs = filter_out_linked_children(directory, subject_dirs)
+            if not (only_current_scan and selected_scan):
+                subject_dirs = filter_out_linked_children(directory, subject_dirs)
             if not subject_dirs:
                 return Response(
                     {"error": voxel_only_no_eligible_targets_message('Apply masks')},
@@ -1498,7 +1569,18 @@ class BatchApplyMaskToScansView(APIView):
                                 'current': idx + 1,
                             }
                         )
-                    subject_path = os.path.join(extracted_dir, subject_name)
+                    if subject_name == "atlas":
+                        subject_path = os.path.join(directory, "atlas")
+                    else:
+                        subject_path = os.path.join(extracted_dir, subject_name)
+
+                    if not os.path.isdir(subject_path):
+                        skipped_subjects.append({
+                            "subject": subject_name,
+                            "reason": f"Subject directory not found: {subject_path}"
+                        })
+                        print(f"Skipping {subject_name}: directory not found")
+                        continue
                     
                     # Find the latest edit with a mask
                     # Look for files matching pattern: {subject_name}_edit_*.nii.mask.gz (full resolution only)
@@ -1572,7 +1654,10 @@ class BatchApplyMaskToScansView(APIView):
                     masked_image_data = image_data * label_mask
                     
                     # Create output directory for this subject
-                    target_subject_dir = os.path.join(masks_base_dir, "extracted", subject_name)
+                    if subject_name == "atlas":
+                        target_subject_dir = os.path.join(masks_base_dir, "atlas")
+                    else:
+                        target_subject_dir = os.path.join(masks_base_dir, "extracted", subject_name)
                     os.makedirs(target_subject_dir, exist_ok=True)
                     
                     # Extract suffix from edit name
@@ -1634,9 +1719,9 @@ class BatchApplyMaskToScansView(APIView):
                     except Exception as e:
                         print(f"Warning: Could not create lossy version for {subject_name}: {str(e)}")
                     
-                    # Copy elastic transformations if they exist
+                    # Copy elastic transformations if they exist (atlas has no elastic transfer path)
                     edit_number = None
-                    if '_edit_' in edit_name:
+                    if subject_name != "atlas" and '_edit_' in edit_name:
                         try:
                             edit_number = int(edit_name.split('_edit_')[-1].split('_')[0])
                         except (ValueError, IndexError):
@@ -1690,7 +1775,7 @@ class BatchApplyMaskToScansView(APIView):
                     print(f"Successfully processed {subject_name} with label {label}")
                     
                     # Propagate to same-shape linked siblings
-                    if propagate_linked:
+                    if propagate_linked and subject_name != "atlas":
                         try:
                             siblings, sib_err = get_same_shape_siblings(directory, subject_name)
                             if sib_err:
@@ -1788,14 +1873,14 @@ class BatchApplyMaskToScansView(APIView):
                                             registration_tools.save_as_lossy_nifti(
                                                 sib_masked_data,
                                                 sib_voxel_size,
-                                                sib_metadata_target,
+                                                sib_metadata_target if os.path.exists(sib_metadata_source) else None,
                                                 sib_lossy_path
                                             )
-                                            sib_placeholder_lossy = os.path.join(sib_target_dir, f"{sibling_name}_lossy.nii.gz")
-                                            nib.save(empty_img, sib_placeholder_lossy)
+                                            sib_placeholder_lossy_path = os.path.join(sib_target_dir, f"{sibling_name}_lossy.nii.gz")
+                                            nib.save(empty_img, sib_placeholder_lossy_path)
                                         except Exception as e:
                                             print(f"  Warning: Could not create lossy version for sibling {sibling_name}: {str(e)}")
-                                        
+
                                         linked_propagation_results.append({
                                             'scan_name': sibling_name,
                                             'status': 'success'
@@ -2213,6 +2298,8 @@ class BatchMaskOutScansView(APIView):
         - overwrite (bool): If True, overwrite an existing masked-before-elastic insertion using the
           edit prior to the masked slot as source; if False, skip subjects where the insertion already
           exists (default: False)
+        - onlyCurrentScan (bool, optional): If true, apply only to selectedScan
+        - selectedScan (str, optional): Subject name (including atlas or reference) when onlyCurrentScan is true
     
     Response:
         {
@@ -2232,7 +2319,12 @@ class BatchMaskOutScansView(APIView):
         invert = request.data.get('invert', False)
         overwrite = request.data.get('overwrite', False)
         dilation = _parse_mask_dilation(request.data)
-        flag_filter = normalize_flag_filter_value(request.data.get('flagFilter', 'off'))
+        only_current_scan = bool(request.data.get('onlyCurrentScan', False))
+        selected_scan = request.data.get('selectedScan', None)
+        flag_filter = normalize_flag_filter_value(
+            request.data.get('flagFilter', 'off'),
+            only_current_scan=only_current_scan,
+        )
         
         # Validate required parameters
         if not all([directory is not None, label is not None]):
@@ -2284,9 +2376,16 @@ class BatchMaskOutScansView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            subject_dirs, only_current_error = _filter_to_only_current_subject(
+                directory, subject_dirs, only_current_scan, selected_scan, 'Apply masks'
+            )
+            if only_current_error is not None:
+                return only_current_error
+
             flagged_set = load_flagged_subject_names(directory)
             subject_dirs = apply_flag_filter(subject_dirs, flagged_set, flag_filter)
-            subject_dirs = filter_out_linked_children(directory, subject_dirs)
+            if not (only_current_scan and selected_scan):
+                subject_dirs = filter_out_linked_children(directory, subject_dirs)
             if not subject_dirs:
                 return Response(
                     {"error": voxel_only_no_eligible_targets_message('Apply masks')},
@@ -2515,6 +2614,11 @@ class BatchMaskOutScansView(APIView):
                             _lc = [e for e in _lc
                                    if f'_edit_{masked_edit_number}_masked' not in e.get('filename', '')]
                             _meta['lossy_compression'] = _lc
+                            from .intensityMapping import drop_intensity_mappings_containing
+                            drop_intensity_mappings_containing(
+                                _meta,
+                                f'_edit_{masked_edit_number}_masked',
+                            )
                             with open(metadata_path, 'w') as f:
                                 json.dump(_meta, f, indent=4)
                         except Exception as _e:
@@ -2637,6 +2741,12 @@ class BatchMaskOutScansView(APIView):
                                         f'_edit_{elastic_edit_num}_elastic',
                                         f'_edit_{elastic_edit_num + 1}_elastic',
                                     )
+                            from .intensityMapping import rename_intensity_mapping_filenames
+                            rename_intensity_mapping_filenames(
+                                _meta,
+                                f'_edit_{elastic_edit_num}_elastic',
+                                f'_edit_{elastic_edit_num + 1}_elastic',
+                            )
                             def _lc_sort_key(e):
                                 m = re.search(r'_edit_(\d+)_', e.get('filename', ''))
                                 return int(m.group(1)) if m else 0

@@ -137,6 +137,7 @@ from .rigidAlignment import (
     voxel_size_for_edit_stem,
 )
 from .resampleAnisotropicVoxels import DeformationBasedMRIInterpolator
+from .averagePooling import apply_extract_scaling, normalize_scaling_factor
 from .maskOperations import *
 from .denoiseTools import *
 from .restoreTools import *
@@ -2884,7 +2885,10 @@ class ExtractScansView(APIView):
                 continue
             if meta.get('is_mesh') and meta.get('voxelized') is False:
                 continue
-            mapping = meta.get('intensity_value_mapping')
+            from .intensityMapping import resolve_intensity_value_mapping
+            # Cohort windows live on the raw extraction row. Later edits keep those
+            # windows but may compose scale/shift; a legacy dict is the raw row.
+            mapping = resolve_intensity_value_mapping(meta.get('intensity_value_mapping'))
             # Every extracted subject stores a reverse mapping, but only cohort windows
             # chosen in the extraction dialog define a reusable project policy.
             if not mapping or mapping.get('mode') not in ('shared_project', 'shared_subgroup'):
@@ -3510,6 +3514,7 @@ class ExtractScansView(APIView):
             scans = [s for s in scans if not self._is_segmentation_name(s['name']) and s['name'].lower() != 'atlas']
 
             mesh_options = request.data.get('mesh_extraction_options') or {}
+            scaling_factor = normalize_scaling_factor(request.data.get('scaling_factor', 1))
             mesh_mode = mesh_options.get('mode', 'keep')
             skipped_mesh_subjects = set(mesh_options.get('skipped_subjects') or [])
             mesh_voxel_size = None
@@ -3949,6 +3954,18 @@ class ExtractScansView(APIView):
                     final_voxel_size = 1.0
                     print(f"⚠️ Warning: Could not extract voxel sizes for {scan_name}, using default")
 
+                if image_data is not None:
+                    image_data, final_voxel_size, applied_scaling = apply_extract_scaling(
+                        image_data, final_voxel_size, scaling_factor
+                    )
+                    if applied_scaling > 1:
+                        print(
+                            f"Average-pooled {scan_name} by {applied_scaling}; "
+                            f"voxel size {final_voxel_size}"
+                        )
+                else:
+                    applied_scaling = scaling_factor
+
                 # Save as NIfTI using the final voxel size
                 if image_data is not None:
                     nifti_file = os.path.join(scan_out_folder, scan_name)
@@ -4009,13 +4026,16 @@ class ExtractScansView(APIView):
                     'name': scan_name,
                     'voxel_size': final_voxel_size,
                     'original_voxel_sizes': voxel_sizes,
+                    'scaling_factor': applied_scaling,
                     'threshold': threshold,
                     'original_format': scan_subtype,
                 })
                 if extra_json_metadata:
                     json_metadata.update(extra_json_metadata)
                 if intensity_value_mapping:
-                    json_metadata['intensity_value_mapping'] = intensity_value_mapping
+                    raw_mapping = dict(intensity_value_mapping)
+                    raw_mapping['filename'] = f"{scan_name}_lossy.nii.gz"
+                    json_metadata['intensity_value_mapping'] = [raw_mapping]
                 elif 'intensity_value_mapping' in json_metadata:
                     # Passthrough / individual stretch must not retain a stale factor pair
                     del json_metadata['intensity_value_mapping']
@@ -12752,8 +12772,13 @@ class DeleteEditView(APIView):
 
                         deleted_lossy_names = set(os.path.basename(p) for p in lossy_files)
                         if deleted_lossy_names:
+                            from .intensityMapping import remove_intensity_mappings_for_filenames
                             new_lc = [e for e in lc if e.get('filename') not in deleted_lossy_names]
-                            if new_lc != lc:
+                            mapping_removed = remove_intensity_mappings_for_filenames(
+                                scan_metadata,
+                                deleted_lossy_names,
+                            )
+                            if new_lc != lc or mapping_removed:
                                 scan_metadata['lossy_compression'] = new_lc
                                 with open(json_path, 'w') as jf:
                                     json.dump(scan_metadata, jf, indent=4)
@@ -12983,6 +13008,12 @@ class DeleteEditView(APIView):
                                         f'_edit_{next_edit_num}_elastic',
                                         f'_edit_{edit}_elastic',
                                     )
+                            from .intensityMapping import rename_intensity_mapping_filenames
+                            rename_intensity_mapping_filenames(
+                                _meta,
+                                f'_edit_{next_edit_num}_elastic',
+                                f'_edit_{edit}_elastic',
+                            )
                             # Keep old_thresholds keys aligned with the renamed elastic stem.
                             old_elastic_stem = normalize_threshold_edit_stem(
                                 f"{filename}_edit_{next_edit_num}_elastic",
@@ -23267,6 +23298,16 @@ class ClearIntermediateFilesView(APIView):
                     updated_lossy_compression.extend(edit_entries[-2:])  # Keep last two
                     
                     metadata['lossy_compression'] = updated_lossy_compression
+
+                    # Drop reverse-map rows for the edit files just removed.
+                    # A legacy single dict has no per-edit rows.
+                    intensity_rows = metadata.get('intensity_value_mapping')
+                    if isinstance(intensity_rows, list):
+                        kept_map_names = {f"{subject}_lossy.nii.gz"} | lossy_files_to_keep
+                        metadata['intensity_value_mapping'] = [
+                            entry for entry in intensity_rows
+                            if isinstance(entry, dict) and entry.get('filename') in kept_map_names
+                        ]
                     
                     # Save updated metadata
                     with open(json_path, 'w') as jf:

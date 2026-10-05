@@ -1373,7 +1373,13 @@ class HomogenizeBackgroundView(APIView):
 
 
                 # Save compressed version
-                RegistrationTools().save_as_lossy_nifti(scan_data, scan_metadata['voxel_size'], os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), output_path_lossy)
+                RegistrationTools().save_as_lossy_nifti(
+                    scan_data,
+                    scan_metadata['voxel_size'],
+                    os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"),
+                    output_path_lossy,
+                    stored_offset=-float(applied_shift),
+                )
                 print(f"Saved compressed version of {scan_name}")
 
                 # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
@@ -2555,8 +2561,11 @@ class MatchHistogramView(APIView):
                 print(f"Values clipped to range [{min_val}, {max_val}]")
                 
                 # Save results using consistent helper
-                self._save_processed_scan(directory, scan_name, aligned_data, scan_affine, latest_edit + 1, 
-                                        "histmatched", reference_metadata, scan_metadata)
+                self._save_processed_scan(
+                    directory, scan_name, aligned_data, scan_affine, latest_edit + 1,
+                    "histmatched", reference_metadata, scan_metadata,
+                    stored_offset=float(shift),
+                )
                 
                 # Clean up
                 del scan_data, scan_img, aligned_data
@@ -2771,8 +2780,16 @@ class MatchHistogramView(APIView):
                 # Determine next edit number
                 next_edit = latest_edit + 1
 
-                self._save_processed_scan(directory, scan_name, normalized_data, scan_affine, next_edit,
-                                          "histmatched", reference_metadata_copy, scan_metadata)
+                in_span = float(p_high - p_low)
+                out_span = float(out_max - out_min)
+                percentile_scale = out_span / in_span if in_span else 1.0
+                percentile_offset = float(out_min) - percentile_scale * float(p_low)
+                self._save_processed_scan(
+                    directory, scan_name, normalized_data, scan_affine, next_edit,
+                    "histmatched", reference_metadata_copy, scan_metadata,
+                    stored_scale=percentile_scale,
+                    stored_offset=percentile_offset,
+                )
 
                 del scan_data, scan_img, normalized_data
                 cleanup_memory()
@@ -2780,7 +2797,7 @@ class MatchHistogramView(APIView):
             except Exception as e:
                 print(f"Error processing {scan_name}: {str(e)}")
     
-    def _save_processed_scan(self, directory, scan_name, processed_data, affine, edit_number, method_suffix, reference_metadata, scan_metadata):
+    def _save_processed_scan(self, directory, scan_name, processed_data, affine, edit_number, method_suffix, reference_metadata, scan_metadata, stored_scale=1.0, stored_offset=0.0):
         """Helper method to save processed scan data and metadata"""
         # Determine source base before saving (previous latest edit or base scan)
         try:
@@ -2830,7 +2847,9 @@ class MatchHistogramView(APIView):
             processed_data, 
             reference_metadata['voxel_size'],
             json_path,
-            lossy_path
+            lossy_path,
+            stored_scale=stored_scale,
+            stored_offset=stored_offset,
         )
         print(f"  Saved lossy version to: {lossy_path}")
 
@@ -4116,7 +4135,8 @@ class SaveBackgroundValuesView(APIView):
                     corrected_data, 
                     scan_metadata['voxel_size'], 
                     json_path,
-                    output_path_lossy
+                    output_path_lossy,
+                    stored_offset=-float(applied_shift),
                 )
 
                 # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
