@@ -5126,6 +5126,12 @@ class ExtractJsonView(APIView):
             json_data['edits'] = sort_edit_filenames(edits)
             json_data['edits_masks'] = sort_edit_filenames(edits_masks)
             json_data['landmark_files'] = sorted(landmarks)
+            # Elastic slots holding a pre-mask backup: a masked edit was inserted before that
+            # elastic (and deleting it restores the original). Lets the UI allow one insert only.
+            _backup_re = re.compile(rf"^{re.escape(scan_name)}_edit_(\d+)_elastic\.nii\.backup\.gz$")
+            json_data['elastic_backup_slots'] = sorted(
+                int(m.group(1)) for m in (_backup_re.match(f) for f in os.listdir(edits_dir)) if m
+            )
             json_data = enrich_builtin_texture_metadata(
                 json_data,
                 edits_dir,
@@ -12670,6 +12676,27 @@ class DeleteEditView(APIView):
 
         # delete the edit
         if edit is not None:
+            # Only the last edit may be deleted, except a masked edit inserted right before
+            # the elastic. An insert always backs up the elastic at edit+1; a masked edit the
+            # elastic was run on has no backup, and deleting it would corrupt the stack.
+            _slot_re = re.compile(rf"^{re.escape(filename)}(?:_lossy)?_edit_(\d+)_")
+            _slots = [
+                int(m.group(1))
+                for m in (_slot_re.match(f) for f in os.listdir(scan_dir) if os.path.isfile(os.path.join(scan_dir, f)))
+                if m
+            ] if os.path.isdir(scan_dir) else []
+            is_inserted_mask = os.path.isfile(
+                os.path.join(scan_dir, f"{filename}_edit_{int(edit) + 1}_elastic.nii.backup.gz")
+            )
+            if _slots and int(edit) < max(_slots) and not (is_inserted_mask and int(edit) + 1 == max(_slots)):
+                return Response(
+                    {"error": (
+                        f"Edit {edit} is not the last edit. Only the last edit, or a masked edit "
+                        "inserted before the elastic, can be deleted."
+                    )},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             edit_files = []
             lossy_files = []
             projection_files = []
@@ -12952,13 +12979,10 @@ class DeleteEditView(APIView):
                     with open(json_path, 'w') as jf:
                         json.dump(scan_metadata, jf, indent=4)
 
-                # If a _masked edit was deleted AND the immediately following slot contains
-                # elastic files (i.e. this was the inserted-before-elastic case), un-bump
-                # those elastic files back to the now-vacated slot.
-                # The glob acts as the guard: if no elastic exists at edit+1 the list is
-                # empty and backup restore / rename is skipped entirely.
+                # If an inserted _masked edit was deleted (the elastic at edit+1 has a pre-mask
+                # backup), restore that elastic and un-bump it back to the now-vacated slot.
                 is_masked = any("_masked" in file for file in edit_payload_files)
-                if is_masked:
+                if is_masked and is_inserted_mask:
                     next_edit_num = int(edit) + 1
 
                     elastic_to_unbump = [

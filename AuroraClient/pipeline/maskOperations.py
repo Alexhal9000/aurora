@@ -1037,6 +1037,247 @@ def _resolve_mask_source(directory, own_base_path, own_edit_stem, mask_source):
     return source_base_path, source_edit_stem
 
 
+def _parse_edit_slot_number(edit_stem, filename):
+    """Return the `_edit_N_` slot for *edit_stem*, or -1 for the raw volume."""
+    if not edit_stem:
+        return -1
+    stem = str(edit_stem).replace('.nii.gz', '').replace('_lossy', '')
+    if '_edit_' in stem:
+        try:
+            return int(stem.split('_edit_')[-1].split('_')[0])
+        except (ValueError, IndexError):
+            return None
+    if stem == filename or stem == f"{filename}":
+        return -1
+    return None
+
+
+def _last_elastic_edit_slot(base_path, filename):
+    """Highest `_edit_N_elastic` slot on disk for *filename*, or None when it has no elastic edit."""
+    pattern = re.compile(rf"^{re.escape(filename)}_edit_(\d+)_elastic\.nii\.gz$")
+    slots = [
+        int(m.group(1))
+        for m in (pattern.match(os.path.basename(p)) for p in glob.glob(os.path.join(base_path, f"{filename}_edit_*_elastic.nii.gz")))
+        if m
+    ]
+    return max(slots) if slots else None
+
+
+def _resolve_non_elastic_edit_volume(base_path, filename, edit_num):
+    """Primary full-res intensity volume at *edit_num* (raw when edit_num < 0)."""
+    if edit_num is None:
+        return None
+    if edit_num < 0:
+        raw_path = os.path.join(base_path, f"{filename}.nii.gz")
+        return raw_path if os.path.isfile(raw_path) else None
+    candidates = []
+    for path in glob.glob(os.path.join(base_path, f"{filename}_edit_{edit_num}_*.nii.gz")):
+        base = os.path.basename(path)
+        lower = base.lower()
+        if 'elastic' in lower:
+            continue
+        if any(
+            base.endswith(suffix)
+            for suffix in (
+                '_fwd.nii.gz',
+                '_inv.nii.gz',
+                '_mask.nii.gz',
+                '_mask_temp.nii.gz',
+                '_removal_mask.nii.gz',
+                '.nii.backup.gz',
+            )
+        ):
+            continue
+        candidates.append(path)
+    if not candidates:
+        return None
+    return sorted(
+        candidates,
+        key=lambda path: (len(os.path.basename(path)), os.path.basename(path)),
+    )[0]
+
+
+def _elastic_files_for_slot(base_path, filename, edit_num):
+    """All elastic sidecars (volume, warps, lossy, backups) at a given edit slot."""
+    if edit_num is None or edit_num < 0:
+        return []
+    return (
+        glob.glob(os.path.join(base_path, f"{filename}_edit_{edit_num}_elastic*")) +
+        glob.glob(os.path.join(base_path, f"{filename}_lossy_edit_{edit_num}_elastic*"))
+    )
+
+
+def _fix_lossy_compression_after_elastic_bump(metadata_path, old_elastic_num, new_elastic_num):
+    """Rename stale elastic lossy_compression / intensity-mapping entries after a slot bump."""
+    try:
+        with open(metadata_path, 'r') as f:
+            meta = json.load(f)
+        lc = meta.get('lossy_compression', [])
+        if isinstance(lc, dict):
+            lc = [lc]
+        old_token = f'_edit_{old_elastic_num}_elastic'
+        new_token = f'_edit_{new_elastic_num}_elastic'
+        for entry in lc:
+            fn = entry.get('filename', '')
+            if old_token in fn:
+                entry['filename'] = fn.replace(old_token, new_token)
+        from .intensityMapping import rename_intensity_mapping_filenames
+        rename_intensity_mapping_filenames(meta, old_token, new_token)
+
+        def _lc_sort_key(entry):
+            m = re.search(r'_edit_(\d+)_', entry.get('filename', ''))
+            return int(m.group(1)) if m else 0
+
+        lc.sort(key=_lc_sort_key)
+        meta['lossy_compression'] = lc
+        with open(metadata_path, 'w') as f:
+            json.dump(meta, f, indent=4)
+    except Exception as exc:
+        print(f"Warning: could not fix lossy_compression after elastic bump: {exc}")
+
+
+def _clean_masked_slot_metadata(metadata_path, masked_edit_number):
+    """Strip stale lossy_compression / intensity-mapping rows for a masked slot before overwrite."""
+    try:
+        with open(metadata_path, 'r') as f:
+            meta = json.load(f)
+        lc = meta.get('lossy_compression', [])
+        if isinstance(lc, dict):
+            lc = [lc]
+        token = f'_edit_{masked_edit_number}_masked'
+        lc = [e for e in lc if token not in e.get('filename', '')]
+        meta['lossy_compression'] = lc
+        from .intensityMapping import drop_intensity_mappings_containing
+        drop_intensity_mappings_containing(meta, token)
+        with open(metadata_path, 'w') as f:
+            json.dump(meta, f, indent=4)
+    except Exception as exc:
+        print(f"Warning: could not clean lossy_compression before masked overwrite: {exc}")
+
+
+def _transfer_mask_to_elastic_via_field(
+    base_path,
+    filename,
+    source_mask_path,
+    source_image_path,
+    elastic_edit_num,
+    metadata,
+):
+    """
+    Warp *source_mask_path* onto the elastic edit using elastic_fwd (pre-elastic → elastic space).
+
+    Returns (elastic_mask_path, elastic_mask_lossy_path) on success.
+    Raises RuntimeError when the field or elastic volume is missing / transfer fails.
+    """
+    elastic_stem = f"{filename}_edit_{elastic_edit_num}_elastic"
+    elastic_img_path = os.path.join(base_path, f"{elastic_stem}.nii.gz")
+    elastic_fwd_path = os.path.join(base_path, f"{elastic_stem}_fwd.nii.gz")
+    elastic_mask_path = os.path.join(base_path, f"{elastic_stem}.nii.mask.gz")
+    elastic_lossy_stem = f"{filename}_lossy_edit_{elastic_edit_num}_elastic"
+    elastic_lossy_img = os.path.join(base_path, f"{elastic_lossy_stem}.nii.gz")
+    elastic_mask_lossy_path = os.path.join(base_path, f"{elastic_lossy_stem}.nii.mask.gz")
+
+    if not os.path.isfile(elastic_img_path):
+        raise RuntimeError(f"Elastic volume not found: {elastic_stem}.nii.gz")
+    if not os.path.isfile(elastic_fwd_path):
+        raise RuntimeError(
+            f"Elastic forward field not found: {elastic_stem}_fwd.nii.gz. "
+            "Cannot transfer the modified mask onto the elastic edit."
+        )
+    if not os.path.isfile(source_mask_path):
+        raise RuntimeError(f"Source mask not found for transfer: {source_mask_path}")
+    if not os.path.isfile(source_image_path):
+        raise RuntimeError(f"Source image not found for transfer: {source_image_path}")
+
+    # Lazy import: views imports maskOperations at module load.
+    from .views import PropagateMaskView
+
+    propagator = PropagateMaskView()
+    lossy_img = elastic_lossy_img if os.path.isfile(elastic_lossy_img) else None
+    propagator.propagate_mask_with_field(
+        mask_path=source_mask_path,
+        displacement_field_path=elastic_fwd_path,
+        source_image_path=source_image_path,
+        target_image_path=elastic_img_path,
+        output_path=elastic_mask_path,
+        target_lossy_image_path=lossy_img,
+        lossy_output_path=elastic_mask_lossy_path if lossy_img else None,
+        json_metadata=metadata,
+        selected_label=None,
+        field_fov_image_path=elastic_img_path,
+    )
+    if not os.path.isfile(elastic_mask_path):
+        raise RuntimeError("Mask transfer to elastic edit produced no output mask")
+    return elastic_mask_path, elastic_mask_lossy_path if lossy_img else None
+
+
+def _backup_and_apply_mask_to_elastic(
+    base_path,
+    filename,
+    elastic_edit_num,
+    labels,
+    invert,
+):
+    """
+    Restore any prior backup, create a fresh `.nii.backup.gz`, then apply label mask-out/isolate
+    to the elastic full-res and lossy volumes using the elastic's own (transferred) mask.
+
+    Backup-before-apply is required so DeleteEditView can un-bump the insertion and restore
+    the original elastic intensities.
+    """
+    for stem in (
+        f"{filename}_edit_{elastic_edit_num}_elastic",
+        f"{filename}_lossy_edit_{elastic_edit_num}_elastic",
+    ):
+        img_path = os.path.join(base_path, f"{stem}.nii.gz")
+        backup_path = os.path.join(base_path, f"{stem}.nii.backup.gz")
+        mask_path = os.path.join(base_path, f"{stem}.nii.mask.gz")
+        if not os.path.isfile(img_path):
+            continue
+        try:
+            # Overwrite path: start from the original unmasked elastic if a prior backup exists.
+            if os.path.isfile(backup_path):
+                os.replace(backup_path, img_path)
+                print(f"Restored elastic from backup before re-masking: {stem}")
+            shutil.copy2(img_path, backup_path)
+
+            if not os.path.isfile(mask_path):
+                print(f"Backed up elastic ({stem}); no mask present — image unchanged")
+                continue
+
+            mask_temp = mask_path.replace('.nii.mask.gz', '_mask.nii.gz')
+            os.replace(mask_path, mask_temp)
+            try:
+                mask_img = nib.load(mask_temp)
+                mask_arr = np.round(mask_img.get_fdata()).astype(np.uint8)
+            finally:
+                os.replace(mask_temp, mask_path)
+
+            combined = np.zeros(mask_arr.shape, dtype=bool)
+            for label in labels:
+                combined |= (mask_arr == label)
+            if not np.any(combined):
+                print(f"Backed up elastic ({stem}); labels {labels} not in mask — image unchanged")
+                continue
+
+            ei = nib.load(img_path)
+            edata = ei.get_fdata().copy()
+            if edata.shape != combined.shape:
+                print(
+                    f"Warning: elastic image shape {edata.shape} != mask shape {combined.shape} "
+                    f"for {stem}; skipping apply"
+                )
+                continue
+            if invert:
+                edata[~combined] = 0
+            else:
+                edata[combined] = 0
+            nib.save(nib.Nifti1Image(edata, ei.affine, header=ei.header), img_path)
+            print(f"Backed up and masked elastic ({stem})")
+        except Exception as exc:
+            print(f"Warning: could not backup/mask elastic ({stem}): {exc}")
+
+
 class ApplyMaskToImageView(APIView):
     """
     API endpoint to apply a mask to an image and save it to a specified folder.
@@ -1960,8 +2201,13 @@ class MaskOutLabelsView(APIView):
     1. Loads the current image edit
     2. Loads the corresponding mask
     3. For each label in the labels array, sets those voxels to 0 in the image (or inverse if invert=True)
-    4. Finds the next edit number
-    5. Saves as "{filename}_edit_{N}_masked.nii.gz"
+    4. Saves as "{filename}_edit_{N}_masked.nii.gz"
+       - Normal: append at the next free edit slot
+       - When the current edit is immediately before an elastic edit: insert the masked
+         volume between them (bump elastic), matching Apply masks / batch-mask-out
+    5. When inserting before elastic: transfer the (possibly manually edited) mask onto
+       the elastic edit via elastic_fwd, backup the elastic volumes, then apply the same
+       mask-out/isolate so delete/un-bump restore works
     6. Creates lossy version with metadata update
     7. Copies mask to new edit with downsampling
     8. Copies landmarks (if present) without transformation
@@ -1983,7 +2229,8 @@ class MaskOutLabelsView(APIView):
             "labels_masked": list[int],
             "voxels_affected": int,
             "landmarks_copied": bool,
-            "operation": str ("masked_out" or "isolated")
+            "operation": str ("masked_out" or "isolated"),
+            "inserted_before_elastic": bool
         }
     """
     
@@ -2050,9 +2297,46 @@ class MaskOutLabelsView(APIView):
             
             # Process edit name
             edit_clean = edit.replace(".nii.gz", "")
-            lossy_edit = edit_clean
             full_edit = edit_clean.replace('_lossy', '')
-            
+
+            # Once a subject has an elastic edit, mask-out/isolate is only allowed on the
+            # edit immediately before its last elastic edit, so the result can be carried
+            # through the registration field. Editing the mask itself stays allowed anywhere.
+            last_elastic_slot = _last_elastic_edit_slot(base_path, filename)
+            if last_elastic_slot is not None:
+                # Only one masked insert between edit E-1 and the elastic: stacking re-masks
+                # makes the delete → restore-original-elastic path unreliable. Every insert
+                # backs up the elastic and deleting the masked edit restores and removes that
+                # backup, so the backup marks an insert. A masked edit that was simply the input
+                # to the elastic (no backup) is the normal edit before elastic and may be masked.
+                pre_elastic_slot = last_elastic_slot - 1
+                elastic_backup = os.path.join(
+                    base_path, f"{filename}_edit_{last_elastic_slot}_elastic.nii.backup.gz"
+                )
+                if os.path.isfile(elastic_backup):
+                    return Response(
+                        {
+                            "error": (
+                                f"A masked edit (edit {pre_elastic_slot}) is already inserted before "
+                                "the elastic edit. Delete it to restore the original elastic, then "
+                                "mask out / isolate again."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if _parse_edit_slot_number(full_edit, filename) != last_elastic_slot - 1:
+                    allowed = "the raw scan" if last_elastic_slot == 0 else f"edit {last_elastic_slot - 1}"
+                    return Response(
+                        {
+                            "error": (
+                                f"{filename} has an elastic edit (edit {last_elastic_slot}). "
+                                f"Mask out / isolate is only allowed on {allowed}, the edit "
+                                "right before the last elastic edit."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
             # ===== ALWAYS LOAD FULL RESOLUTION MASK =====
             mask_base_path, mask_edit_stem = _resolve_mask_source(
                 directory, base_path, full_edit, mask_source
@@ -2068,25 +2352,78 @@ class MaskOutLabelsView(APIView):
                     status=status.HTTP_404_NOT_FOUND
                 )
             
-            # Load mask with temp rename
+            # Load mask with temp rename. Keep affine/header so we can rewrite the mask
+            # after an overwrite wipe removes the on-disk source under the masked slot.
             os.replace(full_mask_path, full_mask_temp_path)
             try:
                 mask_img = nib.load(full_mask_temp_path)
+                mask_affine = mask_img.affine
+                mask_header = mask_img.header.copy()
+                mask_dtype = mask_img.get_data_dtype()
                 # Round before astype to avoid truncating floats
                 mask_data = np.round(mask_img.get_fdata()).astype(np.uint8)
             finally:
                 os.replace(full_mask_temp_path, full_mask_path)
-            
-            # ===== ALWAYS LOAD FULL RESOLUTION IMAGE =====
-            full_image_filename = f"{full_edit}.nii.gz"
-            full_image_path = os.path.join(base_path, full_image_filename)
-            
-            if not os.path.exists(full_image_path):
-                return Response(
-                    {"error": f"Full resolution image not found: {full_image_filename}"},
-                    status=status.HTTP_404_NOT_FOUND
+
+            # ===== Detect insert-before-elastic (segmentation on edit immediately before elastic) =====
+            current_edit_num = _parse_edit_slot_number(full_edit, filename)
+            next_edit_num = (current_edit_num + 1) if current_edit_num is not None else None
+            elastic_vol_at_next = (
+                os.path.join(base_path, f"{filename}_edit_{next_edit_num}_elastic.nii.gz")
+                if next_edit_num is not None and next_edit_num >= 0
+                else None
+            )
+            insert_before_elastic = bool(
+                elastic_vol_at_next and os.path.isfile(elastic_vol_at_next)
+            )
+            # Re-running mask-out while sitting on an already-inserted masked slot before elastic.
+            overwrite_masked_before_elastic = bool(
+                insert_before_elastic and '_masked' in full_edit
+            )
+
+            # Preflight: elastic_fwd must exist before we mutate the edit stack.
+            if insert_before_elastic:
+                preflight_fwd = os.path.join(
+                    base_path, f"{filename}_edit_{next_edit_num}_elastic_fwd.nii.gz"
                 )
-            
+                if not os.path.isfile(preflight_fwd):
+                    return Response(
+                        {
+                            "error": (
+                                f"Elastic forward field not found at edit {next_edit_num}. "
+                                "Cannot transfer the mask onto the elastic edit."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            # ===== ALWAYS LOAD FULL RESOLUTION IMAGE =====
+            # Overwrite of an inserted masked slot: rebuild from the prior (unmasked) edit
+            # so repeated mask-out does not compound on already-zeroed voxels. The mask in
+            # use is still the current (possibly manually edited) segmentation.
+            if overwrite_masked_before_elastic:
+                source_edit_num = current_edit_num - 1
+                full_image_path = _resolve_non_elastic_edit_volume(
+                    base_path, filename, source_edit_num
+                )
+                if not full_image_path:
+                    return Response(
+                        {
+                            "error": (
+                                f"Source image not found at edit {source_edit_num} for "
+                                "overwriting the masked-before-elastic insertion"
+                            )
+                        },
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
+            else:
+                full_image_path = os.path.join(base_path, f"{full_edit}.nii.gz")
+                if not os.path.exists(full_image_path):
+                    return Response(
+                        {"error": f"Full resolution image not found: {full_edit}.nii.gz"},
+                        status=status.HTTP_404_NOT_FOUND,
+                    )
+
             full_image_img = nib.load(full_image_path)
             full_image_data = full_image_img.get_fdata()
             
@@ -2120,14 +2457,51 @@ class MaskOutLabelsView(APIView):
                 masked_full_data[~combined_mask] = 0
             else:
                 masked_full_data[combined_mask] = 0
-            
-            # Find next edit number
-            edit_number = 0
-            while glob.glob(os.path.join(base_path, f"{filename}_edit_{edit_number}_*.nii.gz")):
-                edit_number += 1
+
+            # ===== Resolve output slot (append vs insert-before-elastic / overwrite) =====
+            elastic_files_to_bump = []
+            elastic_edit_num_after = None
+            bumped_elastic = False
+
+            if overwrite_masked_before_elastic:
+                masked_edit_number = current_edit_num
+                elastic_edit_num_after = next_edit_num
+                _clean_masked_slot_metadata(metadata_path, masked_edit_number)
+                for old_f in (
+                    glob.glob(os.path.join(base_path, f"{filename}_edit_{masked_edit_number}_masked*")) +
+                    glob.glob(os.path.join(base_path, f"{filename}_lossy_edit_{masked_edit_number}_masked*"))
+                ):
+                    try:
+                        os.remove(old_f)
+                    except OSError as rm_err:
+                        print(f"Warning: could not remove {old_f}: {rm_err}")
+                print(
+                    f"Overwriting masked-before-elastic slot {masked_edit_number} for {filename}"
+                )
+            elif insert_before_elastic:
+                elastic_files_to_bump = _elastic_files_for_slot(
+                    base_path, filename, next_edit_num
+                )
+                for src in elastic_files_to_bump:
+                    dst = src.replace(
+                        f"_edit_{next_edit_num}_elastic",
+                        f"_edit_{next_edit_num + 1}_elastic",
+                    )
+                    os.rename(src, dst)
+                masked_edit_number = next_edit_num
+                elastic_edit_num_after = next_edit_num + 1
+                bumped_elastic = True
+                print(
+                    f"Inserted masked edit before elastic for {filename}: "
+                    f"elastic bumped {next_edit_num} → {elastic_edit_num_after}"
+                )
+            else:
+                masked_edit_number = 0
+                while glob.glob(os.path.join(base_path, f"{filename}_edit_{masked_edit_number}_*.nii.gz")):
+                    masked_edit_number += 1
             
             # Save full resolution version
-            full_output_name = f"{filename}_edit_{edit_number}_masked"
+            full_output_name = f"{filename}_edit_{masked_edit_number}_masked"
             full_output_path = os.path.join(base_path, f"{full_output_name}.nii.gz")
             
             full_masked_img = nib.Nifti1Image(
@@ -2139,10 +2513,13 @@ class MaskOutLabelsView(APIView):
             print(f"Saved full resolution masked image: {full_output_path}")
             
             # Create lossy version from full resolution masked data
-            lossy_output_name = f"{filename}_lossy_edit_{edit_number}_masked"
+            lossy_output_name = f"{filename}_lossy_edit_{masked_edit_number}_masked"
             lossy_output_path = os.path.join(base_path, f"{lossy_output_name}.nii.gz")
             
             try:
+                # Reload metadata after possible cleanup; save_as_lossy_nifti appends to it.
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
                 voxel_size = metadata.get('voxel_size', 1.0)
                 registration_tools = RegistrationTools()
                 registration_tools.save_as_lossy_nifti(
@@ -2154,65 +2531,105 @@ class MaskOutLabelsView(APIView):
                 print(f"Saved lossy masked image: {lossy_output_path}")
             except Exception as e:
                 print(f"Warning: Could not create lossy version: {str(e)}")
+
+            if bumped_elastic:
+                _fix_lossy_compression_after_elastic_bump(
+                    metadata_path, next_edit_num, elastic_edit_num_after
+                )
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
             
-            # Copy and downsample mask to new edit
+            # Write the applied mask onto the new/overwritten masked edit from memory
+            # (overwrite deletes on-disk masked* files, including the prior mask source).
+            dst_mask_full = os.path.join(base_path, f"{full_output_name}.nii.mask.gz")
+            dst_mask_lossy = os.path.join(base_path, f"{lossy_output_name}.nii.mask.gz")
             try:
-                # Copy full resolution mask
-                src_mask = os.path.join(base_path, f"{full_edit}.nii.mask.gz")
-                dst_mask_full = os.path.join(base_path, f"{full_output_name}.nii.mask.gz")
-                dst_mask_lossy = os.path.join(base_path, f"{lossy_output_name}.nii.mask.gz")
-                
-                if os.path.exists(src_mask):
-                    shutil.copy2(src_mask, dst_mask_full)
-                    print(f"Copied mask to: {dst_mask_full}")
-                    
-                    # Downsample mask for lossy version
-                    resolution_factor = 2
-                    lc = metadata.get('lossy_compression', None)
-                    if isinstance(lc, list) and len(lc) > 0:
-                        try:
-                            resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
-                        except Exception:
-                            pass
-                    elif isinstance(lc, dict) and lc:
-                        try:
-                            resolution_factor = int(lc.get('resolution_factor', resolution_factor))
-                        except Exception:
-                            pass
-                    
-                    # Load lossy image to get affine
+                mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
+                nib.save(
+                    nib.Nifti1Image(mask_data.astype(mask_dtype, copy=False), mask_affine, header=mask_header),
+                    mask_temp,
+                )
+                os.replace(mask_temp, dst_mask_full)
+                print(f"Wrote mask to: {dst_mask_full}")
+
+                # Downsample mask for lossy version
+                resolution_factor = 2
+                lc = metadata.get('lossy_compression', None)
+                if isinstance(lc, list) and len(lc) > 0:
+                    try:
+                        resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
+                    except Exception:
+                        pass
+                elif isinstance(lc, dict) and lc:
+                    try:
+                        resolution_factor = int(lc.get('resolution_factor', resolution_factor))
+                    except Exception:
+                        pass
+
+                if os.path.isfile(lossy_output_path):
                     lossy_img = nib.load(lossy_output_path)
                     lossy_affine = lossy_img.affine
-                    
-                    # Downsample mask
-                    mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
+                    slices = [slice(None, None, resolution_factor) for _ in range(3)]
+                    lossy_mask_arr = mask_data[slices[0], slices[1], slices[2]].astype(mask_dtype)
                     lossy_mask_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
-                    os.replace(dst_mask_full, mask_temp)
-                    try:
-                        mask_img = nib.load(mask_temp)
-                        mask_dtype = mask_img.get_data_dtype()
-                        # Round before astype to avoid truncating floats
-                        mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
-                        slices = [slice(None, None, resolution_factor) for _ in range(3)]
-                        lossy_mask_arr = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype)
-                        nib.save(nib.Nifti1Image(lossy_mask_arr, lossy_affine), lossy_mask_temp)
-                        os.replace(lossy_mask_temp, dst_mask_lossy)
-                        print(f"Created lossy mask: {dst_mask_lossy}")
-                    finally:
-                        os.replace(mask_temp, dst_mask_full)
+                    nib.save(nib.Nifti1Image(lossy_mask_arr, lossy_affine), lossy_mask_temp)
+                    os.replace(lossy_mask_temp, dst_mask_lossy)
+                    print(f"Created lossy mask: {dst_mask_lossy}")
             except Exception as e:
-                print(f"Warning: Could not copy/downsample mask: {str(e)}")
+                print(f"Warning: Could not write/downsample mask: {str(e)}")
+
+            # ===== Transfer modified mask → elastic, backup, apply =====
+            if insert_before_elastic and elastic_edit_num_after is not None:
+                try:
+                    _transfer_mask_to_elastic_via_field(
+                        base_path=base_path,
+                        filename=filename,
+                        source_mask_path=dst_mask_full if os.path.isfile(dst_mask_full) else full_mask_path,
+                        source_image_path=full_image_path,
+                        elastic_edit_num=elastic_edit_num_after,
+                        metadata=metadata,
+                    )
+                    _backup_and_apply_mask_to_elastic(
+                        base_path=base_path,
+                        filename=filename,
+                        elastic_edit_num=elastic_edit_num_after,
+                        labels=labels,
+                        invert=invert,
+                    )
+                except Exception as transfer_err:
+                    print(
+                        f"Error transferring/applying mask to elastic for {filename}: "
+                        f"{transfer_err}"
+                    )
+                    import traceback
+                    traceback.print_exc()
+                    return Response(
+                        {
+                            "error": (
+                                f"Masked edit was saved, but transferring/applying the mask "
+                                f"to the elastic edit failed: {transfer_err}"
+                            ),
+                            "new_edit": f"{full_output_name}.nii.gz",
+                            "new_edit_lossy": f"{lossy_output_name}.nii.gz",
+                            "inserted_before_elastic": True,
+                        },
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
             
-            # === Copy landmarks if they exist (WITHOUT TRANSFORMATION) ===
+            # === Copy landmarks if they exist (WITHOUT TRANSFORM) ===
             landmarks_copied = False
             try:
-                # Determine source base for landmark files
-                source_landmark_base = full_edit
-                
-                # Check for landmarks file
+                # Prefer landmarks on the image source used for masking (pre-masked edit
+                # when overwriting); fall back to the viewed edit stem.
+                source_landmark_base = os.path.basename(full_image_path).replace('.nii.gz', '')
                 source_landmarks_path = os.path.join(base_path, f"{source_landmark_base}_landmarks.json")
+                if not os.path.isfile(source_landmarks_path):
+                    source_landmark_base = full_edit
+                    source_landmarks_path = os.path.join(
+                        base_path, f"{source_landmark_base}_landmarks.json"
+                    )
+
                 if os.path.isfile(source_landmarks_path):
-                    # Copy landmarks directly without transformation (geometry not changed)
                     dest_landmarks_path = os.path.join(base_path, f"{full_output_name}_landmarks.json")
                     shutil.copy2(source_landmarks_path, dest_landmarks_path)
                     print(f"Copied landmarks to: {dest_landmarks_path}")
@@ -2220,10 +2637,13 @@ class MaskOutLabelsView(APIView):
                 else:
                     print(f"No landmarks found: {source_landmarks_path}")
                 
-                # Check for landmark distances file
-                source_landmark_distances_path = os.path.join(base_path, f"{source_landmark_base}_landmark_distances.json")
+                source_landmark_distances_path = os.path.join(
+                    base_path, f"{source_landmark_base}_landmark_distances.json"
+                )
                 if os.path.isfile(source_landmark_distances_path):
-                    dest_landmark_distances_path = os.path.join(base_path, f"{full_output_name}_landmark_distances.json")
+                    dest_landmark_distances_path = os.path.join(
+                        base_path, f"{full_output_name}_landmark_distances.json"
+                    )
                     shutil.copy2(source_landmark_distances_path, dest_landmark_distances_path)
                     print(f"Copied landmark distances to: {dest_landmark_distances_path}")
                 else:
@@ -2241,7 +2661,7 @@ class MaskOutLabelsView(APIView):
                         "operation": "isolated" if invert else "masked_out",
                         "label": labels[0] if labels else None,
                         "labels": list(labels),
-                        "inserted_before_elastic": False,
+                        "inserted_before_elastic": bool(insert_before_elastic),
                         "dilation": 0,
                         "ts": datetime.now(timezone.utc).isoformat(),
                     },
@@ -2257,7 +2677,8 @@ class MaskOutLabelsView(APIView):
                     "labels_masked": labels,
                     "voxels_affected": voxels_affected,
                     "landmarks_copied": landmarks_copied,
-                    "operation": "isolated" if invert else "masked_out"
+                    "operation": "isolated" if invert else "masked_out",
+                    "inserted_before_elastic": bool(insert_before_elastic),
                 },
                 status=status.HTTP_200_OK
             )
@@ -2467,12 +2888,16 @@ class BatchMaskOutScansView(APIView):
                     # --- Step 3: Detect if a masked insertion already exists before the elastic ---
                     # After a previous run the layout is: ..._edit_{E-1}_*, _edit_{E}_masked, _edit_{E+1}_elastic
                     # so pre_masked_edit_num == E and source_for_overwrite == E-1.
+                    # The elastic backup marks a real insert; a masked edit the elastic was run
+                    # on has none and is treated as an ordinary edit before elastic.
                     already_inserted = False
                     pre_masked_edit_num = elastic_edit_num - 1
                     if elastic_files_to_bump and pre_masked_edit_num >= 0:
                         already_inserted = bool(glob.glob(
                             os.path.join(subject_path, f"{subject_name}_edit_{pre_masked_edit_num}_*masked*.nii.gz")
-                        ))
+                        )) and os.path.isfile(
+                            os.path.join(subject_path, f"{subject_name}_edit_{elastic_edit_num}_elastic.nii.backup.gz")
+                        )
 
                     # Also detect when the last edit is already masked with no elastic following it.
                     last_edit_is_masked = (

@@ -263,6 +263,10 @@ MATH_BY_ID: Dict[str, Optional[Math]] = {
             r"I' = I \cdot (C\ \mathrm{if\ invert\ else}\ \neg C)",
             r"invert: keep the labeled region; otherwise zero it out.",
         ),
+        eq(
+            r"M_E = T_{\mathrm{fwd}}(M)\quad\text{then}\quad I_E' = I_E \cdot (C_E\ \mathrm{if\ invert\ else}\ \neg C_E)",
+            r"When the current edit is immediately before elastic: insert I' before elastic, warp M through elastic_fwd onto the elastic edit, backup I_E, then apply the same mask-out/isolate.",
+        ),
     ],
     "batch-mask-out-scans": [
         eq(

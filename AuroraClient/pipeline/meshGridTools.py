@@ -30,7 +30,7 @@ PROJECTION_RENDER_SIZE = 768
 GRID_PREVIEW_JPEG_QUALITY = 80
 
 # Keys populated at bundle-load time from on-disk edit files — never persist in scan JSON.
-EPHEMERAL_SCAN_METADATA_KEYS = ("edits", "edits_masks", "last_mesh_edit")
+EPHEMERAL_SCAN_METADATA_KEYS = ("edits", "edits_masks", "last_mesh_edit", "elastic_backup_slots")
 
 
 def strip_ephemeral_scan_metadata(metadata):
