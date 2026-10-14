@@ -67,6 +67,7 @@ urlpatterns = [
     path('backfill-elastic-ncc/', BackfillElasticNccView.as_view(), name='backfill_elastic_ncc'),  # TEMPORARY
     path('display-nifti/', DisplayNiftiView.as_view(), name='display_nifti'),
     path('nifti-header-info/', NiftiHeaderInfoView.as_view(), name='nifti_header_info'),
+    path('full-resolution-value-histogram/', FullResolutionValueHistogramView.as_view(), name='full_resolution_value_histogram'),
     path('elastic-slice-ncc-heatmap/', ElasticSliceNccHeatmapView.as_view(), name='elastic_slice_ncc_heatmap'),
     path('marchingcubes/', MarchingCubesView.as_view(), name='marchingcubes'),
     path('edge-detection/', EdgeDetectionView.as_view(), name='edge_detection'),

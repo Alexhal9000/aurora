@@ -72,6 +72,10 @@ from .coordinateFrames import (
     voxel_only_no_eligible_targets_message,
 )
 from .meshBasedTools import ApplyMeshCleanupView
+from .backgroundOffsetEstimation import (
+    estimate_background_peak,
+    normalize_region as normalize_background_region,
+)
 
 # Summary of classes:
 # CleanupMeshView: Used to clean up the mesh by removing small disconnected components and trying to separate connected objects
@@ -1091,6 +1095,9 @@ class HomogenizeBackgroundView(APIView):
         print("Homogenizing background for all scans")
         directory = request.data['directory']
         background_value = request.data['background_value']
+        # Region used by the automatic estimator: 'outside' (Surrounding air,
+        # default) or 'surrounding_tissue' (near band, inside or outside).
+        background_region = normalize_background_region(request.data.get('background_region'))
         flag_filter = normalize_flag_filter_value(
             request.data.get('flagFilter', 'off') if request.data else 'off',
             only_current_scan=False,
@@ -1168,7 +1175,10 @@ class HomogenizeBackgroundView(APIView):
         if skipped_preserved_meshes:
             print(f"Skipping preserved mesh subjects for background homogenization: {skipped_preserved_meshes}")
 
+        # One entry per scan in scan_names (None when estimation failed), so
+        # the apply pass can index both lists by the same position.
         background_values = []
+        background_estimates = []
         optimal_background = None
         last_idx = 0  
 
@@ -1238,15 +1248,22 @@ class HomogenizeBackgroundView(APIView):
                     
                     # Analyze background
                     time_start = time.time()
-                    background_value = self._get_background_value(scan_data, np.array(scan_metadata['threshold'], dtype=original_dtype))
+                    background_value, estimate_info = self._get_background_value(
+                        scan_data,
+                        scan_metadata['threshold'],
+                        region=background_region,
+                    )
                     background_values.append(background_value)
+                    background_estimates.append(estimate_info)
                     time_end = time.time()
                     print(f"Time taken to analyze background: {time_end - time_start} seconds")
                     
-                    print(f"Analyzed {scan_name}, background value: {background_value}")
+                    print(f"Analyzed {scan_name}, background value: {background_value} ({estimate_info})")
                     
                 except Exception as e:
                     print(f"Error processing {scan_name}: {str(e)}")
+                    background_values.append(None)
+                    background_estimates.append(None)
             
         else:
             optimal_background = np.array(background_value, dtype=int)
@@ -1269,6 +1286,9 @@ class HomogenizeBackgroundView(APIView):
         
         # Second pass: apply homogenization to all scans
         for idx, scan_name in enumerate(scan_names):
+            if optimal_background is None and background_values[idx] is None:
+                print(f"Skipping {scan_name}: no background value was estimated")
+                continue
             try:
                 # Send progress update
                 channel_layer = get_channel_layer()
@@ -1361,6 +1381,10 @@ class HomogenizeBackgroundView(APIView):
                     'mode': offset_mode,
                     'shift': applied_shift,
                 }
+                if optimal_background is None and background_estimates[idx]:
+                    # Provenance of the automatic estimate (method, region,
+                    # derived constants, sample counts, any fallback).
+                    scan_metadata['background_offset_settings']['estimator'] = background_estimates[idx]
                 append_background_offset_history(
                     scan_metadata,
                     f"{scan_name}_edit_{new_edit_number}_backfixed",
@@ -1480,7 +1504,34 @@ class HomogenizeBackgroundView(APIView):
         
         return Response({"status": "success", "message": "Background homogenization completed"})
     
-    def _get_background_value(self, data, current_threshold):
+    def _get_background_value(self, data, current_threshold, region=None):
+        """Automatic background offset for one scan.
+
+        Uses the distance-guarded peak estimator (see ``backgroundOffsetEstimation``):
+        the histogram peak of blurred below-threshold voxels that lie beyond
+        a 3-sigma edge guard from the specimen and from constant padding
+        (far exterior for 'outside', near band for 'surrounding_tissue'). When too few eligible voxels exist, the
+        legacy sub-threshold histogram mode is used and the reason recorded.
+
+        Returns ``(value, info)``; ``info`` is stored in the scan metadata.
+        """
+        value, info = estimate_background_peak(data, float(current_threshold), region=region)
+        if value is not None:
+            return int(value), info
+        legacy_threshold = np.array(current_threshold, dtype=data.dtype)
+        value = int(self._get_background_value_legacy(data, legacy_threshold))
+        info = dict(info)
+        info['method'] = 'legacy_threshold_mode'
+        info['value'] = value
+        print(f"Distance-guarded background estimate unavailable ({info.get('fallback_reason')}); used legacy mode {value}")
+        return value, info
+
+    def _get_background_value_legacy(self, data, current_threshold):
+        """Original estimator: histogram mode of sub-threshold voxels.
+
+        Kept as the fallback of ``_get_background_value``. It ignores where
+        voxels are, so interior cavities and the edge halo are included.
+        """
         # Subsample for speed, like before
         vals = data[::2, ::2, ::2]
         thr = float(current_threshold)

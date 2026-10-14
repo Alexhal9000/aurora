@@ -1063,6 +1063,9 @@ class EnsureQuickGridProjectionPngsView(APIView):
 
         directory = os.path.abspath(os.path.expanduser(unquote(directory)))
         results = []
+        # Terminal output: one summary line per request (cached / generated / failed);
+        # per-subject lines only for failures, so large grids do not flood the log.
+        request_start_time = time.time()
 
         for subject in subjects:
             scan_name = os.path.basename(unquote(str(subject.get('scan_name', ''))))
@@ -1117,18 +1120,18 @@ class EnsureQuickGridProjectionPngsView(APIView):
             })
             if self._projection_pair_exists(scan_dir, edit):
                 result['ready'] = True
-                print(f"[QuickGrid] {scan_name}: using existing projection PNGs for {edit}")
                 results.append(result)
                 continue
 
             if ply_edit_path and os.path.isfile(ply_edit_path):
                 try:
-                    print(f"[QuickGrid] {scan_name}: generating mesh projection PNGs from {ply_edit_path}")
                     result['generated'] = ensure_mesh_projection_pngs(ply_edit_path)
                     result['ready'] = True
                     result['debug']['projection_pair_exists_after'] = self._projection_pair_exists(scan_dir, edit)
                 except Exception as exc:
-                    print(f"Error ensuring Quick Grid mesh projection for {scan_name}: {exc}")
+                    print(f"Error ensuring Quick Grid mesh projection for {scan_name} (source {ply_edit_path}): {exc}")
+                    import traceback
+                    traceback.print_exc()
                     result['error'] = str(exc)
                 results.append(result)
                 continue
@@ -1158,7 +1161,6 @@ class EnsureQuickGridProjectionPngsView(APIView):
                 continue
 
             try:
-                print(f"[QuickGrid] {scan_name}: generating projection PNGs from {source_path}")
                 result['generated'] = self._ensure_projection_pair(
                     source_path,
                     projection_base_path,
@@ -1167,11 +1169,20 @@ class EnsureQuickGridProjectionPngsView(APIView):
                 result['ready'] = True
                 result['debug']['projection_pair_exists_after'] = self._projection_pair_exists(scan_dir, edit)
             except Exception as exc:
-                print(f"Error ensuring Quick Grid projection for {scan_name}: {exc}")
+                print(f"Error ensuring Quick Grid projection for {scan_name} (source {source_path}): {exc}")
+                import traceback
+                traceback.print_exc()
                 result['error'] = str(exc)
 
             results.append(result)
 
+        generated_count = sum(1 for r in results if r.get('ready') and r.get('generated'))
+        cached_count = sum(1 for r in results if r.get('ready') and not r.get('generated'))
+        failed_count = sum(1 for r in results if not r.get('ready'))
+        print(
+            f"[QuickGrid] {len(results)} subjects: {cached_count} cached, {generated_count} generated, "
+            f"{failed_count} failed ({time.time() - request_start_time:.2f} s)"
+        )
         return Response({'subjects': results})
 
 
@@ -1462,7 +1473,12 @@ class GetGridView(APIView):
 
     def create_preview_image(self, scan_name, directory, ignoreElastic=False):
         start_time = time.time() # Start timing
-        print(f"[{scan_name}] Starting preview generation...")
+        # Per-step timings are collected here and printed as ONE summary line at the end
+        # (instead of ~15 lines per scan, which flooded the terminal for large grids).
+        step_times = {}
+        preview_3d_detail = ''
+        # Shared with the caller so a failure can report which steps completed before it broke.
+        self._preview_step_times = step_times
 
         # 1. Load Data
         latest_edit = 0
@@ -1530,7 +1546,7 @@ class GetGridView(APIView):
              buf.seek(0)
              return buf.read()
 
-        print(f"[{scan_name}] NIfTI loaded in {time.time() - load_start_time:.2f} seconds.")
+        step_times['load'] = time.time() - load_start_time
 
         metadata_start_time = time.time()
         # Load metadata
@@ -1553,7 +1569,7 @@ class GetGridView(APIView):
              buf.seek(0)
              return buf.read()
 
-        print(f"[{scan_name}] Metadata loaded in {time.time() - metadata_start_time:.2f} seconds.")
+        step_times['metadata'] = time.time() - metadata_start_time
 
         threshold_orig = metadata_data.get('threshold')
 
@@ -1620,8 +1636,7 @@ class GetGridView(APIView):
         # Ensure threshold is within the range of the lossy data (often 0-255 for uint8)
         data_min, data_max = np.min(latest_edit_image_data), np.max(latest_edit_image_data)
         adjusted_threshold = np.clip(adjusted_threshold, data_min, data_max)
-        print(f"Scan: {scan_name}, Orig Threshold: {threshold_orig}, Adjusted Threshold: {adjusted_threshold}, Data Range: [{data_min}, {data_max}]")
-        print(f"[{scan_name}] Threshold adjusted in {time.time() - threshold_adjust_start_time:.2f} seconds.")
+        step_times['threshold'] = time.time() - threshold_adjust_start_time
 
         centroid_start_time = time.time()
         # 3. Calculate Centroid (using center_of_mass on thresholded data)
@@ -1640,14 +1655,14 @@ class GetGridView(APIView):
 
         # Assuming Nifti shape is (X, Y, Z)
         centroid_x, centroid_y, centroid_z = centroid_voxel
-        print(f"[{scan_name}] Centroid calculated in {time.time() - centroid_start_time:.2f} seconds.")
+        step_times['centroid'] = time.time() - centroid_start_time
 
         quad1_start_time = time.time()
         # 4. Generate Quadrant 1 (Z-Sum Projection)
         z_sum_projection = np.sum(latest_edit_image_data, axis=2)
         # Normalize for display
         z_sum_norm = exposure.rescale_intensity(z_sum_projection, out_range=(0, 255)).astype(np.uint8)
-        print(f"[{scan_name}] Quadrant 1 (Z-Sum Projection) generated in {time.time() - quad1_start_time:.2f} seconds.")
+        step_times['z-sum'] = time.time() - quad1_start_time
 
         quad2_start_time = time.time()
         # 5. Generate Quadrant 2 (Marching Cubes 3D View)
@@ -1680,13 +1695,12 @@ class GetGridView(APIView):
             else:
                 dynamic_step = 1
 
-            print(f"[{scan_name}] Active voxels: {active_voxels:,}, using step_size: {dynamic_step}")
+            preview_3d_detail = f"; 3D {active_voxels:,} voxels, step {dynamic_step}"
 
             # Use Max Pooling (block_reduce) to downsample strategically.
             # Max pooling ensures that thin, high-intensity structures (like edges or small muscles/bones)
             # are preserved and not "eaten away" or blurred below the threshold.
             if dynamic_step > 1:
-                print(f"[{scan_name}] Applying Max Pooling block reduction with size: {dynamic_step}")
                 reduced_image_data = measure.block_reduce(
                     latest_edit_image_data, 
                     block_size=(dynamic_step, dynamic_step, dynamic_step), 
@@ -1772,7 +1786,7 @@ class GetGridView(APIView):
             draw.text((10, 10), "3D Preview Error", fill="white")
             quadrant2_img_array = np.array(img_placeholder)
 
-        print(f"[{scan_name}] Quadrant 2 (3D View) generated in {time.time() - quad2_start_time:.2f} seconds.")
+        step_times['3D'] = time.time() - quad2_start_time
 
         quad3_start_time = time.time()
         # 6. Generate Quadrant 3 (X, Z Slice at Centroid Y)
@@ -1780,7 +1794,7 @@ class GetGridView(APIView):
         xz_slice = latest_edit_image_data[:, centroid_y, :]
         # Normalize and ensure correct orientation (transpose if needed)
         xz_slice_norm = np.rot90(xz_slice).astype(np.uint8) # Rotate for better view
-        print(f"[{scan_name}] Quadrant 3 (XZ Slice) generated in {time.time() - quad3_start_time:.2f} seconds.")
+        step_times['xz'] = time.time() - quad3_start_time
 
         quad4_start_time = time.time()
         # 7. Generate Quadrant 4 (Y, Z Slice at Centroid X)
@@ -1788,7 +1802,7 @@ class GetGridView(APIView):
         yz_slice = latest_edit_image_data[centroid_x, :, :]
         # Normalize and ensure correct orientation
         yz_slice_norm = np.rot90(yz_slice).astype(np.uint8) # Rotate for better view
-        print(f"[{scan_name}] Quadrant 4 (YZ Slice) generated in {time.time() - quad4_start_time:.2f} seconds.")
+        step_times['yz'] = time.time() - quad4_start_time
 
         combine_start_time = time.time()
         # 8. Combine Quadrants
@@ -1887,7 +1901,7 @@ class GetGridView(APIView):
         draw_text_with_bg(draw, (5, target_size[1] + 5), f"XZ Slice (Y={centroid_y})", font=font)
         draw_text_with_bg(draw, (target_size[0] + 5, target_size[1] + 5), f"YZ Slice (X={centroid_x})", font=font)
 
-        print(f"[{scan_name}] Quadrants combined and titles added in {time.time() - combine_start_time:.2f} seconds.")
+        step_times['compose'] = time.time() - combine_start_time
 
         save_start_time = time.time()
         # 9. Save/Return Image
@@ -1906,11 +1920,10 @@ class GetGridView(APIView):
         try:
             with open(preview_path, 'wb') as f:
                 f.write(image_data_bytes)
-            print(f"Preview image saved to {preview_path}")
         except IOError as e:
             print(f"Error saving preview image {preview_path}: {e}")
 
-        print(f"[{scan_name}] Final image saved/encoded in {time.time() - save_start_time:.2f} seconds.")
+        step_times['save'] = time.time() - save_start_time
 
         # Clean up large data structures
         cleanup_start_time = time.time()
@@ -1918,10 +1931,15 @@ class GetGridView(APIView):
         binary_image = None
         verts = faces = None
         gc.collect()
-        print(f"[{scan_name}] Cleanup performed in {time.time() - cleanup_start_time:.2f} seconds.")
+        step_times['cleanup'] = time.time() - cleanup_start_time
 
         total_time = time.time() - start_time
-        print(f"[{scan_name}] Total preview generation time: {total_time:.2f} seconds.")
+        step_summary = ' · '.join(f"{step} {seconds:.2f}" for step, seconds in step_times.items())
+        print(
+            f"[GridView] {scan_name}: preview generated in {total_time:.2f} s "
+            f"(thr {threshold_orig} → {float(adjusted_threshold):.1f} lossy, range [{data_min}, {data_max}]"
+            f"{preview_3d_detail}; {step_summary})"
+        )
         return image_data_bytes # Return bytes for the response
 
     def get_histogram_data(self, scan_name, directory):
@@ -1969,7 +1987,7 @@ class GetGridView(APIView):
         # Check if preview exists and is up to date
         if os.path.exists(preview_path) and os.path.exists(preview_json_path):
             if preview_is_current:
-                print(f"Preview for {scan_name} is up to date. Loading existing.")
+                # Cached preview: silent (one request per tile; the access log summarizes them).
                 try:
                     with open(preview_path, 'rb') as image_file:
                         image_data = image_file.read()
@@ -1980,11 +1998,11 @@ class GetGridView(APIView):
                      print(f"Error reading existing preview file {preview_path}: {e}")
                      # Fall through to regenerate if reading fails
             else:
-                 print(f"Preview for {scan_name} is outdated. Regenerating.")
-                 # Fall through to regenerate
+                 # Outdated: regenerate (create_preview_image prints the one-line summary)
+                 pass
         else:
-            print(f"Preview for {scan_name} not found or incomplete. Generating.")
-            # Fall through to generate
+            # Not found or incomplete: generate (create_preview_image prints the one-line summary)
+            pass
 
         # Generate or Regenerate Preview
         try:
@@ -1995,7 +2013,12 @@ class GetGridView(APIView):
             histogram_data = self.get_histogram_data(scan_name, directory)
             return Response({'image_data': base64.b64encode(preview_image_bytes).decode('utf-8'), 'histogram_data': histogram_data})
         except Exception as e:
+             # Full context for debugging: the steps that completed, then the traceback.
+             import traceback
+             completed_steps = ', '.join(getattr(self, '_preview_step_times', {}).keys()) or 'none'
              print(f"Error occurred during preview generation for {scan_name}: {e}")
+             print(f"[GridView] {scan_name}: steps completed before the error: {completed_steps}")
+             traceback.print_exc()
              # Optionally: return a specific error image or message
              # For now, return a server error
              return Response({'error': f'Failed to generate preview: {e}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -5083,7 +5106,6 @@ def compute_union_mask_ncc(fixed_volume, moving_volume, reference_threshold, mov
 class ExtractJsonView(APIView):
     def post(self, request, *args, **kwargs):
         json_path = request.data.get('path')
-        print(json_path)
 
         if not json_path:
             return Response({'error': 'Missing required parameters'}, status=status.HTTP_400_BAD_REQUEST)
@@ -5204,12 +5226,10 @@ class ExtractJsonView(APIView):
 
 def extract_voxel_data(file_path):
     # Load the NIfTI file using nibabel
-    print("extracting "+file_path)
     nifti_image = nib.load(file_path)
-    print(nifti_image)
     voxel_data = nifti_image.get_fdata()  # Extract voxel data as a numpy array
-    print(voxel_data)
-    print(voxel_data.shape)
+    # One line instead of dumping the NIfTI header and the voxel array repr.
+    print(f"[extract_voxel_data] {os.path.basename(file_path)}: shape {voxel_data.shape}")
     return voxel_data.tolist()
 
 class DisplayNiftiView(APIView):
@@ -5435,6 +5455,50 @@ class ElasticSliceNccHeatmapView(APIView):
                 "elastic_to": elastic_to,
             }
         )
+
+
+class FullResolutionValueHistogramView(APIView):
+    """Full-resolution value distribution for the histogram bar detail view.
+
+    Same file resolution as NiftiHeaderInfoView (lossy name or edit -> full-res
+    file). Returns exact integer value counts (or fine float bins) from
+    ``intensityValueHistogram``; the viewer derives per-bar sub-bins, mean and
+    median from them, so later bars need no further requests.
+    """
+    def post(self, request, *args, **kwargs):
+        from .intensityValueHistogram import value_histogram_for_file
+        directory = request.data.get('directory')
+        filename = request.data.get('filename')
+        edit = request.data.get('edit')
+
+        if not directory or not filename:
+            return Response(
+                {"error": "Both 'directory' and 'filename' fields are required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        name = filename.replace(".nii.gz", "").replace("_lossy", "")
+        if edit and "edit" in edit:
+            filename = edit
+
+        if name == "atlas":
+            full_res_path = os.path.join(resolve_atlas_dir(directory), filename.replace("_lossy", ""))
+        else:
+            full_res_path = os.path.join(directory, "extracted", name, filename.replace("_lossy", ""))
+
+        if not os.path.isfile(full_res_path):
+            return Response(
+                {"error": f"File not found: {full_res_path}"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        try:
+            return Response(value_histogram_for_file(full_res_path))
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 class NiftiHeaderInfoView(APIView):

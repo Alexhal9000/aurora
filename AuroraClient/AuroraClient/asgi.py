@@ -15,9 +15,14 @@ from django.core.asgi import get_asgi_application
 from channels.routing import ProtocolTypeRouter, URLRouter
 from channels.auth import AuthMiddlewareStack
 from AuroraClient import routing
+from AuroraClient import compactAccessLog
 
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'AuroraClient.settings')
+
+# Replace daphne's one-line-per-request access log with a grouped, error-first one
+# (AURORA_ACCESS_LOG=full restores the original). See compactAccessLog.py.
+compactAccessLog.install()
 
 django_asgi_app = get_asgi_application()
 
@@ -59,7 +64,8 @@ threading.Thread(target=print_startup_message, daemon=True).start()
 
 
 application = ProtocolTypeRouter({
-    "http": django_asgi_app,
+    # Heartbeat bookkeeping for long requests (compact access log); transparent otherwise.
+    "http": compactAccessLog.RequestHeartbeatMiddleware(django_asgi_app),
     "websocket": AuthMiddlewareStack(
         URLRouter(
             routing.websocket_urlpatterns

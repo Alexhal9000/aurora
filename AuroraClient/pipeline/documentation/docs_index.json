@@ -6534,15 +6534,19 @@
                 "intensity offset",
                 "batch",
                 "threshold shift",
-                "Set Background Value"
+                "Set Background Value",
+                "background peak",
+                "distance transform",
+                "surrounding air",
+                "surrounding tissue"
               ],
               "source": {
                 "file": "preprocessingTools.py",
                 "symbol": "HomogenizeBackgroundView",
-                "hash": "7b116116870b6f8b8c9e35e83bfcc93a85f97ac1eb62062ebfc8af0d5bd7d166",
-                "lastChecked": "2026-09-23T20:01:27+00:00"
+                "hash": "4b46b05c942060f13680f13893ba9ae3ef16831f15be0c7cde1929bce3ae38a5",
+                "lastChecked": "2026-10-13T23:45:46+00:00"
               },
-              "summary": "Background Offset Correction estimates a per-scan (or shared) background level—manually or as the mode of voxels below threshold—and subtracts it so backgrounds harmonize near zero (values below the estimate clip to the dtype floor), then shifts stored thresholds by the same offset.",
+              "summary": "Background Offset Correction subtracts one background level per scan (or a shared manual value) so backgrounds harmonize near zero (values below the estimate clip to the dtype floor), then shifts stored thresholds by the same offset. The automatic estimate is the peak of the lightly smoothed below-threshold intensities away from the specimen edge and from constant padding: both modes split the below-threshold space at one distance from the specimen (the median distance of the exterior): 'Surrounding air' uses the far side (an outer margin measured from the specimen), 'Surrounding tissue' uses the near band, inside or outside the specimen. The subtracted level acts as a baseline landmark shared across specimens.",
               "options": [
                 {
                   "name": "directory",
@@ -6557,6 +6561,12 @@
                   "description": "Fixed background intensity to subtract from all scans; null triggers per-scan automatic estimation."
                 },
                 {
+                  "name": "background_region",
+                  "type": "string",
+                  "default": "outside",
+                  "description": "Automatic estimation only: 'outside' (Surrounding air, exterior voxels beyond the median exterior distance to the specimen) or 'surrounding_tissue' (Surrounding tissue, any below-threshold voxel between the edge guard and that distance)."
+                },
+                {
                   "name": "flagFilter",
                   "type": "string",
                   "default": "off",
@@ -6564,11 +6574,11 @@
                 }
               ],
               "algorithm": {
-                "text": "Collect eligible voxel scans and optionally run a first pass that estimates each scan's background as the mode of subsampled voxels below threshold (dtype-specific histogram logic for uint8 and uint16). Subtract the chosen background from every voxel with clipping to dtype bounds, save *_backfixed edits and lossy copies, subtract the same amount from metadata threshold, record backfixed_shift, and copy masks and landmarks unchanged.",
+                "text": "Collect eligible voxel scans. In automatic mode, for each scan: sample the volume with stride s (>= 2, chosen so at most 16M voxels are analysed); mark the specimen as samples >= threshold on unblurred data; mark constant fill (below-threshold voxels whose 3x3x3 neighbourhood holds one value, e.g. reorientation padding) as non-data; compute Euclidean distance transforms to the specimen and to fill and keep below-threshold voxels at least 3 sigma from both; split them at D*, the median specimen distance of the eligible exterior voxels (exterior = not enclosed by the hole-filled specimen): 'outside' keeps exterior voxels with d >= D*, 'surrounding_tissue' keeps any voxel with d < D* (inside/outside is not used, since a bone threshold can leave the body open); Gaussian-blur the samples (sigma = 1 sampled voxel) and take the peak of a Freedman-Diaconis histogram of the selected blurred values, refined by a three-point parabolic fit. If fewer than 2000 voxels qualify, the original sub-threshold histogram mode is used. The method, region, constants, sample count and any fallback are stored in background_offset_settings.estimator. Then subtract the chosen background from every voxel with clipping to dtype bounds, save *_backfixed edits and lossy copies, subtract the same amount from metadata threshold, record backfixed_shift, and copy masks and landmarks unchanged.",
                 "math": [
                   {
-                    "equation": "b = \\mathrm{mode}\\{ v \\mid 0 < v < \\tau \\}",
-                    "caption": "b: per-scan (or shared) background estimate; v: voxel intensity; τ: current threshold."
+                    "equation": "b = \\arg\\max_{x}\\, H\\big(\\{ (G_\\sigma * I)(p) \\mid p \\in R,\\ I(p) < \\tau,\\ D_F(p) \\ge 3\\sigma,\\ D_P(p) \\ge 3\\sigma \\}\\big)",
+                    "caption": "b: background peak; I: sampled intensity; G_σ: Gaussian blur (σ = 1 sampled voxel); τ: threshold; D_F, D_P: Euclidean distance to the specimen (I ≥ τ) and to constant padding; R: Surrounding air = exterior with D_F ≥ D* (median exterior distance), Surrounding tissue = any voxel with D_F < D*; H: Freedman–Diaconis histogram, peak refined by a parabolic fit."
                   },
                   {
                     "equation": "v' = \\mathrm{clip}(v - b)",
@@ -6579,7 +6589,7 @@
                     "caption": "τ': threshold shifted by the same background offset so segmentation stays consistent."
                   }
                 ],
-                "diagram": "flowchart TD\n  A[\"List eligible voxel scans\"] --> B{\"background_value provided?\"}\n  B -->|\"no\"| C[\"Phase 1: estimate background per scan\"]\n  B -->|\"yes\"| D[\"Use fixed background for all\"]\n  C --> E[\"Phase 2: subtract background\"]\n  D --> E\n  E --> F[\"Clip to dtype range\"]\n  F --> G[\"Save backfixed edit + lossy\"]\n  G --> H[\"Update threshold and backfixed_shift\"]"
+                "diagram": "flowchart TD\n  A[\"List eligible voxel scans\"] --> B{\"background_value provided?\"}\n  B -->|\"no\"| C[\"Phase 1: distance-guarded background peak per scan\"]\n  B -->|\"yes\"| D[\"Use fixed background for all\"]\n  C --> E[\"Phase 2: subtract background\"]\n  D --> E\n  E --> F[\"Clip to dtype range\"]\n  F --> G[\"Save backfixed edit + lossy\"]\n  G --> H[\"Update threshold and backfixed_shift\"]"
               },
               "related": [
                 "save-background-values",
