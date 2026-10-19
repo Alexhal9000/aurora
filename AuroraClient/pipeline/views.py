@@ -120,6 +120,7 @@ from .meshBasedTools import (
     build_and_cache_preserved_mesh_display_geometry,
     prepare_heatmap_reference_mesh,
     compute_mesh_to_reference_surface_distances,
+    transferred_landmark_row,
 )
 from .rigidAlignment import (
     AlignToReferenceView,
@@ -170,6 +171,9 @@ from .elasticHeatmapMetrics import (
 )
 from .elasticLocalNccHeatmap import compute_dense_local_ncc_dissimilarity
 from .registrationHeatmapTools import (
+    compute_settings_registration_heatmap,
+    decode_display_vertices,
+    load_settings_subject_values,
     RegistrationHeatmapError,
     compute_registration_heatmap,
     registration_heatmap_cache_path,
@@ -1186,6 +1190,80 @@ class EnsureQuickGridProjectionPngsView(APIView):
         return Response({'subjects': results})
 
 
+def _windows_drive_letters():
+    """
+    Drive letters visible to this process, including mapped network drives (which
+    psutil.disk_partitions() leaves out by default). Network drives are labelled so
+    they can be told apart. Mapped drives belong to the logon session, so a server
+    started elevated or as another user will not see the user's mappings.
+    """
+    drives = []
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        mask = kernel32.GetLogicalDrives()
+        DRIVE_REMOTE = 4
+        for i in range(26):
+            if not mask & (1 << i):
+                continue
+            letter = f"{chr(ord('A') + i)}:"
+            is_network = kernel32.GetDriveTypeW(f"{letter}\\") == DRIVE_REMOTE
+            drives.append({
+                'label': f"{letter} (network)" if is_network else letter,
+                'path': letter + '/',
+                'network': is_network,
+            })
+        return drives
+    except Exception as e:
+        print(f"GetLogicalDrives failed, falling back to psutil: {e}")
+    for partition in psutil.disk_partitions(all=True):
+        device = partition.device
+        if len(device) >= 2 and device[1] == ':':
+            letter = device[:2].upper()
+            if any(d['path'] == letter + '/' for d in drives):
+                continue
+            is_network = 'remote' in (partition.opts or '').lower()
+            drives.append({
+                'label': f"{letter} (network)" if is_network else letter,
+                'path': letter + '/',
+                'network': is_network,
+            })
+    return drives
+
+
+def _linux_removable_media_root():
+    """
+    Folder where this Linux system mounts removable/extra drives: /media/<user> on older
+    Ubuntu, /run/media/<user> on newer ones (e.g. Ubuntu 26). Prefers the one that holds a
+    current mount, then the one that exists; None when neither does.
+    """
+    username = os.getenv('USER', os.getenv('USERNAME', ''))
+    if not username:
+        try:
+            import getpass
+            username = getpass.getuser()
+        except Exception:
+            username = ''
+    candidates = []
+    if username:
+        candidates += [f'/run/media/{username}', f'/media/{username}']
+    candidates += ['/run/media', '/media']
+
+    mount_points = []
+    try:
+        with open('/proc/mounts', 'r') as mounts:
+            mount_points = [line.split()[1].replace('\\040', ' ') for line in mounts if len(line.split()) > 1]
+    except OSError:
+        pass
+    for root in candidates:
+        if any(mp.startswith(root + '/') for mp in mount_points):
+            return root
+    for root in candidates:
+        if os.path.isdir(root):
+            return root
+    return None
+
+
 class QuickAccessPathsView(APIView):
     """Returns OS-specific quick access paths for file browser"""
     def get(self, request, *args, **kwargs):
@@ -1204,34 +1282,15 @@ class QuickAccessPathsView(APIView):
         
         try:
             if os_type == 'Windows':
-                # Get Windows drive letters
-                partitions = psutil.disk_partitions()
-                for partition in partitions:
-                    # Check if it's a drive letter (e.g., C:\, D:\, or C:, D:)
-                    # partition.device can be "C:\", "C:", etc.
-                    device = partition.device
-                    if len(device) >= 2 and device[1] == ':':
-                        # Extract just the drive letter (e.g., "C:")
-                        drive_letter = device[:2]
-                        quick_paths['drives'].append({
-                            'label': drive_letter,
-                            'path': drive_letter + '/'
-                        })
+                quick_paths['drives'] = _windows_drive_letters()
             elif os_type == 'Darwin':  # macOS
                 quick_paths['volumes'] = '/Volumes'
                 if os.path.exists('/mnt'):
                     quick_paths['mnt'] = '/mnt'
             else:  # Linux
-                if os.path.exists('/media'):
-                    quick_paths['media'] = '/media'
+                quick_paths['media'] = _linux_removable_media_root()
                 if os.path.exists('/mnt'):
                     quick_paths['mnt'] = '/mnt'
-                # Try to add /run/media/<username> if it exists
-                username = os.getenv('USER', os.getenv('USERNAME', ''))
-                if username:
-                    run_media_path = f'/run/media/{username}'
-                    if os.path.exists(run_media_path):
-                        quick_paths['run_media'] = run_media_path
         except Exception as e:
             # Fail gracefully - just return home and common paths
             print(f"Error fetching quick access paths: {e}")
@@ -12432,6 +12491,46 @@ def _heatmap_distances_from_landmark_distance_file(data):
     return []
 
 
+def _landmark_distance_kinds(data):
+    """
+    (current, before_snap) per-landmark lists from a *_landmark_distances.json payload.
+    current: landmark-to-mesh distance at the saved position. before_snap: the distance
+    removed by snapping (NaN for landmarks that were not snapped); None when nothing was.
+    """
+    def as_floats(values):
+        out = []
+        for v in values:
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                fv = float('nan')
+            out.append(fv if np.isfinite(fv) else float('nan'))
+        return out
+
+    if isinstance(data, list):
+        return as_floats(data), None
+    if not isinstance(data, dict):
+        return None, None
+    mesh = data.get('distances')
+    snap = data.get('snap_distance')
+    current = as_floats(mesh) if isinstance(mesh, list) and mesh else None
+    before = as_floats(snap) if isinstance(snap, list) and snap else None
+    if before is not None and not np.any(np.isfinite(before)):
+        before = None
+    return current, before
+
+
+def _nan_mean_rows(rows):
+    """Per-landmark mean over subjects, ignoring NaN; landmarks with no value become 0."""
+    min_len = min(len(r) for r in rows)
+    stacked = np.vstack([np.asarray(r[:min_len], dtype=float) for r in rows])
+    with np.errstate(invalid='ignore'):
+        counts = np.sum(np.isfinite(stacked), axis=0)
+        sums = np.nansum(stacked, axis=0)
+        means = np.where(counts > 0, sums / np.maximum(counts, 1), 0.0)
+    return means.tolist()
+
+
 class GetAverageSnappedDistancesView(APIView):
     def post(self, request):
         print("Getting average snapped distances from all subjects")
@@ -12443,6 +12542,8 @@ class GetAverageSnappedDistancesView(APIView):
             return Response({'error': 'No extracted subjects found'}, status=status.HTTP_404_NOT_FOUND)
 
         all_distances = []
+        current_rows = []
+        before_snap_rows = []
 
         for subject in os.listdir(extracted_path):
             subject_dir = os.path.join(extracted_path, subject)
@@ -12479,6 +12580,12 @@ class GetAverageSnappedDistancesView(APIView):
             except (FileNotFoundError, json.JSONDecodeError):
                 continue
 
+            current, before_snap = _landmark_distance_kinds(data)
+            if current:
+                current_rows.append(current)
+            if before_snap:
+                before_snap_rows.append(before_snap)
+
             dists = _heatmap_distances_from_landmark_distance_file(data)
             if not dists:
                 continue
@@ -12493,9 +12600,20 @@ class GetAverageSnappedDistancesView(APIView):
         stacked = np.vstack([d[:min_len] for d in all_distances])
         average_distances = np.mean(stacked, axis=0).tolist()
 
+        # Per kind, so the viewer averages one quantity at a time: 'current' over every
+        # subject, 'before_snap' over snapped subjects only. 'average_distances' (snap
+        # where available, else current) stays for the scientific report.
         return Response({
             'average_distances': average_distances,
-            'subject_count': len(all_distances)
+            'subject_count': len(all_distances),
+            'current': {
+                'average_distances': _nan_mean_rows(current_rows),
+                'subject_count': len(current_rows),
+            } if current_rows else None,
+            'before_snap': {
+                'average_distances': _nan_mean_rows(before_snap_rows),
+                'subject_count': len(before_snap_rows),
+            } if before_snap_rows else None,
         }, status=status.HTTP_200_OK)
 
 
@@ -14930,6 +15048,18 @@ class CreateAtlasView(APIView):
         average_intensity_image_transformed_path = os.path.join(resolve_atlas_dir(directory), f"atlas.nii.gz")
         ants.image_write(average_intensity_image_transformed_restored, average_intensity_image_transformed_path)
 
+        # Store as uint16 like every extracted/edited volume: subjects are uint16 and the
+        # restored range lies within theirs, so rounding to the nearest integer loses at most
+        # 0.5 of a stored unit. ANTs has no uint16 pixel type, so re-save through nibabel
+        # keeping the geometry ANTs wrote.
+        atlas_written = nib.load(average_intensity_image_transformed_path)
+        atlas_uint16 = np.clip(np.rint(np.asanyarray(atlas_written.dataobj, dtype=np.float32)), 0, 65535).astype(np.uint16)
+        atlas_header = atlas_written.header.copy()
+        atlas_header.set_data_dtype(np.uint16)
+        atlas_header.set_slope_inter(1.0, 0.0)
+        nib.save(nib.Nifti1Image(atlas_uint16, atlas_written.affine, atlas_header), average_intensity_image_transformed_path)
+        del atlas_written, atlas_uint16
+
         # Copy json metadata from reference image but remove metrics that are not needed
         reference_metadata['threshold'] = average_threshold
         reference_metadata['elastic_dice'] = None
@@ -15013,6 +15143,27 @@ class RegistrationHeatmapView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            # QuickMesh viewer: settings-stamped calculation surface, mapped onto the
+            # displayed vertices (see compute_settings_registration_heatmap). Callers that
+            # send no settings (scientific report) keep the display-NPZ path below.
+            calculation_settings = request.data.get('calculation_settings')
+            display_vertices_b64 = request.data.get('display_vertices')
+            if isinstance(calculation_settings, dict) and display_vertices_b64:
+                display_vertices = decode_display_vertices(
+                    display_vertices_b64,
+                    request.data.get('display_center'),
+                    request.data.get('display_scale_factor'),
+                )
+                result = compute_settings_registration_heatmap(
+                    directory=directory,
+                    filename=filename,
+                    raw_settings=calculation_settings,
+                    display_vertices=display_vertices,
+                    recalculate=bool(recalculate),
+                    heatmap_metric=heatmap_metric,
+                )
+                return Response(result, status=status.HTTP_200_OK)
+
             result = compute_registration_heatmap(
                 directory=directory,
                 filename=filename,
@@ -15058,6 +15209,45 @@ class RegistrationSubjectDataView(APIView):
             )
             
             print(f"Fetching subject data for {filename} (metric={heatmap_metric})")
+
+            # Settings-stamped cache: the viewer sends calculation-surface indices it got
+            # from the heatmap's display_to_calc mapping, plus its own display indices.
+            cache_key = request.data.get('cache_key')
+            if cache_key:
+                calc_indices = request.data.get('calc_indices')
+                if calc_indices is None:
+                    calc_index = request.data.get('calc_index')
+                    calc_indices = [calc_index] if calc_index is not None else None
+                if not calc_indices:
+                    return Response({'error': 'calc_indices or calc_index is required'}, status=status.HTTP_400_BAD_REQUEST)
+                try:
+                    loaded = load_settings_subject_values(
+                        directory, filename, heatmap_metric, str(cache_key), calc_indices
+                    )
+                except RegistrationHeatmapError as exc:
+                    return Response({'error': exc.message}, status=exc.status_code)
+                values = loaded['values']
+                if vertex_indices is not None:
+                    result = {
+                        name: values[:, col].tolist()
+                        for col, name in enumerate(loaded['subjects'])
+                    }
+                    return Response({
+                        'subject_distances': result,
+                        'vertex_indices': vertex_indices,
+                        'mode': 'area',
+                        'metric': loaded['metric'],
+                    }, status=status.HTTP_200_OK)
+                result = {
+                    name: float(values[0, col])
+                    for col, name in enumerate(loaded['subjects'])
+                }
+                return Response({
+                    'subject_distances': result,
+                    'vertex_index': vertex_index,
+                    'mode': 'single',
+                    'metric': loaded['metric'],
+                }, status=status.HTTP_200_OK)
             
             sub_path = resolve_sub_path(filename)
             cache_file_path = registration_heatmap_cache_path(
@@ -16390,8 +16580,9 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                 landmark_type = landmark_obj.get('landmark_type', 'main')
                 # Displace the position
                 displaced_position = self.displace_coordinate_by_closest_field_vector(position, deformation_back_to_reference, atlas_voxel_size, atlas_shape)
-                # Update landmark with new position, preserving landmark_type
-                landmarks_atlas[i] = {'position': displaced_position.tolist() if hasattr(displaced_position, 'tolist') else list(displaced_position), 'landmark_type': landmark_type}  
+                # Update landmark with new position, preserving landmark_type and the
+                # group / family / semi-parent metadata (see transferred_landmark_row)
+                landmarks_atlas[i] = transferred_landmark_row(landmark_obj, displaced_position)
             
             # Clean up immediately after use
             del deformation_back_to_reference
@@ -16627,8 +16818,9 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                     landmark_type = landmark_obj.get('landmark_type', 'main')
                     # Displace the position
                     displaced_position = self.displace_coordinate_by_closest_field_vector(position, elastic_fwd, ref_voxel_size, current_shape)
-                    # Update landmark with new position, preserving landmark_type
-                    initial_landmark_copy[i] = {'position': displaced_position.tolist() if hasattr(displaced_position, 'tolist') else list(displaced_position), 'landmark_type': landmark_type}
+                    # Update landmark with new position, preserving landmark_type and the
+                    # group / family / semi-parent metadata (see transferred_landmark_row)
+                    initial_landmark_copy[i] = transferred_landmark_row(landmark_obj, displaced_position)
 
                 # Clean up immediately after use
                 del elastic_fwd
@@ -16745,10 +16937,21 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                                and os.path.isdir(os.path.join(directory, "extracted", f))]
             extracted_folders = apply_flag_filter(extracted_folders, flagged_set, flag_filter)
             extracted_folders = filter_out_linked_children(directory, extracted_folders)
+            # Only subjects with an elastic registration can receive landmarks (the loop below
+            # skips the rest); drop them here so the progress count matches the real work.
+            extracted_folders = [
+                f for f in extracted_folders
+                if glob.glob(os.path.join(directory, "extracted", f, f"{f}*elastic*"))
+            ]
             extracted_folders.sort()
             print(extracted_folders)
 
             total_scans = len(extracted_folders)
+            if total_scans == 0:
+                return Response(
+                    {'message': f'No subjects with an elastic registration found to transfer landmarks from {reference}'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
             # Send progress update
             channel_layer = get_channel_layer()
@@ -16915,8 +17118,9 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                     landmark_type = landmark_obj.get('landmark_type', 'main')
                     # Displace the position
                     displaced_position = self.displace_coordinate_by_closest_field_vector(position, elastic_fwd, ref_voxel_size, current_shape)
-                    # Update landmark with new position, preserving landmark_type
-                    initial_landmark_copy[i] = {'position': displaced_position.tolist() if hasattr(displaced_position, 'tolist') else list(displaced_position), 'landmark_type': landmark_type}
+                    # Update landmark with new position, preserving landmark_type and the
+                    # group / family / semi-parent metadata (see transferred_landmark_row)
+                    initial_landmark_copy[i] = transferred_landmark_row(landmark_obj, displaced_position)
 
                 # Clean up immediately after use
                 del elastic_fwd
@@ -17090,8 +17294,9 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                 landmark_type = landmark_obj.get('landmark_type', 'main')
                 # Displace the position
                 displaced_position = self.displace_coordinate_by_closest_field_vector(position, atlas_average_forward_deformation, ref_voxel_size, atlas_shape)
-                # Update landmark with new position, preserving landmark_type
-                landmarks[i] = {'position': displaced_position.tolist() if hasattr(displaced_position, 'tolist') else list(displaced_position), 'landmark_type': landmark_type}
+                # Update landmark with new position, preserving landmark_type and the
+                # group / family / semi-parent metadata (see transferred_landmark_row)
+                landmarks[i] = transferred_landmark_row(landmark_obj, displaced_position)
 
             # Clean up immediately after use
             del atlas_average_forward_deformation
@@ -17367,14 +17572,8 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                     displaced_position = self.displace_coordinate_by_closest_field_vector(
                         position, elastic_inv, subject_voxel_size, current_shape,
                     )
-                    landmarks[i] = {
-                        'position': (
-                            displaced_position.tolist()
-                            if hasattr(displaced_position, 'tolist')
-                            else list(displaced_position)
-                        ),
-                        'landmark_type': landmark_type,
-                    }
+                    # Keep group / family / semi-parent metadata (see transferred_landmark_row)
+                    landmarks[i] = transferred_landmark_row(landmark_obj, displaced_position)
 
                 del elastic_inv
                 cleanup_memory()
@@ -19844,13 +20043,16 @@ class SaveLandmarkGuidepointsView(APIView):
         snap_distance_array=None,
         mesh_context=None,
         is_partial_save=False,
+        use_outer_shell=True,
     ):
+        # mesh_context (when given) was built by the caller with the same use_outer_shell.
         if mesh_context is not None:
             vertices, faces, voxel_size, json_metadata, sub_path = mesh_context
         else:
             vertices, faces, voxel_size, json_metadata, sub_path = self._load_landmark_mesh_context(
-                directory, filename, edit, use_outer_shell=True
+                directory, filename, edit, use_outer_shell=use_outer_shell
             )
+        distance_surface = 'outer_shell' if use_outer_shell else 'full_mesh'
 
         json_path = os.path.join(directory, sub_path, f"{filename}.json")
         existing_landmarks_meta = json_metadata.get('landmarks') or {}
@@ -19874,6 +20076,18 @@ class SaveLandmarkGuidepointsView(APIView):
                 distances_dict = json.load(jf)
                 existing_distances = distances_dict.get('distances')
                 existing_snap_distance = distances_dict.get('snap_distance')
+                # Files written before distance_surface existed were measured against the outer shell.
+                existing_surface = distances_dict.get('distance_surface', 'outer_shell')
+            if existing_distances and existing_surface != distance_surface:
+                # Never mix surfaces within one distance file: if the save surface changed,
+                # recompute every landmark against the new surface (a full, not partial, save).
+                print(
+                    f"Distance surface changed ({existing_surface} -> {distance_surface}); "
+                    f"recomputing all landmark distances for {filename}"
+                )
+                existing_distances = None
+                is_partial_save = False
+                exclude_from_outliers = set()
 
         num_landmarks = len(merged_landmarks)
         if existing_distances:
@@ -19900,6 +20114,7 @@ class SaveLandmarkGuidepointsView(APIView):
         distances_dict = {
             'distances': distances.tolist(),
             'snap_distance': final_snap_distance,
+            'distance_surface': distance_surface,
         }
         with open(distances_path, 'w') as jf:
             json.dump(distances_dict, jf, indent=4)
@@ -19908,6 +20123,7 @@ class SaveLandmarkGuidepointsView(APIView):
         landmarks_meta['num_landmarks'] = int(num_landmarks)
         landmarks_meta['mean_distance'] = float(np.mean(distances))
         landmarks_meta['std_distance'] = float(np.std(distances))
+        landmarks_meta['distance_surface'] = distance_surface
         landmarks_meta['edit_name'] = edit
 
         if has_voxel_size and (not is_partial_save or existing_outliers is not None):
@@ -20088,6 +20304,12 @@ class SaveLandmarkGuidepointsView(APIView):
             auto_snap = auto_snap.strip().lower() in ('true', '1', 'yes', 'on')
         if isinstance(auto_snap_use_outer_shell, str):
             auto_snap_use_outer_shell = auto_snap_use_outer_shell.strip().lower() in ('true', '1', 'yes', 'on')
+        # Surface the saved distances are measured against (outer shell vs full mesh). Applies
+        # with or without snap; older clients only send auto_snap_use_outer_shell, so fall back to it.
+        use_outer_shell = request.data.get('use_outer_shell', auto_snap_use_outer_shell)
+        if isinstance(use_outer_shell, str):
+            use_outer_shell = use_outer_shell.strip().lower() in ('true', '1', 'yes', 'on')
+        use_outer_shell = bool(use_outer_shell)
 
         if filename == "atlas":
             root_path = "atlas"
@@ -20170,6 +20392,47 @@ class SaveLandmarkGuidepointsView(APIView):
         )
 
         if not changed_indices and not landmarks_truncated:
+            # No landmark moved, but the requested distance surface (shell vs full mesh) may
+            # differ from the one the stored distances were measured against. In that case
+            # recompute every distance on the new surface; nothing is snapped, since no
+            # position changed (snapping all landmarks is a separate landmark-menu action).
+            requested_surface = 'outer_shell' if use_outer_shell else 'full_mesh'
+            stored_surface = None
+            if os.path.exists(distances_path):
+                try:
+                    with open(distances_path, 'r') as jf:
+                        # Files written before distance_surface existed used the outer shell.
+                        stored_surface = json.load(jf).get('distance_surface', 'outer_shell')
+                except (OSError, ValueError) as e:
+                    print(f"Warning: could not read {distances_path}: {e}")
+            if existing_landmarks and stored_surface is not None and stored_surface != requested_surface:
+                print(
+                    f"No landmark changes for {filename} with edit {edit}; distance surface changed "
+                    f"({stored_surface} -> {requested_surface}), recomputing all distances"
+                )
+                try:
+                    self.partial_distance_analysis(
+                        directory,
+                        filename,
+                        edit,
+                        merged_landmarks,
+                        set(),
+                        is_partial_save=False,
+                        use_outer_shell=use_outer_shell,
+                    )
+                except Exception as e:
+                    print(f"Error during distance analysis: {str(e)}")
+                    return Response(
+                        {'error': f'Distance recalculation failed: {str(e)}'},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
+                return Response({
+                    'message': 'Landmark guidepoints saved successfully',
+                    # Lets the client explain that only distances were recalculated
+                    'distances_recomputed_only': True,
+                    'previous_distance_surface': stored_surface,
+                    'distance_surface': requested_surface,
+                }, status=status.HTTP_200_OK)
             print(f"No landmark changes for {filename} with edit {edit}; keeping existing values")
             return Response({'message': 'Landmark guidepoints saved successfully'}, status=status.HTTP_200_OK)
 
@@ -20182,10 +20445,10 @@ class SaveLandmarkGuidepointsView(APIView):
         mesh_context = None
         snap_distance_array = None
         if auto_snap and position_changed_indices:
-            print(f"Auto-snapping {len(position_changed_indices)} position-changed landmark(s) to mesh (use_outer_shell={auto_snap_use_outer_shell})")
+            print(f"Auto-snapping {len(position_changed_indices)} position-changed landmark(s) to mesh (use_outer_shell={use_outer_shell})")
             try:
                 mesh_context = self._load_landmark_mesh_context(
-                    directory, filename, edit, use_outer_shell=auto_snap_use_outer_shell
+                    directory, filename, edit, use_outer_shell=use_outer_shell
                 )
                 vertices, faces, voxel_size, _, _ = mesh_context
                 changed_sorted = sorted(position_changed_indices)
@@ -20242,6 +20505,7 @@ class SaveLandmarkGuidepointsView(APIView):
                 snap_distance_array=snap_distance_array,
                 mesh_context=mesh_context,
                 is_partial_save=is_partial_save,
+                use_outer_shell=use_outer_shell,
             )
             print(f"Distance analysis completed for {filename} with edit {edit}")
         except Exception as e:
@@ -21841,6 +22105,29 @@ class SaveProjectSettingsView(APIView):
 
         except Exception as e:
             return Response({'error': str(e)}, status=400)
+
+
+class DisplayEnvironmentView(APIView):
+    """
+    Desktop session facts the 3D viewer uses to pick a transparency technique.
+
+    Chrome on a Linux Wayland session silently fails Babylon's order-independent
+    transparency (meshes vanish below 100 % opacity), while X11 sessions work. The browser
+    cannot report which path it uses, but this local server inherits the session
+    environment of the desktop it was launched from. Read-only; no project data involved.
+    """
+
+    def get(self, request):
+        import sys
+        session_type = (os.environ.get('XDG_SESSION_TYPE') or '').strip().lower()
+        wayland = sys.platform.startswith('linux') and (
+            session_type == 'wayland' or bool(os.environ.get('WAYLAND_DISPLAY'))
+        )
+        return Response({
+            'platform': sys.platform,
+            'session_type': session_type or None,
+            'wayland': bool(wayland),
+        })
 
 
 class GetReportEnvironmentView(APIView):

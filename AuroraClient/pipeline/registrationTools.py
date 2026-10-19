@@ -606,6 +606,9 @@ class RegistrationTools():
             "scale_factor": float(scale_factor),
             "zero_point_shift": float(zero_point_shift),
             "resolution_factor": int(resolution_factor),
+            # Mean pool: sample i is centred at i*rf + (rf-1)/2 full-res voxels. Older
+            # stride-sampled files ([::rf], centred at i*rf) have no "downsampling" key.
+            "downsampling": "mean_pool",
             "compression_info": "JPEG compression with quality 70, 8-bit per pixel",
         }
 

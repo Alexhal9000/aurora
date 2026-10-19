@@ -9,10 +9,13 @@ metric-tagged via elasticHeatmapMetrics (surface_distance, ncc, …).
 
 from __future__ import annotations
 
+import base64
 import glob
+import hashlib
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -22,6 +25,7 @@ import open3d as o3d
 import trimesh
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
+from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
 from skimage import measure
 
@@ -1482,3 +1486,471 @@ def compute_registration_heatmap(
         save_display_sidecar_cache(ctx.cache_file_path, response_data_full)
 
     return strip_response_payload(response_data_full)
+
+
+# ---------------------------------------------------------------------------
+# Settings-based population heatmaps (QuickMesh viewer)
+#
+# The population error is computed on a *calculation surface* defined only by the
+# scientific mesh settings the user chose in the refresh menu (edit, threshold,
+# full/half resolution, Gaussian sigma, outer shell). The reference and every
+# subject are meshed with exactly those settings and never decimated, so two runs
+# with the same settings give the same numbers. The display mesh (decimated, and
+# not identical from run to run) only *receives* those values: each displayed vertex
+# takes the value of its nearest calculation-surface vertex on every load.
+#
+# Caches are stored per settings combination (stamp + key), so a heatmap is never
+# silently reused for a mesh built with different settings; the viewer is told and
+# asks the user to recalculate or reload the mesh with the stored settings.
+# High quality vs regular refresh only changes display decimation and is not part
+# of the stamp.
+# ---------------------------------------------------------------------------
+
+SETTINGS_CACHES_KEPT = 3  # per reference + metric; oldest settings caches are pruned
+MAPPING_WARN_SPACINGS = 1.0  # warn when a displayed vertex is > 1 voxel from the calc surface
+
+
+def _canonical_reference_edit(edit) -> Optional[str]:
+    """Full-resolution edit stem (no ``_lossy``, no extension); None for the raw scan."""
+    if edit is None:
+        return None
+    text = os.path.basename(str(edit)).strip()
+    if not text or text.lower() in ("raw", "none", "null", "latest"):
+        return None
+    if text.lower().endswith(".ply"):
+        return text
+    return strip_nifti_basename(text).replace("_lossy", "")
+
+
+def _round_sig(value, digits: int = 6) -> Optional[float]:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return float(f"{value:.{digits}g}")
+
+
+def normalize_calculation_settings(raw: dict, metric_id: str, is_preserved_mesh: bool) -> dict:
+    """
+    Canonical settings stamp. Only fields that change the calculated numbers are kept;
+    voxel-only fields are dropped for preserved-mesh references (they have no volume).
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    sigma = _round_sig(raw.get("gaussian_blur"), 4)
+    settings = {
+        "metric": normalize_heatmap_metric(metric_id),
+        "edit": _canonical_reference_edit(raw.get("edit")),
+        "shell": bool(raw.get("shell_mode") or raw.get("shell")),
+    }
+    if not is_preserved_mesh:
+        settings["threshold"] = _round_sig(raw.get("threshold"))
+        settings["full_resolution"] = bool(raw.get("full_resolution"))
+        settings["gaussian_blur"] = sigma if sigma and sigma > 0 else 0.0
+    return settings
+
+
+def calculation_settings_key(settings: dict) -> str:
+    payload = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+_SETTING_LABELS = {
+    "edit": "edit",
+    "threshold": "threshold",
+    "full_resolution": "resolution",
+    "gaussian_blur": "Gaussian σ",
+    "shell": "shell",
+    "metric": "metric",
+}
+
+
+def _format_setting(name: str, value) -> str:
+    if name == "full_resolution":
+        return "full" if value else "half"
+    if name == "shell":
+        return "on" if value else "off"
+    if name == "edit":
+        return value or "raw"
+    return "—" if value is None else str(value)
+
+
+def describe_settings_differences(stored: dict, current: dict) -> list:
+    """Human-readable rows {setting, stored, current} for the viewer prompt."""
+    rows = []
+    for name in ("edit", "threshold", "full_resolution", "gaussian_blur", "shell", "metric"):
+        if name not in stored and name not in current:
+            continue
+        if stored.get(name) != current.get(name):
+            rows.append({
+                "setting": _SETTING_LABELS[name],
+                "stored": _format_setting(name, stored.get(name)),
+                "current": _format_setting(name, current.get(name)),
+            })
+    return rows
+
+
+def _settings_cache_base(directory: str, sub_path: str, filename: str, metric_id: str) -> str:
+    legacy = registration_heatmap_cache_path(directory, sub_path, filename, metric_id)
+    return legacy[:-5] if legacy.endswith(".json") else legacy
+
+
+def _settings_cache_paths(base: str, key: str) -> dict:
+    return {
+        "meta": f"{base}_calc_{key}.json",
+        "surface": f"{base}_calc_{key}.npz",
+        "subjects": f"{base}_calc_{key}_subjects.npy",
+    }
+
+
+def _list_settings_caches(base: str) -> list:
+    """Stored settings caches for this reference+metric, newest first: [(key, meta)]."""
+    found = []
+    for meta_path in glob.glob(f"{base}_calc_*.json"):
+        try:
+            with open(meta_path, "r") as jf:
+                meta = json.load(jf)
+            found.append((os.path.getmtime(meta_path), meta.get("key"), meta))
+        except (OSError, ValueError):
+            continue
+    found.sort(key=lambda row: row[0], reverse=True)
+    return [(key, meta) for _, key, meta in found if key]
+
+
+def _prune_settings_caches(base: str, keep: int = SETTINGS_CACHES_KEPT) -> None:
+    for key, _meta in _list_settings_caches(base)[keep:]:
+        for path in _settings_cache_paths(base, key).values():
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as exc:
+                print(f"Warning: could not prune heatmap cache {path}: {exc}")
+
+
+def _resolve_voxel_reference_volume(directory, sub_path, filename, metadata, settings):
+    """
+    Volume, iso-value and spacing exactly as /marchingcubes/ builds the reference display
+    mesh for these settings (same file choice, lossy threshold mapping and spacing).
+    """
+    edit = settings.get("edit")
+    full_res = settings.get("full_resolution")
+    if full_res:
+        name = f"{edit}.nii.gz" if edit else f"{filename}.nii.gz"
+    elif edit and "_edit_" in edit:
+        name = f"{edit.replace('_edit_', '_lossy_edit_', 1)}.nii.gz"
+    elif edit:
+        name = f"{edit}_lossy.nii.gz"
+    else:
+        name = f"{filename}_lossy.nii.gz"
+    nifti_path = os.path.join(directory, sub_path, name)
+    if not os.path.isfile(nifti_path):
+        raise RegistrationHeatmapError(f"Reference volume not found: {name}", status_code=404)
+
+    threshold = settings.get("threshold")
+    if threshold is None:
+        threshold = float(metadata.get("threshold") or 0.0)
+    volume = _load_volume_swapped(nifti_path)
+
+    resolution_factor = 1.0
+    if not full_res:
+        entry = _lossy_params_entry(metadata, name)
+        scale = float(entry.get("scale_factor", 1.0) or 1.0)
+        zero = float(entry.get("zero_point_shift", 0.0) or 0.0)
+        resolution_factor = float(entry.get("resolution_factor", 1) or 1)
+        threshold = (float(threshold) - zero) / scale
+    iso = float(np.clip(float(threshold), np.min(volume), np.max(volume)))
+
+    edit_voxel_size = voxel_size_for_edit_stem(
+        metadata, name, filename, scan_dir=os.path.join(directory, sub_path)
+    )
+    spacing = float(edit_voxel_size) * resolution_factor
+    return nifti_path, volume, iso, spacing
+
+
+def _voxel_surface(volume, iso, spacing, sigma, shell):
+    """Marching cubes with the display pipeline's blur/shell steps, without decimation."""
+    if sigma and sigma > 0:
+        volume = gaussian_filter(volume, sigma=sigma)
+    vertices, faces, _, _ = measure.marching_cubes(
+        volume, level=iso, spacing=(spacing, spacing, spacing)
+    )
+    faces = faces[:, ::-1]
+    if shell:
+        vertices, faces = alpaca.get_outer_mesh(vertices, faces)
+    return np.asarray(vertices, dtype=np.float64), np.asarray(faces, dtype=np.int64)
+
+
+def build_reference_calculation_surface(directory, filename, sub_path, metadata, settings):
+    """
+    Returns dict with:
+      coords        calculation-surface vertices in the display frame (for mapping)
+      query         the same vertices in the frame subjects are measured in
+      spacing       nominal sample spacing (mm), for the mapping quality check
+      fixed_volume / fixed_spacing  reference intensities for intensity metrics (voxel only)
+    """
+    shell = bool(settings.get("shell"))
+    if is_preserved_mesh_metadata(metadata):
+        ply_path = _preserved_mesh_path(directory, sub_path, filename, metadata, settings.get("edit"))
+        mesh_obj = _load_trimesh_as_single_mesh(ply_path)
+        vertices = np.asarray(mesh_obj.vertices, dtype=np.float64)
+        faces = np.asarray(mesh_obj.faces, dtype=np.int64)
+        if shell:
+            vertices, faces, _ = get_outer_mesh_with_mapping(vertices, faces)
+        reg_mesh = preserved_mesh_reference_in_shared_mm(
+            trimesh.Trimesh(vertices=vertices, faces=faces, process=False), metadata, directory
+        )
+        edges = vertices[faces[:, 1]] - vertices[faces[:, 0]] if len(faces) else np.zeros((1, 3))
+        return {
+            "coords": vertices,
+            "query": np.asarray(reg_mesh.vertices, dtype=np.float64),
+            "spacing": float(np.mean(np.linalg.norm(edges, axis=1))) or 1.0,
+            "fixed_volume": None,
+            "fixed_spacing": None,
+        }
+
+    nifti_path, volume, iso, spacing = _resolve_voxel_reference_volume(
+        directory, sub_path, filename, metadata, settings
+    )
+    vertices, _faces = _voxel_surface(
+        volume, iso, spacing, settings.get("gaussian_blur"), shell
+    )
+    print(
+        f"Calculation surface for {filename}: {len(vertices):,} vertices from "
+        f"{os.path.basename(nifti_path)} (iso={iso:.4f}, spacing={spacing:.4f}, "
+        f"sigma={settings.get('gaussian_blur')}, shell={shell})"
+    )
+    return {
+        "coords": vertices,
+        "query": vertices,
+        "spacing": spacing,
+        # Intensity metrics sample unblurred intensities on the reference grid.
+        "fixed_volume": volume,
+        "fixed_spacing": spacing,
+    }
+
+
+def _subject_surface_for_settings(subject: ElasticSubject, settings: dict):
+    """Subject surface meshed with the same resolution / blur / shell as the reference."""
+    shell = bool(settings.get("shell"))
+    if subject.modality != "voxel":
+        mesh_obj = _load_trimesh_as_single_mesh(subject.edit_path)
+        vertices = np.asarray(mesh_obj.vertices, dtype=np.float64)
+        faces = np.asarray(mesh_obj.faces, dtype=np.int64)
+        if shell:
+            vertices, faces, _ = get_outer_mesh_with_mapping(vertices, faces)
+        return vertices, faces
+
+    edit_path = subject.edit_path
+    spacing = float(subject.metadata.get("voxel_size") or 1.0)
+    using_lossy = False
+    if settings.get("full_resolution") is False:
+        lossy = _lossy_companion_path(edit_path)
+        if lossy:
+            edit_path = lossy
+            using_lossy = True
+            spacing *= _lossy_resolution_factor(subject.metadata, os.path.basename(edit_path))
+    volume = _load_volume_swapped(edit_path)
+    # Each subject keeps its own stored threshold (intensities differ per scan).
+    iso = _iso_threshold_for_volume(
+        subject.metadata, volume, nifti_basename=os.path.basename(edit_path), is_lossy=using_lossy
+    )
+    return _voxel_surface(volume, iso, spacing, settings.get("gaussian_blur"), shell)
+
+
+def _subject_values_for_settings(surface: dict, subject: ElasticSubject, settings: dict, metric_id: str):
+    spec = get_heatmap_metric_spec(metric_id)
+    if spec.compute_kind == "intensity":
+        if subject.modality != "voxel" or surface["fixed_volume"] is None:
+            raise ValueError(f"{metric_id} population heatmap skips mesh subject {subject.name}")
+        moving_path = subject.edit_path
+        if settings.get("full_resolution") is False:
+            moving_path = _lossy_companion_path(subject.edit_path) or moving_path
+        values = try_compute_intensity_heatmap(
+            metric_id,
+            surface["fixed_volume"],
+            _load_volume_swapped(moving_path),
+            surface["query"],
+            surface["fixed_spacing"],
+        )
+        if values is None:
+            raise ValueError(f"Metric '{metric_id}' is not an intensity heatmap")
+        return np.asarray(values, dtype=np.float64)
+
+    subject_vertices, subject_faces = _subject_surface_for_settings(subject, settings)
+    return np.asarray(
+        alpaca.calculate_landmark_distances(surface["query"], subject_vertices, subject_faces),
+        dtype=np.float64,
+    )
+
+
+def decode_display_vertices(b64: str, center, scale_factor) -> np.ndarray:
+    """Viewer positions (normalized GLB buffer) back to physical display-frame mm."""
+    flat = np.frombuffer(base64.b64decode(b64), dtype="<f4").astype(np.float64)
+    if flat.size % 3:
+        raise RegistrationHeatmapError("Displayed vertex buffer is not a multiple of 3", 400)
+    center = np.asarray(center if center is not None else [0, 0, 0], dtype=np.float64).reshape(1, 3)
+    scale = float(scale_factor) if scale_factor else 1.0
+    return flat.reshape(-1, 3) * scale + center
+
+
+def _encode_int32(values: np.ndarray) -> str:
+    return base64.b64encode(np.asarray(values, dtype="<i4").tobytes()).decode("ascii")
+
+
+def _map_to_display(base, key, meta, display_vertices):
+    paths = _settings_cache_paths(base, key)
+    with np.load(paths["surface"], allow_pickle=False) as data:
+        coords = np.asarray(data["coords"], dtype=np.float64)
+        average = np.asarray(data["average"], dtype=np.float64)
+    nn_dist, nn_idx = cKDTree(coords).query(display_vertices)
+    spacing = float(meta.get("spacing_mm") or 1.0)
+    max_dist = float(np.max(nn_dist)) if len(nn_dist) else 0.0
+    mean_dist = float(np.mean(nn_dist)) if len(nn_dist) else 0.0
+    warning = None
+    if max_dist > MAPPING_WARN_SPACINGS * spacing:
+        warning = (
+            f"Some displayed vertices are up to {max_dist:.3f} mm from the calculation surface "
+            f"(sample spacing {spacing:.3f} mm); their colours come from the nearest surface point."
+        )
+    print(
+        f"Mapped {len(display_vertices):,} displayed vertices onto {len(coords):,} calculation "
+        f"vertices (mean {mean_dist:.4f} mm, max {max_dist:.4f} mm)"
+    )
+    values = average[nn_idx]
+    return {
+        "distances": values.tolist(),
+        "subject_distances": {"average": values.tolist()},
+        "n_subjects_processed": int(meta.get("n_subjects_processed", 0)),
+        "n_vertices_total": int(len(display_vertices)),
+        "n_vertices_calculation": int(len(coords)),
+        "has_full_subject_data": True,
+        "metric": meta.get("metric", FALLBACK_HEATMAP_METRIC),
+        "dense_distances_metric": meta.get("metric", FALLBACK_HEATMAP_METRIC),
+        "cache_key": key,
+        "calculation_settings": meta.get("settings"),
+        "display_to_calc": _encode_int32(nn_idx),
+        "mapping_mean_mm": mean_dist,
+        "mapping_max_mm": max_dist,
+        "mapping_warning": warning,
+    }
+
+
+def compute_settings_registration_heatmap(
+    directory: str,
+    filename: str,
+    raw_settings: dict,
+    display_vertices: np.ndarray,
+    recalculate: bool = False,
+    heatmap_metric: str = SURFACE_DISTANCE,
+) -> dict:
+    """
+    Settings-stamped population heatmap mapped onto the displayed mesh.
+
+    Without ``recalculate``: a cache for these exact settings is mapped and returned;
+    if only caches for *other* settings exist, nothing is computed and a
+    ``settings_mismatch`` payload lets the viewer ask the user what to do.
+    """
+    sub_path = resolve_sub_path(filename)
+    with open(resolve_json_path(directory, filename, sub_path), "r") as jf:
+        metadata = json.load(jf)
+    is_mesh = is_preserved_mesh_metadata(metadata)
+    metric_id = resolve_heatmap_metric(heatmap_metric, is_mesh=is_mesh)
+    settings = normalize_calculation_settings(raw_settings, metric_id, is_mesh)
+    if not is_mesh and str(settings.get("edit") or "").lower().endswith(".ply"):
+        raise RegistrationHeatmapError(
+            "Population heatmaps for a .ply edit of a voxel reference are not supported; "
+            "select a volume edit of the reference.",
+            status_code=400,
+        )
+    key = calculation_settings_key(settings)
+    base = _settings_cache_base(directory, sub_path, filename, metric_id)
+    paths = _settings_cache_paths(base, key)
+
+    if not recalculate:
+        if os.path.isfile(paths["meta"]) and os.path.isfile(paths["surface"]):
+            with open(paths["meta"], "r") as jf:
+                meta = json.load(jf)
+            os.utime(paths["meta"], None)  # most recently used survives pruning
+            print(f"Loaded settings heatmap cache {key} for {filename}")
+            return _map_to_display(base, key, meta, display_vertices)
+        others = _list_settings_caches(base)
+        if others:
+            stored = others[0][1].get("settings") or {}
+            return {
+                "settings_mismatch": True,
+                "stored_settings": stored,
+                "current_settings": settings,
+                "differences": describe_settings_differences(stored, settings),
+                "metric": metric_id,
+            }
+
+    elastic_subjects = discover_elastic_subjects(directory, filename)
+    if not elastic_subjects:
+        raise RegistrationHeatmapError("No valid elastic edits found in any subjects", status_code=404)
+
+    started = time.time()
+    surface = build_reference_calculation_surface(directory, filename, sub_path, metadata, settings)
+    total = len(elastic_subjects)
+    _send_progress(total, elastic_subjects[0].name, f"Computing {metric_id} population heatmap for {total} subjects...", 0)
+
+    names, columns = [], []
+    for idx, subject in enumerate(elastic_subjects):
+        _send_progress(total, subject.name, f"Processing {subject.name} ({idx + 1}/{total}) [{metric_id}]...", idx + 1)
+        try:
+            values = _subject_values_for_settings(surface, subject, settings, metric_id)
+        except Exception as exc:
+            print(f"Error processing subject {subject.name}: {exc}")
+            continue
+        names.append(subject.name)
+        columns.append(values.astype(np.float32))
+        print(f"{metric_id} for {subject.name}: mean {float(np.mean(values)):.4f}")
+
+    if not columns:
+        raise RegistrationHeatmapError(
+            f"No valid elastic subjects could be processed for metric '{metric_id}'", status_code=404
+        )
+
+    per_subject = np.stack(columns, axis=1)  # (n_calc, n_subjects), row = calc vertex
+    average = np.nan_to_num(np.mean(per_subject.astype(np.float64), axis=1), nan=0, posinf=0, neginf=0)
+
+    os.makedirs(os.path.dirname(paths["meta"]), exist_ok=True)
+    np.savez(paths["surface"], coords=surface["coords"].astype(np.float32), average=average)
+    np.save(paths["subjects"], per_subject)
+    meta = {
+        "key": key,
+        "settings": settings,
+        "metric": metric_id,
+        "subjects": names,
+        "n_subjects_processed": len(names),
+        "n_vertices_calculation": int(len(average)),
+        "spacing_mm": float(surface["spacing"]),
+        "computed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "compute_seconds": round(time.time() - started, 1),
+    }
+    with open(paths["meta"], "w") as jf:
+        json.dump(meta, jf, indent=2)
+    _prune_settings_caches(base)
+    print(f"Saved settings heatmap cache {key}: {len(names)} subjects, {len(average):,} vertices")
+    return _map_to_display(base, key, meta, display_vertices)
+
+
+def load_settings_subject_values(directory: str, filename: str, metric_id: str, key: str, calc_indices) -> dict:
+    """Per-subject values at calculation-surface indices (histograms), via a memory map."""
+    sub_path = resolve_sub_path(filename)
+    base = _settings_cache_base(directory, sub_path, filename, normalize_heatmap_metric(metric_id))
+    paths = _settings_cache_paths(base, key)
+    if not (os.path.isfile(paths["meta"]) and os.path.isfile(paths["subjects"])):
+        raise RegistrationHeatmapError("Registration cache not found", status_code=404)
+    with open(paths["meta"], "r") as jf:
+        meta = json.load(jf)
+    matrix = np.load(paths["subjects"], mmap_mode="r")
+    idx = np.asarray(calc_indices, dtype=np.int64)
+    if idx.size and (idx.min() < 0 or idx.max() >= matrix.shape[0]):
+        raise RegistrationHeatmapError("Calculation index out of range", status_code=400)
+    rows = np.asarray(matrix[idx, :], dtype=np.float64)
+    return {
+        "subjects": meta.get("subjects", []),
+        "values": rows,  # (len(idx), n_subjects)
+        "metric": meta.get("metric", FALLBACK_HEATMAP_METRIC),
+    }

@@ -2530,6 +2530,24 @@ def _outer_shell_trimesh(mesh, label="mesh"):
     return shell
 
 
+def transferred_landmark_row(source_row, position):
+    """
+    Landmark row for a transferred landmark: ``source_row`` with only its position replaced.
+
+    Transfers (atlas/reference/subject, voxel or preserved-mesh) map positions one-to-one
+    and in order, so per-landmark metadata — ``landmark_type``, ``group_id``, ``family_id``
+    and the ``semi_parent_start``/``semi_parent_end`` indices — stays valid on the target
+    and must be carried over. Rebuilding rows as ``{position, landmark_type}`` silently
+    dropped landmark groups (and semi-landmark parents) on every transferred scan.
+    """
+    if hasattr(position, "tolist"):
+        position = position.tolist()
+    row = dict(source_row) if isinstance(source_row, dict) else {}
+    row.setdefault("landmark_type", "main")
+    row["position"] = list(position)
+    return row
+
+
 def _filter_landmarks_to_shell_mesh(landmarks, shell_mesh):
     """Keep landmarks that lie on the shell surface within a small tolerance."""
     if landmarks is None:
@@ -3854,11 +3872,9 @@ class MeshElasticRegistrationMixin(MeshEditMixin):
                 f"suggests a coordinate-frame mismatch between reference landmarks and the subject elastic mesh"
             )
 
+        # Keep each reference landmark's group / family / semi-parent metadata.
         new_landmarks = [
-            {
-                "position": pre_elastic_mesh.vertices[int(idx)].tolist(),
-                "landmark_type": lm.get("landmark_type", "main"),
-            }
+            transferred_landmark_row(lm, pre_elastic_mesh.vertices[int(idx)])
             for lm, idx in zip(reference_landmarks, nearest_vertex)
         ]
 
@@ -3867,10 +3883,7 @@ class MeshElasticRegistrationMixin(MeshEditMixin):
         elastic_stem = self._mesh_stem(elastic_edit)
         if elastic_stem != edit_stem:
             elastic_landmarks = [
-                {
-                    "position": elastic_mesh.vertices[int(idx)].tolist(),
-                    "landmark_type": lm.get("landmark_type", "main"),
-                }
+                transferred_landmark_row(lm, elastic_mesh.vertices[int(idx)])
                 for lm, idx in zip(reference_landmarks, nearest_vertex)
             ]
             self._write_landmark_rows_for_edit(subject_dir, elastic_stem, elastic_landmarks)
@@ -3994,11 +4007,9 @@ class MeshElasticRegistrationMixin(MeshEditMixin):
                 )
             ref_positions = registration_positions
 
+        # Keep each subject landmark's group / family / semi-parent metadata.
         new_landmarks = [
-            {
-                "position": ref_positions[i].tolist(),
-                "landmark_type": lm.get("landmark_type", "main"),
-            }
+            transferred_landmark_row(lm, ref_positions[i])
             for i, lm in enumerate(subject_landmarks)
         ]
         return new_landmarks, transfer_distances

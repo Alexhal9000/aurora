@@ -163,6 +163,7 @@ urlpatterns = [
     path('delete-report-figure-mesh-cache/', DeleteReportFigureMeshCacheView.as_view(), name='delete_report_figure_mesh_cache'),
     path('delete-scientific-report/', DeleteScientificReportView.as_view(), name='delete_scientific_report'),
     path('get-report-environment/', GetReportEnvironmentView.as_view(), name='get_report_environment'),
+    path('display-environment/', DisplayEnvironmentView.as_view(), name='display_environment'),
     path('make-atlas-reference/', MakeAtlasReferenceView.as_view(), name='make_atlas_reference'),
     path('get-all-subjects-mesh/', GetAllSubjectsMeshView.as_view(), name='get_all_subjects_mesh'),
     path('get-version/', GetVersionView.as_view(), name='get_version'),

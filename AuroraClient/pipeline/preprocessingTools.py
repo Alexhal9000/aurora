@@ -1175,120 +1175,16 @@ class HomogenizeBackgroundView(APIView):
         if skipped_preserved_meshes:
             print(f"Skipping preserved mesh subjects for background homogenization: {skipped_preserved_meshes}")
 
-        # One entry per scan in scan_names (None when estimation failed), so
-        # the apply pass can index both lists by the same position.
-        background_values = []
-        background_estimates = []
         optimal_background = None
-        last_idx = 0  
-
         scan_count = len(scan_names)
 
-        if background_value is None:
-            # Each auto phase is its own 0→1 progress epoch. Phase 1 (mode-finding)
-            # is much cheaper than phase 2 (load/shift/save), so a shared 2n bar
-            # races to ~50% then wraps current back to 1 and overshoots the canvas.
-            channel_layer = get_channel_layer()
-            if channel_layer is not None and scan_count > 0:
-                print("Sending progress update")
-                async_to_sync(channel_layer.group_send)(
-                    'progress_group',
-                    {
-                        'type': 'send_progress',
-                        'progress': 0,
-                        'scan_name': scan_names[0],
-                        'custom_message': f'Phase 1/2: finding background values for {scan_count} scan(s)...',
-                        'total': scan_count,
-                        'current': 0,
-                    }
-                )
-            
-            # First pass: analyze all scans to determine background properties                        
-            for last_idx, scan_name in enumerate(scan_names):
-                try:
-                    # Find the latest edit for this scan
-                    latest_edit = 0
-                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                        latest_edit += 1
-                    latest_edit -= 1
-                    
-                    # Send progress update
-                    if channel_layer is not None:
-                        progress = last_idx / scan_count
-                        async_to_sync(channel_layer.group_send)(
-                            'progress_group',
-                            {
-                                'type': 'send_progress',
-                                'progress': progress,
-                                'scan_name': scan_name,
-                                'custom_message': f'Phase 1/2: finding background value for {scan_name}...',
-                                'total': scan_count,
-                                'current': last_idx + 1,
-                            }
-                        )
-                    
-                    # Load the scan data
-                    if latest_edit >= 0:
-                        scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
-                    else:
-                        scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
-                    
-                    # Load the scan's metadata
-                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
-                        scan_metadata = json.load(jf)
-                    
-                    # Load the scan data
-                    time_start = time.time()
-                    nifti_img = nib.load(scan_path)
-                    original_dtype = nifti_img.get_data_dtype()  # Get the original data type
-                    scan_data = nifti_img.get_fdata().astype(original_dtype)  # Keep original dtype
-                    time_end = time.time()
-                    print(f"Time taken to load {scan_name} scan data: {time_end - time_start} seconds")
-                    print(f"Original data type: {original_dtype}")
-                    
-                    # Analyze background
-                    time_start = time.time()
-                    background_value, estimate_info = self._get_background_value(
-                        scan_data,
-                        scan_metadata['threshold'],
-                        region=background_region,
-                    )
-                    background_values.append(background_value)
-                    background_estimates.append(estimate_info)
-                    time_end = time.time()
-                    print(f"Time taken to analyze background: {time_end - time_start} seconds")
-                    
-                    print(f"Analyzed {scan_name}, background value: {background_value} ({estimate_info})")
-                    
-                except Exception as e:
-                    print(f"Error processing {scan_name}: {str(e)}")
-                    background_values.append(None)
-                    background_estimates.append(None)
-            
-        else:
+        if background_value is not None:
             optimal_background = np.array(background_value, dtype=int)
 
-        # Restart the bar for the apply pass so current/total and 0→1 progress stay aligned.
-        if optimal_background is None and scan_count > 0:
-            channel_layer = get_channel_layer()
-            if channel_layer is not None:
-                async_to_sync(channel_layer.group_send)(
-                    'progress_group',
-                    {
-                        'type': 'send_progress',
-                        'progress': 0,
-                        'scan_name': scan_names[0],
-                        'custom_message': f'Phase 2/2: applying background values to {scan_count} scan(s)...',
-                        'total': scan_count,
-                        'current': 0,
-                    }
-                )
-        
-        # Second pass: apply homogenization to all scans
+        # One pass: each scan is loaded once, its background estimated (auto mode) and
+        # shifted right away. No estimate depends on another scan, so nothing is gained
+        # by estimating all scans first (that only loaded every volume twice).
         for idx, scan_name in enumerate(scan_names):
-            if optimal_background is None and background_values[idx] is None:
-                print(f"Skipping {scan_name}: no background value was estimated")
-                continue
             try:
                 # Send progress update
                 channel_layer = get_channel_layer()
@@ -1297,7 +1193,7 @@ class HomogenizeBackgroundView(APIView):
                     if optimal_background is not None:
                         progress_message = f'Setting background of {scan_name} to value {optimal_background}...'
                     else:
-                        progress_message = f'Phase 2/2: applying background value {background_values[idx]} to {scan_name}...'
+                        progress_message = f'Finding and applying the background value of {scan_name}...'
                     async_to_sync(channel_layer.group_send)(
                         'progress_group',
                         {
@@ -1330,13 +1226,28 @@ class HomogenizeBackgroundView(APIView):
                 time_end = time.time()
                 print(f"Time taken to load {scan_name} scan data: {time_end - time_start} seconds")
                 print(f"Original data type: {original_dtype}")
-                
+
+                # Auto mode: estimate this scan's background from the volume just loaded
+                scan_background = optimal_background
+                estimate_info = None
+                if optimal_background is None:
+                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
+                        estimate_threshold = json.load(jf)['threshold']
+                    time_start = time.time()
+                    scan_background, estimate_info = self._get_background_value(
+                        scan_data,
+                        estimate_threshold,
+                        region=background_region,
+                    )
+                    print(f"Time taken to analyze background: {time.time() - time_start} seconds")
+                    print(f"Analyzed {scan_name}, background value: {scan_background} ({estimate_info})")
+                    if scan_background is None:
+                        print(f"Skipping {scan_name}: no background value was estimated")
+                        continue
+
                 # Apply homogenization
                 time_start = time.time()
-                if optimal_background is not None:
-                    scan_data = self._homogenize_background(scan_data, optimal_background)
-                else:
-                    scan_data = self._homogenize_background(scan_data, background_values[idx])
+                scan_data = self._homogenize_background(scan_data, scan_background)
                 time_end = time.time()
                 print(f"Time taken to homogenize {scan_name} background: {time_end - time_start} seconds")
 
@@ -1373,7 +1284,7 @@ class HomogenizeBackgroundView(APIView):
                     applied_shift = int(optimal_background)
                     offset_mode = 'fixed'
                 else:
-                    applied_shift = int(background_values[idx])
+                    applied_shift = int(scan_background)
                     offset_mode = 'auto_per_scan'
                 scan_metadata['threshold'] = scan_metadata['threshold'] - applied_shift
                 scan_metadata['backfixed_shift'] = applied_shift
@@ -1381,10 +1292,10 @@ class HomogenizeBackgroundView(APIView):
                     'mode': offset_mode,
                     'shift': applied_shift,
                 }
-                if optimal_background is None and background_estimates[idx]:
+                if optimal_background is None and estimate_info:
                     # Provenance of the automatic estimate (method, region,
                     # derived constants, sample counts, any fallback).
-                    scan_metadata['background_offset_settings']['estimator'] = background_estimates[idx]
+                    scan_metadata['background_offset_settings']['estimator'] = estimate_info
                 append_background_offset_history(
                     scan_metadata,
                     f"{scan_name}_edit_{new_edit_number}_backfixed",
