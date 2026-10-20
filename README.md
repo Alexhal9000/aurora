@@ -11,13 +11,13 @@ here. Installers for Ubuntu, Windows, and macOS are attached to
 
 ## Installers
 
-The version cited in the Aurora article is **1.8.7**. These links stay up;
+The version cited in the Aurora article is **1.9.3**. These links stay up;
 later wizard releases are extra, not replacements:
 
-- [Release v1.8.7](https://github.com/Alexhal9000/aurora/releases/tag/v1.8.7)
-- [Ubuntu `.deb`](https://github.com/Alexhal9000/aurora/releases/download/v1.8.7/aurora-tools_1.8.7_amd64.deb)
-- [Windows `.exe`](https://github.com/Alexhal9000/aurora/releases/download/v1.8.7/aurora_1.8.7_setup.exe)
-- [macOS `.pkg`](https://github.com/Alexhal9000/aurora/releases/download/v1.8.7/aurora_1.8.7_macos.pkg)
+- [Release v1.9.3](https://github.com/Alexhal9000/aurora/releases/tag/v1.9.3)
+- [Ubuntu `.deb`](https://github.com/Alexhal9000/aurora/releases/download/v1.9.3/aurora-tools_1.9.3_amd64.deb)
+- [Windows `.exe`](https://github.com/Alexhal9000/aurora/releases/download/v1.9.3/aurora_1.9.3_setup.exe)
+- [macOS `.pkg`](https://github.com/Alexhal9000/aurora/releases/download/v1.9.3/aurora_1.9.3_macos.pkg)
 
 Every later GitHub release is also kept. Each tag marks the backend that
 shipped in that version's installers. The lab site requires **1.8.7 or newer**.
