@@ -1,6 +1,11 @@
 import os
 import json
 import shutil
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    atomic_write_json,
+    atomic_copy,
+)
 
 # Subject name used after promoting population atlas into extracted/ as the project reference.
 REFERENCE_ATLAS_SUBJECT = "ReferenceAtlas"
@@ -96,6 +101,10 @@ def read_selected_reference(directory):
     return value if isinstance(value, str) else ""
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def update_json_metadata_files(folder_path, previous_reference=None):
     """Rewrite JSON metadata after file renames (edits lists, name field, etc.).
 
@@ -124,8 +133,7 @@ def update_json_metadata_files(folder_path, previous_reference=None):
                 and previous_reference != REFERENCE_ATLAS_SUBJECT
             ):
                 data["previous_reference"] = previous_reference
-        with open(json_path, "w") as f:
-            json.dump(data, f, indent=4)
+        atomic_write_json(json_path, data, indent=4)
 
 
 def write_project_reference(directory, reference_name):
@@ -150,6 +158,10 @@ def delete_stale_average_files(folder_path):
     return removed
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def copy_reference_atlas_nifti_to_project_root(directory, subject_dir=None):
     """
     Copy ReferenceAtlas.nii.gz to the project root so the file browser can pair
@@ -162,7 +174,7 @@ def copy_reference_atlas_nifti_to_project_root(directory, subject_dir=None):
         raise FileNotFoundError(
             f"{REFERENCE_ATLAS_SUBJECT}.nii.gz not found in {subject_dir}"
         )
-    shutil.copy2(src, dst)
+    atomic_copy(src, dst)
     return dst
 
 

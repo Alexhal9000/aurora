@@ -23,6 +23,15 @@ from rest_framework.views import APIView
 
 from .atlas_paths import resolve_atlas_dir
 from .coordinateFrames import is_preserved_mesh_metadata
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    crash_safe_view,
+    request_subjects,
+    atomic_nib_save,
+    atomic_write_json,
+    atomic_np_savez,
+    atomic_mesh_export,
+)
 
 
 DISTANCE_ARRAY_KEYS = (
@@ -244,6 +253,10 @@ def _scale_quick_mesh_properties(json_metadata, scale):
     return changed
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _update_nifti_affine(path, scale, scale_vector_data=False):
     img = nib.load(path)
     affine = np.array(img.affine, dtype=np.float64, copy=True)
@@ -256,9 +269,13 @@ def _update_nifti_affine(path, scale, scale_vector_data=False):
     else:
         out = nib.Nifti1Image(img.dataobj, affine, header)
     out.set_data_dtype(img.get_data_dtype())
-    nib.save(out, path)
+    atomic_nib_save(out, path)
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _scale_vertices_npz(path, scale):
     with np.load(path, allow_pickle=False) as npz:
         keys = list(npz.files)
@@ -266,10 +283,14 @@ def _scale_vertices_npz(path, scale):
     if 'vertices' not in payload:
         return False
     payload['vertices'] = np.asarray(payload['vertices'], dtype=np.float64) * scale
-    np.savez(path, **payload)
+    atomic_np_savez(path, **payload)
     return True
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _scale_ply(path, scale):
     mesh = trimesh.load(path, process=False)
     if isinstance(mesh, trimesh.Scene):
@@ -283,17 +304,20 @@ def _scale_ply(path, scale):
     if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0:
         return False
     mesh.vertices = np.asarray(mesh.vertices, dtype=np.float64) * scale
-    mesh.export(path)
+    atomic_mesh_export(mesh, path)
     return True
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _scale_distance_file_arrays(path, scale):
     with open(path, 'r') as jf:
         data = json.load(jf)
 
     if isinstance(data, list):
-        with open(path, 'w') as jf:
-            json.dump(_scale_numeric_list(data, scale), jf, indent=4)
+        atomic_write_json(path, _scale_numeric_list(data, scale), indent=4)
         return True
 
     if not isinstance(data, dict):
@@ -310,11 +334,14 @@ def _scale_distance_file_arrays(path, scale):
             changed = True
 
     if changed:
-        with open(path, 'w') as jf:
-            json.dump(data, jf, indent=4)
+        atomic_write_json(path, data, indent=4)
     return changed
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _scale_mm_assets(scan_dir, json_path, json_metadata, scale):
     """
     Scale physical-mm sidecar assets only (not voxel_size / NIfTI affines).
@@ -355,15 +382,13 @@ def _scale_mm_assets(scan_dir, json_path, json_metadata, scale):
             with open(path, 'r') as jf:
                 payload = json.load(jf)
             scaled, count = _scale_landmarks_payload(payload, scale)
-            with open(path, 'w') as jf:
-                json.dump(scaled, jf, indent=4)
+            atomic_write_json(path, scaled, indent=4)
             updated['landmark_files'].append({'file': basename, 'count': count})
         elif 'guidepoints' in basename and basename.endswith('.json'):
             with open(path, 'r') as jf:
                 payload = json.load(jf)
             scaled, count = _scale_guidepoints_payload(payload, scale)
-            with open(path, 'w') as jf:
-                json.dump(scaled, jf, indent=4)
+            atomic_write_json(path, scaled, indent=4)
             updated['guidepoint_files'].append({'file': basename, 'count': count})
         elif basename.endswith('_landmark_distances.json'):
             if _scale_distance_file_arrays(path, scale):
@@ -395,7 +420,7 @@ def _scale_mm_assets(scan_dir, json_path, json_metadata, scale):
             data = np.asarray(np.asanyarray(img.dataobj), dtype=np.float64) * scale
             out = nib.Nifti1Image(data.astype(img.get_data_dtype(), copy=False), img.affine, img.header.copy())
             out.set_data_dtype(img.get_data_dtype())
-            nib.save(out, path)
+            atomic_nib_save(out, path)
             updated['displacement_fields'].append(basename)
         except Exception as exc:
             print(f'Warning: could not scale displacement field {basename}: {exc}')
@@ -444,6 +469,10 @@ def _revert_legacy_mm_rescales(scan_dir, json_path, json_metadata):
     return inverse, repaired
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def apply_voxel_size_override(directory, filename, new_voxel_size):
     scan_dir, json_path = _resolve_scan_paths(directory, filename)
     if not os.path.isfile(json_path):
@@ -479,8 +508,7 @@ def apply_voxel_size_override(directory, filename, new_voxel_size):
                 if summary:
                     distance_summaries.append(summary)
             _refresh_landmarks_metadata(json_metadata, distance_summaries)
-            with open(json_path, 'w') as jf:
-                json.dump(json_metadata, jf, indent=4)
+            atomic_write_json(json_path, json_metadata, indent=4)
         return {
             'voxel_size': old_voxel_size,
             'previous_voxel_size': old_voxel_size,
@@ -539,8 +567,7 @@ def apply_voxel_size_override(directory, filename, new_voxel_size):
     if _refresh_landmarks_metadata(json_metadata, distance_summaries):
         updated['metadata_fields'].append('landmarks')
 
-    with open(json_path, 'w') as jf:
-        json.dump(json_metadata, jf, indent=4)
+    atomic_write_json(json_path, json_metadata, indent=4)
 
     return {
         'voxel_size': float(new_voxel_size),
@@ -567,6 +594,14 @@ class OverwriteVoxelSizeView(APIView):
     Landmarks, guidepoints, and other mm-space sidecars are preserved as-is.
     """
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('overwrite_voxel_size', lambda request: request_subjects(request, 'filename'))
     def post(self, request, *args, **kwargs):
         directory = request.data.get('directory')
         filename = request.data.get('filename')

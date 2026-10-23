@@ -7,6 +7,13 @@ from scipy.ndimage import zoom
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    crash_safe_view,
+    request_subjects,
+    atomic_nib_save,
+    load_nifti_readonly,
+)
 
 
 
@@ -149,6 +156,14 @@ class RunAISegmentationView(APIView):
         }
     """
     
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('ai_segmentation', lambda request: request_subjects(request, 'subject'))
     def post(self, request):
         print("=" * 60)
         print("RunAISegmentationView.post() called")
@@ -302,21 +317,11 @@ class RunAISegmentationView(APIView):
             try:
                 if os.path.exists(mask_path):
                     print(f"Existing mask found at: {mask_path}")
-                    # Temporarily rename to standard extension for nibabel
-                    os.replace(mask_path, mask_temp_path)
-                    print(f"Renamed mask to temporary name: {mask_temp_path}")
-
-                    try:
-                        print(f"Loading mask from temporary path")
-                        mask_img = nib.load(mask_temp_path)
-                        # Round before astype to avoid truncating floats
-                        mask_data_3d = np.round(mask_img.get_fdata()).astype(np.uint8)
-                        print(f"Mask loaded successfully. Shape: {mask_data_3d.shape}, dtype: {mask_data_3d.dtype}")
-
-                    finally:
-                        # Always rename back to original custom extension
-                        os.replace(mask_temp_path, mask_path)
-                        print(f"Renamed mask back to original name: {mask_path}")
+                    # Read in place (crash-safe rule 2): the mask is never renamed to be read.
+                    mask_img = load_nifti_readonly(mask_path)
+                    # Round before astype to avoid truncating floats
+                    mask_data_3d = np.round(mask_img.get_fdata()).astype(np.uint8)
+                    print(f"Mask loaded successfully. Shape: {mask_data_3d.shape}, dtype: {mask_data_3d.dtype}")
                 else:
                     # No existing mask, create empty one with same shape as image
                     print(f"No existing mask found, creating empty mask")
@@ -397,6 +402,10 @@ class RunAISegmentationView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _save_segmentation_result(self, segmented_mask_3d, image_img, mask_path, 
                                 mask_temp_path, lossy_edit, full_edit, base_path, label):
         """
@@ -432,13 +441,9 @@ class RunAISegmentationView(APIView):
                 full_temp_path = os.path.join(base_path, full_mask_temp_filename)
                 
                 if os.path.exists(full_save_path):
-                    os.replace(full_save_path, full_temp_path)
-                    try:
-                        existing_full_mask_img = nib.load(full_temp_path)
-                        # Round before astype to avoid truncating floats
-                        existing_full_mask_data = np.round(existing_full_mask_img.get_fdata()).astype(np.uint8)
-                    finally:
-                        os.replace(full_temp_path, full_save_path)
+                    existing_full_mask_img = load_nifti_readonly(full_save_path)
+                    # Round before astype to avoid truncating floats
+                    existing_full_mask_data = np.round(existing_full_mask_img.get_fdata()).astype(np.uint8)
                 else:
                     existing_full_mask_data = np.zeros(target_shape, dtype=np.uint8)
                 
@@ -462,8 +467,7 @@ class RunAISegmentationView(APIView):
                 # Save full resolution mask
                 full_mask_img = nib.Nifti1Image(scaled_seg_mask.astype(np.uint8), full_image.affine, 
                                             header=full_image.header)
-                nib.save(full_mask_img, full_temp_path)
-                os.replace(full_temp_path, full_save_path)
+                atomic_nib_save(full_mask_img, full_save_path)
                 
                 print(f"Saved AI segmentation (full resolution) to: {full_save_path}")
             
@@ -498,8 +502,7 @@ class RunAISegmentationView(APIView):
                 
                 lossy_mask_img = nib.Nifti1Image(scaled_lossy_mask.astype(np.uint8), lossy_image.affine, 
                                                 header=lossy_image.header)
-                nib.save(lossy_mask_img, lossy_temp_path)
-                os.replace(lossy_temp_path, lossy_save_path)
+                atomic_nib_save(lossy_mask_img, lossy_save_path)
                 
                 print(f"Saved AI segmentation (lossy resolution) to: {lossy_save_path}")
                 

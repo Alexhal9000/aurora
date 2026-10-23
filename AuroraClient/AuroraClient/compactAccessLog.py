@@ -18,6 +18,11 @@ This module replaces that log with a compact one:
   over the whole burst.
   A group with a single request prints as a normal one-line entry with its duration.
 * Front-end assets (.js/.css/.png/fonts...) are folded into one "static files" group.
+* Background checks that every open Aurora tab or lab page repeats on its own (the
+  presence heartbeat every 30 s, sign-in status, job and version polls) are not printed
+  one by one: they are counted, and one "background checks" line is printed just before
+  the next real activity, or once an hour while nothing else happens. Over a long idle
+  session the finished tasks above therefore stay close. Failed checks still print at once.
 * WebSocket connect / disconnect are printed as one line each (handshake noise dropped).
 * Long-running requests (N4, registration, AI...) get a heartbeat: once a request has
   been running for HEARTBEAT_AFTER_S, a "still running" line is printed every
@@ -56,6 +61,15 @@ PATH_COLUMN = 34
 # Heartbeat for requests still in flight (see RequestHeartbeatMiddleware).
 HEARTBEAT_AFTER_S = 20.0
 HEARTBEAT_EVERY_S = 30.0
+# Successful background polls (see module docstring): counted, summarised on one line.
+BACKGROUND_ENDPOINTS = {
+    ('POST', '/engine-auth/heartbeat/'): 'heartbeat',
+    ('GET', '/engine-auth/status/'): 'sign-in status',
+    ('GET', '/engine-jobs/'): 'job checks',
+    ('GET', '/get-version/'): 'version checks',
+    ('GET', '/engine-sharing/'): 'sharing status',
+}
+BACKGROUND_SUMMARY_EVERY_S = 3600.0
 # Error lines keep the query string (useful to see the scan), but long ones are clipped.
 ERROR_PATH_MAX = 180
 
@@ -129,6 +143,10 @@ class CompactAccessLogGenerator:
         self._lock = threading.Lock()
         # (method, endpoint label) -> running group stats
         self._groups = {}
+        # Background polls since the last summary line: label -> count, plus when it began.
+        self._background = {}
+        self._background_since = None
+        self._background_started = None
         if mode == 'compact':
             threading.Thread(target=self._flush_loop, name='aurora-access-log', daemon=True).start()
 
@@ -170,6 +188,14 @@ class CompactAccessLogGenerator:
             return
 
         endpoint = full_path.split('?', 1)[0]
+        background = BACKGROUND_ENDPOINTS.get((method, endpoint))
+        if background:
+            with self._lock:
+                if not self._background:
+                    self._background_since = _now_label()
+                    self._background_started = time.monotonic()
+                self._background[background] = self._background.get(background, 0) + 1
+            return
         label = 'static files' if _STATIC_FILE_RE.search(endpoint) else endpoint
         key = (method, label)
         now = time.monotonic()
@@ -193,6 +219,9 @@ class CompactAccessLogGenerator:
             try:
                 self._flush(force=False)
                 self._heartbeat()
+                if (self._background_started is not None
+                        and time.monotonic() - self._background_started >= BACKGROUND_SUMMARY_EVERY_S):
+                    self._flush_background()
             except Exception:
                 pass
 
@@ -252,9 +281,22 @@ class CompactAccessLogGenerator:
             f'avg {_format_duration(avg)} · max {_format_duration(group["max_time"])}'
         )
 
+    def _flush_background(self):
+        with self._lock:
+            counts, since = self._background, self._background_since
+            self._background, self._background_since, self._background_started = {}, None, None
+        if not counts:
+            return
+        total = sum(counts.values())
+        parts = ', '.join(f'{label} ×{count}' for label, count in sorted(counts.items(), key=lambda item: -item[1]))
+        self._write(f'[{_now_label()}]  · background checks ×{total} since {since} ({parts})', background=True)
+
     # ---- output -------------------------------------------------------------------
 
-    def _write(self, line):
+    def _write(self, line, background=False):
+        if not background and self._background:
+            # Summarise the quiet stretch first, so the log reads in order.
+            self._flush_background()
         text = line + '\n'
         try:
             self.stream.write(text)

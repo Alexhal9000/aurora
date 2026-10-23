@@ -41,6 +41,13 @@ import skimage.morphology
 from scipy.signal import convolve
 from .ALPACA import ALPACA
 from skimage import exposure
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    subject_transaction,
+    atomic_nib_save,
+    atomic_write_json,
+    atomic_copy,
+)
 # Set the number of threads for ITK to utilize
 os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(psutil.cpu_count(logical=True))
 import ants
@@ -70,6 +77,7 @@ from .linkedScans import filter_out_linked_children
 from .coordinateFrames import (
     is_preserved_mesh_metadata,
     load_extracted_scan_metadata,
+    list_extracted_scan_names,
     partition_voxel_and_preserved_mesh_scans,
     voxel_only_all_meshes_message,
     voxel_only_no_eligible_targets_message,
@@ -265,9 +273,7 @@ def has_elastic_registration(scan_name, directory):
             metadata = json.load(jf)
             if metadata.get('reference', False):
                 # Check if there are any elastic_to in the json metadata on any of the subjects on the project matching the scan_name
-                for subject in os.listdir(os.path.join(directory, "extracted")):
-                    if subject == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", subject)):
-                        continue
+                for subject in list_extracted_scan_names(directory):
                     json_path = os.path.join(directory, "extracted", subject, f"{subject}.json")
                     with open(json_path, 'r') as jf:
                         metadata = json.load(jf)
@@ -866,9 +872,7 @@ class DenoiseAllScansView(APIView):
         
         # Make a list of faulty files
         faulty_files = []
-        for file in os.listdir(os.path.join(directory, "extracted")):
-            if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                continue
+        for file in list_extracted_scan_names(directory, log_prefix="DenoiseAllScans"):
             json_path = os.path.join(directory, "extracted", file, f"{file}.json")
             with open(json_path, 'r') as jf:
                 metadata = json.load(jf)
@@ -876,8 +880,7 @@ class DenoiseAllScansView(APIView):
                     faulty_files.append(file)
         
         # Find all unique scan names
-        scan_names = [d for d in os.listdir(os.path.join(directory, "extracted")) 
-                     if os.path.isdir(os.path.join(directory, "extracted", d)) and d not in faulty_files]
+        scan_names = [d for d in list_extracted_scan_names(directory) if d not in faulty_files]
 
         if onlyCurrentScan and selectedScan:
             try:
@@ -970,161 +973,165 @@ class DenoiseAllScansView(APIView):
         for idx, scan_name in enumerate(scan_names):
             try:
                 # Update progress
-                if channel_layer is not None:
-                    progress = idx / total_scans
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Denoising {scan_name} using {algorithm}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'denoise'):
+                    if channel_layer is not None:
+                        progress = idx / total_scans
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Denoising {scan_name} using {algorithm}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
                 
-                print(f"Processing {scan_name} ({idx+1}/{total_scans})")
+                    print(f"Processing {scan_name} ({idx+1}/{total_scans})")
                 
-                # Find the latest edit for this scan
-                latest_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                    latest_edit += 1
-                latest_edit -= 1
+                    # Find the latest edit for this scan
+                    latest_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                        latest_edit += 1
+                    latest_edit -= 1
                 
-                # Load the scan data
-                if latest_edit >= 0:
-                    scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
-                else:
-                    scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
-                
-                # Load metadata
-                with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
-                    scan_metadata = json.load(jf)
-                
-                # Load the scan
-                time_start = time.time()
-                nifti_img = nib.load(scan_path)
-                original_dtype = nifti_img.get_data_dtype()
-                scan_data = nifti_img.get_fdata().astype(original_dtype)
-                scan_affine = nifti_img.affine
-                time_end = time.time()
-                print(f"Time taken to load {scan_name}: {time_end - time_start} seconds")
-                
-                # Apply denoising algorithm
-                time_start = time.time()
-                if algorithm == 'Gaussian':
-                    denoised_data = self.denoise_gaussian(scan_data, parameters.get('sigma', 1.0), parameters.get('truncate', 4.0))
-                elif algorithm == 'Median':
-                    denoised_data = self.denoise_median(scan_data)
-
-                elif algorithm == 'NonLocalMeans':
-                    denoised_data = self.denoise_nl_means_module(scan_data,
-                                                         parameters.get('h', 0.1),
-                                                         parameters.get('template_size', 7),
-                                                         parameters.get('search_size', 21),
-                                                         split=True,
-                                                         mode=parameters.get('mode', "2.5D"))
-                elif algorithm == 'TotalVariationChambolle':
-                    denoised_data = self.denoise_tv_chambolle(scan_data,
-                                                             parameters.get('weight', 0.1),
-                                                             parameters.get('eps', 0.002),
-                                                             parameters.get('max_num_iter', 200))
-                elif algorithm == 'TotalVariationBregman':
-                    denoised_data = self.denoise_tv_bregman(scan_data,
-                                                           parameters.get('weight', 0.1),
-                                                           parameters.get('eps', 0.002),
-                                                           parameters.get('max_num_iter', 200))
-                elif algorithm == 'Wavelet':
-                    denoised_data = self.denoise_wavelet(scan_data,
-                                                        parameters.get('wavelet', 'db1'),
-                                                        parameters.get('level', 1),
-                                                        parameters.get('sigma', 0.1))
-                elif algorithm == 'Butterworth':
-                    denoised_data = self.denoise_butterworth(scan_data,
-                                                            parameters.get('cutoff', 0.05),
-                                                            parameters.get('order', 2),
-                                                            parameters.get('high_pass', True),
-                                                            parameters.get('squared_butterworth', False))
-                else:
-                    raise ValueError(f"Unknown algorithm: {algorithm}")
-                
-                time_end = time.time()
-                print(f"Time taken to denoise {scan_name}: {time_end - time_start} seconds")
-                
-                # Determine the next edit number
-                new_edit_number = latest_edit + 1
-                
-                # Save the denoised scan
-                output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit_number}_denoised.nii.gz")
-                output_img = nib.Nifti1Image(denoised_data.astype(original_dtype), scan_affine)
-                nib.save(output_img, output_path)
-                print(f"Saved denoised scan to: {output_path}")
-                
-                # Save lossy version using proper compression method
-                lossy_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit_number}_denoised.nii.gz")
-                registration_tools = RegistrationTools()
-                json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
-                registration_tools.save_as_lossy_nifti(
-                    denoised_data.astype(original_dtype),
-                    scan_metadata['voxel_size'],
-                    json_path,
-                    lossy_path
-                )
-                print(f"Saved lossy version to: {lossy_path}")
-
-                # Persist denoise provenance on subject JSON
-                try:
-                    with open(json_path, 'r') as jf:
-                        _meta = json.load(jf)
-                    _meta['denoise_settings'] = build_denoise_settings(algorithm, parameters)
-                    with open(json_path, 'w') as jf:
-                        json.dump(_meta, jf, indent=4)
-                except Exception as meta_err:
-                    print(f"  Warning: could not save denoise_settings: {meta_err}")
-                
-                # Copy mask files if they exist
-                src_mask_full = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.mask.gz"))
-                src_mask_lossy = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{latest_edit}_*.nii.mask.gz"))
-                if src_mask_full:
-                    dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit_number}_denoised.nii.mask.gz")
-                    shutil.copy(src_mask_full[0], dst_mask_full)
-
-                if src_mask_lossy:
-                    dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit_number}_denoised.nii.mask.gz")
-                    shutil.copy(src_mask_lossy[0], dst_mask_lossy)
-                    
-
-                
-                # Copy paired landmark files (non-geometry change) if they exist
-                try:
+                    # Load the scan data
                     if latest_edit >= 0:
-                        source_landmark_base = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0].replace('.nii.gz', '')
+                        scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
                     else:
-                        source_landmark_base = scan_name
-                    
-                    source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
-                    source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
-                    
-                    dest_landmark_base = f"{scan_name}_edit_{new_edit_number}_denoised"
-                    dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
-                    dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
-                    
-                    if os.path.isfile(source_landmarks_path):
-                        shutil.copyfile(source_landmarks_path, dest_landmarks_path)
-                        print(f"  Copied landmarks to: {dest_landmarks_path}")
-                    
-                    if os.path.isfile(source_distances_path):
-                        shutil.copyfile(source_distances_path, dest_distances_path)
-                        print(f"  Copied landmark distances to: {dest_distances_path}")
-                except Exception as le:
-                    print(f"  Error handling paired landmark files (denoised): {le}")
-
-                updated_scans.append(scan_name)
+                        scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
                 
-                # Clean up
-                del scan_data, denoised_data, nifti_img
-                gc.collect()
+                    # Load metadata
+                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
+                        scan_metadata = json.load(jf)
+                
+                    # Load the scan
+                    time_start = time.time()
+                    nifti_img = nib.load(scan_path)
+                    original_dtype = nifti_img.get_data_dtype()
+                    scan_data = nifti_img.get_fdata().astype(original_dtype)
+                    scan_affine = nifti_img.affine
+                    time_end = time.time()
+                    print(f"Time taken to load {scan_name}: {time_end - time_start} seconds")
+                
+                    # Apply denoising algorithm
+                    time_start = time.time()
+                    if algorithm == 'Gaussian':
+                        denoised_data = self.denoise_gaussian(scan_data, parameters.get('sigma', 1.0), parameters.get('truncate', 4.0))
+                    elif algorithm == 'Median':
+                        denoised_data = self.denoise_median(scan_data)
+
+                    elif algorithm == 'NonLocalMeans':
+                        denoised_data = self.denoise_nl_means_module(scan_data,
+                                                             parameters.get('h', 0.1),
+                                                             parameters.get('template_size', 7),
+                                                             parameters.get('search_size', 21),
+                                                             split=True,
+                                                             mode=parameters.get('mode', "2.5D"))
+                    elif algorithm == 'TotalVariationChambolle':
+                        denoised_data = self.denoise_tv_chambolle(scan_data,
+                                                                 parameters.get('weight', 0.1),
+                                                                 parameters.get('eps', 0.002),
+                                                                 parameters.get('max_num_iter', 200))
+                    elif algorithm == 'TotalVariationBregman':
+                        denoised_data = self.denoise_tv_bregman(scan_data,
+                                                               parameters.get('weight', 0.1),
+                                                               parameters.get('eps', 0.002),
+                                                               parameters.get('max_num_iter', 200))
+                    elif algorithm == 'Wavelet':
+                        denoised_data = self.denoise_wavelet(scan_data,
+                                                            parameters.get('wavelet', 'db1'),
+                                                            parameters.get('level', 1),
+                                                            parameters.get('sigma', 0.1))
+                    elif algorithm == 'Butterworth':
+                        denoised_data = self.denoise_butterworth(scan_data,
+                                                                parameters.get('cutoff', 0.05),
+                                                                parameters.get('order', 2),
+                                                                parameters.get('high_pass', True),
+                                                                parameters.get('squared_butterworth', False))
+                    else:
+                        raise ValueError(f"Unknown algorithm: {algorithm}")
+                
+                    time_end = time.time()
+                    print(f"Time taken to denoise {scan_name}: {time_end - time_start} seconds")
+                
+                    # Determine the next edit number
+                    new_edit_number = latest_edit + 1
+                
+                    # Save the denoised scan
+                    output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit_number}_denoised.nii.gz")
+                    output_img = nib.Nifti1Image(denoised_data.astype(original_dtype), scan_affine)
+                    atomic_nib_save(output_img, output_path)
+                    print(f"Saved denoised scan to: {output_path}")
+                
+                    # Save lossy version using proper compression method
+                    lossy_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit_number}_denoised.nii.gz")
+                    registration_tools = RegistrationTools()
+                    json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
+                    registration_tools.save_as_lossy_nifti(
+                        denoised_data.astype(original_dtype),
+                        scan_metadata['voxel_size'],
+                        json_path,
+                        lossy_path
+                    )
+                    print(f"Saved lossy version to: {lossy_path}")
+
+                    # Persist denoise provenance on subject JSON
+                    try:
+                        with open(json_path, 'r') as jf:
+                            _meta = json.load(jf)
+                        _meta['denoise_settings'] = build_denoise_settings(algorithm, parameters)
+                        atomic_write_json(json_path, _meta, indent=4)
+                    except Exception as meta_err:
+                        print(f"  Warning: could not save denoise_settings: {meta_err}")
+                
+                    # Copy mask files if they exist
+                    src_mask_full = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.mask.gz"))
+                    src_mask_lossy = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{latest_edit}_*.nii.mask.gz"))
+                    if src_mask_full:
+                        dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit_number}_denoised.nii.mask.gz")
+                        atomic_copy(src_mask_full[0], dst_mask_full)
+
+                    if src_mask_lossy:
+                        dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit_number}_denoised.nii.mask.gz")
+                        atomic_copy(src_mask_lossy[0], dst_mask_lossy)
+                    
+
+                
+                    # Copy paired landmark files (non-geometry change) if they exist
+                    try:
+                        if latest_edit >= 0:
+                            source_landmark_base = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0].replace('.nii.gz', '')
+                        else:
+                            source_landmark_base = scan_name
+                    
+                        source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
+                        source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
+                    
+                        dest_landmark_base = f"{scan_name}_edit_{new_edit_number}_denoised"
+                        dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
+                        dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
+                    
+                        if os.path.isfile(source_landmarks_path):
+                            atomic_copy(source_landmarks_path, dest_landmarks_path)
+                            print(f"  Copied landmarks to: {dest_landmarks_path}")
+                    
+                        if os.path.isfile(source_distances_path):
+                            atomic_copy(source_distances_path, dest_distances_path)
+                            print(f"  Copied landmark distances to: {dest_distances_path}")
+                    except Exception as le:
+                        print(f"  Error handling paired landmark files (denoised): {le}")
+
+                    updated_scans.append(scan_name)
+                
+                    # Clean up
+                    del scan_data, denoised_data, nifti_img
+                    gc.collect()
                 
             except Exception as e:
                 error_msg = f"Error processing {scan_name}: {str(e)}"

@@ -146,6 +146,14 @@ def latest_edit_stem(directory, scan_name):
     return stem
 
 
+def has_link_partners(directory, scan_name):
+    """True when scan_name belongs to a link group with at least one other member."""
+    try:
+        return get_link_group(directory, scan_name) is not None
+    except Exception:
+        return False
+
+
 def get_same_shape_siblings(directory, source_name, member_names=None):
     """
     Return members of the link group (excluding source) that share source's full-res dims.

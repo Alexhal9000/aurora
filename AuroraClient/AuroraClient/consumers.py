@@ -31,6 +31,7 @@ class ProgressConsumer(AsyncWebsocketConsumer):
             'val_metrics',
             'best_checkpoint',
             'run_status',
+            'timing',  # 'elapsed': staged tool, show time elapsed instead of an ETA
         ):
             if extra_key in event:
                 payload[extra_key] = event[extra_key]

@@ -50,6 +50,13 @@ from .meshBasedTools import (
     preserved_mesh_reference_in_shared_mm,
     try_load_cached_preserved_mesh_display_geometry,
 )
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    atomic_write_json,
+    atomic_np_savez,
+    atomic_np_save,
+    atomic_write_text,
+)
 
 alpaca = ALPACA()
 
@@ -350,10 +357,14 @@ def _rebuild_capped_voxel_display_from_volume(
     return _decimate_trimesh_to_vertex_cap(mesh, int(vertex_cap))
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _persist_voxel_display_geometry(vertices_path, faces_path, vertices, faces):
     try:
-        np.savez(vertices_path, vertices=vertices)
-        np.savez(faces_path, faces=faces)
+        atomic_np_savez(vertices_path, vertices=vertices)
+        atomic_np_savez(faces_path, faces=faces)
         print(f"Wrote capped display mesh NPZ: {vertices_path}")
     except Exception as exc:
         print(f"Warning: could not write display mesh NPZ: {exc}")
@@ -1082,6 +1093,10 @@ def strip_response_payload(full_data: dict) -> dict:
     }
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def remap_cached_data_to_new_topology(
     cached_data: dict,
     vertices: np.ndarray,
@@ -1137,8 +1152,7 @@ def remap_cached_data_to_new_topology(
             cached_data["subject_distances"]["average"] = avg.tolist()
 
     cached_data = convert_to_json_serializable(cached_data)
-    with open(cache_file_path, "w") as cf:
-        cf.write(json.dumps(cached_data))
+    atomic_write_text(cache_file_path, json.dumps(cached_data))
     save_display_sidecar_cache(cache_file_path, cached_data)
     return cached_data
 
@@ -1148,13 +1162,18 @@ def display_sidecar_path(cache_file_path: str) -> str:
     return cache_file_path.replace(".json", "_display.npz")
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def save_display_sidecar_cache(cache_file_path: str, response_data_full: dict) -> None:
     sidecar = display_sidecar_path(cache_file_path)
     distances = np.asarray(response_data_full["distances"], dtype=np.float32)
     coordinates = np.asarray(response_data_full["coordinates"], dtype=np.float32)
     metric_id = str(response_data_full.get("metric", FALLBACK_HEATMAP_METRIC))
-    np.savez_compressed(
+    atomic_np_savez(
         sidecar,
+        compressed=True,
         distances=distances,
         coordinates=coordinates,
         n_vertices_total=int(response_data_full["n_vertices_total"]),
@@ -1329,6 +1348,10 @@ def _send_progress(total: int, scan_name: str, message: str, current: int):
     )
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def compute_registration_heatmap(
     directory: str,
     filename: str,
@@ -1480,8 +1503,7 @@ def compute_registration_heatmap(
 
     print(f"Saving FULL registration heatmap cache to: {ctx.cache_file_path}")
     os.makedirs(os.path.dirname(ctx.cache_file_path), exist_ok=True)
-    with open(ctx.cache_file_path, "w") as cf:
-        json.dump(response_data_full, cf, indent=2)
+    atomic_write_json(ctx.cache_file_path, response_data_full, indent=2)
     if not ctx.full_resolution:
         save_display_sidecar_cache(ctx.cache_file_path, response_data_full)
 
@@ -1836,6 +1858,10 @@ def _map_to_display(base, key, meta, display_vertices):
     }
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def compute_settings_registration_heatmap(
     directory: str,
     filename: str,
@@ -1915,8 +1941,8 @@ def compute_settings_registration_heatmap(
     average = np.nan_to_num(np.mean(per_subject.astype(np.float64), axis=1), nan=0, posinf=0, neginf=0)
 
     os.makedirs(os.path.dirname(paths["meta"]), exist_ok=True)
-    np.savez(paths["surface"], coords=surface["coords"].astype(np.float32), average=average)
-    np.save(paths["subjects"], per_subject)
+    atomic_np_savez(paths["surface"], coords=surface["coords"].astype(np.float32), average=average)
+    atomic_np_save(paths["subjects"], per_subject)
     meta = {
         "key": key,
         "settings": settings,
@@ -1928,8 +1954,7 @@ def compute_settings_registration_heatmap(
         "computed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "compute_seconds": round(time.time() - started, 1),
     }
-    with open(paths["meta"], "w") as jf:
-        json.dump(meta, jf, indent=2)
+    atomic_write_json(paths["meta"], meta, indent=2)
     _prune_settings_caches(base)
     print(f"Saved settings heatmap cache {key}: {len(names)} subjects, {len(average):,} vertices")
     return _map_to_display(base, key, meta, display_vertices)

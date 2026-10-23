@@ -15,7 +15,6 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 
-from django.contrib import admin
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from pipeline.views import *
@@ -42,6 +41,15 @@ from pipeline.aiFineTuning.api import (
 
 
 from pipeline.spaViews import SpaIndexView, SpaAssetView
+from pipeline.engineAuth import (
+    EngineAuthEndView,
+    EngineAuthHeartbeatView,
+    EngineAuthStartView,
+    EngineAuthStatusView,
+    EngineAuthTakeOverView,
+    EngineJobsView,
+)
+from pipeline.engineSharing import EngineSharingView
 from pipeline.staticMediaViews import StaticMediaView
 from pipeline.aiModels.foundation_views import (
     FoundationModelCancelView,
@@ -51,7 +59,15 @@ from pipeline.aiModels.foundation_views import (
 
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
+    # No /admin/: the engine has no Django users, and the login form would only be an
+    # extra surface. Engine access is the lab-signed session below.
+    path('engine-auth/start/', EngineAuthStartView.as_view(), name='engine_auth_start'),
+    path('engine-auth/status/', EngineAuthStatusView.as_view(), name='engine_auth_status'),
+    path('engine-auth/end/', EngineAuthEndView.as_view(), name='engine_auth_end'),
+    path('engine-auth/heartbeat/', EngineAuthHeartbeatView.as_view(), name='engine_auth_heartbeat'),
+    path('engine-auth/take-over/', EngineAuthTakeOverView.as_view(), name='engine_auth_take_over'),
+    path('engine-jobs/', EngineJobsView.as_view(), name='engine_jobs'),
+    path('engine-sharing/', EngineSharingView.as_view(), name='engine_sharing'),
     path('upload/', FileUploadView.as_view(), name='upload_file'),
     path('list-directories/', ListDirectoriesView.as_view(), name='list_directories'),
     path('quick-access-paths/', QuickAccessPathsView.as_view(), name='quick_access_paths'),
@@ -59,6 +75,8 @@ urlpatterns = [
     path('copy-folder/', FileCopyView.as_view(), name='create_folder'), 
     path('get-data-size-directory/', getDataSizeDirectoryView.as_view(), name='get_data_size_directory'),
     path('get-grid-view/', GetGridView.as_view(), name='get_grid_view'),
+    # Several scans per request, built in parallel worker processes (pipeline/gridPreviewWorker.py).
+    path('get-grid-view-batch/', GetGridViewBatch.as_view(), name='get_grid_view_batch'),
     path('projection-png/', ProjectionPngView.as_view(), name='projection_png'),
     path('ensure-quick-grid-projections/', EnsureQuickGridProjectionPngsView.as_view(), name='ensure_quick_grid_projections'),
     path('extract-scans-preflight/', ExtractScansPreflightView.as_view(), name='extract_scans_preflight'),
@@ -174,6 +192,7 @@ urlpatterns = [
     path('export-landmark-distances/', ExportLandmarkDistancesView.as_view(), name='export_landmark_distances'),
     path('export-landmarks-bundle/', ExportLandmarksBundleView.as_view(), name='export_landmarks_bundle'),
     path('export-landmarks-json/', ExportLandmarksJsonView.as_view(), name='export_landmarks_json'),
+    path('export-landmarks-scale-info/', LandmarkExportScaleInfoView.as_view(), name='export_landmarks_scale_info'),
     path('list-mask-folders/', ListMaskFoldersView.as_view(), name='list_mask_folders'),
     path('apply-mask-to-image/', ApplyMaskToImageView.as_view(), name='apply_mask_to_image'),
     path('batch-apply-mask-to-scans/', BatchApplyMaskToScansView.as_view(), name='batch_apply_mask_to_scans'),

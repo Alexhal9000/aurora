@@ -23,6 +23,13 @@ from rest_framework import status
 import pygltflib
 
 from .preprocessingTools import cleanup_memory
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    crash_safe_view,
+    request_subjects,
+    atomic_nib_save,
+    load_nifti_readonly,
+)
 
 
 def _load_volume_and_meta(directory, filename, edit, full_resolution):
@@ -261,6 +268,14 @@ def _vertices_faces_to_glb_base64(vertices, faces):
 
 class EdgeDetectionView(APIView):
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('edge_detection', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -368,6 +383,10 @@ class EdgeDetectionView(APIView):
             'center': center,
         })
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _save_mask(self, filled, nii_img, meta, scan_folder, filename,
                    edit, full_resolution, force_new_label):
         """Save filled binary mask as segmentation (new label or new file)."""
@@ -384,7 +403,6 @@ class EdgeDetectionView(APIView):
             mask_base = filename if full_resolution else f"{filename}_lossy"
 
         mask_path = os.path.join(scan_folder, f"{mask_base}.nii.mask.gz")
-        mask_temp_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
 
         mask_exists = os.path.isfile(mask_path)
 
@@ -392,29 +410,20 @@ class EdgeDetectionView(APIView):
             return Response({'mask_already_exists': True}, status=status.HTTP_200_OK)
 
         if mask_exists:
-            os.replace(mask_path, mask_temp_path)
-            try:
-                existing_img = nib.load(mask_temp_path)
-                # Round before astype to avoid truncating floats
-                existing_array = np.round(existing_img.get_fdata()).astype(np.uint8)
-                new_label = int(existing_array.max()) + 1
-                new_array = existing_array.copy()
-                new_array[filled] = new_label
-                save_img = nib.Nifti1Image(new_array, existing_img.affine, existing_img.header)
-            except Exception:
-                if os.path.isfile(mask_temp_path):
-                    try:
-                        os.replace(mask_temp_path, mask_path)
-                    except OSError:
-                        pass
-                raise
+            # Read in place (crash-safe rule 2): the mask is never renamed to be read.
+            existing_img = load_nifti_readonly(mask_path)
+            # Round before astype to avoid truncating floats
+            existing_array = np.round(existing_img.get_fdata()).astype(np.uint8)
+            new_label = int(existing_array.max()) + 1
+            new_array = existing_array.copy()
+            new_array[filled] = new_label
+            save_img = nib.Nifti1Image(new_array, existing_img.affine, existing_img.header)
         else:
             new_label = 1
             new_array = filled.astype(np.uint8)
             save_img = nib.Nifti1Image(new_array, nii_img.affine, nii_img.header)
 
-        nib.save(save_img, mask_temp_path)
-        os.replace(mask_temp_path, mask_path)
+        atomic_nib_save(save_img, mask_path)
 
         self._write_companion_mask(
             new_array, nii_img, meta, scan_folder, filename, edit,
@@ -423,6 +432,10 @@ class EdgeDetectionView(APIView):
 
         return Response({'message': 'Mask saved.', 'label': new_label}, status=status.HTTP_200_OK)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _write_companion_mask(self, mask_array, nii_img, meta, scan_folder, filename, edit,
                               full_resolution, mask_base):
         """Write the mask at the other resolution (full <-> lossy) for consistency."""
@@ -442,7 +455,6 @@ class EdgeDetectionView(APIView):
             other_mask = zoom(mask_array.astype(np.float32), zoom_factors, order=0).astype(np.uint8)
             other_mask_path = os.path.join(scan_folder, f"{other_base}.nii.mask.gz")
             other_temp = other_mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-            nib.save(nib.Nifti1Image(other_mask, other_img.affine, other_img.header), other_temp)
-            os.replace(other_temp, other_mask_path)
+            atomic_nib_save(nib.Nifti1Image(other_mask, other_img.affine, other_img.header), other_mask_path)
         except Exception as e:
             print(f"Warning: could not write companion mask: {e}")

@@ -24,6 +24,9 @@ from .registrationTools import (
     _projection_back_file,
     save_projection_png,
 )
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import atomic_mesh_export
+
 
 QUADRANT_RENDER_SIZE = 512
 PROJECTION_RENDER_SIZE = 768
@@ -713,6 +716,10 @@ class PreservedMeshEditWriter:
         """Export ``mesh`` to ``output_path`` and write front/back projection PNGs."""
         return cls(mesh, output_path).write()
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def write(self):
         output_path = os.path.abspath(self.output_path)
         output_dir = os.path.dirname(output_path)
@@ -721,7 +728,7 @@ class PreservedMeshEditWriter:
         # Face / surface PLYs must share vertex indices along edges so downstream
         # tools see one connected surface rather than a triangle soup.
         self.mesh = ensure_welded_trimesh(self.mesh)
-        self.mesh.export(output_path, file_type='ply')
+        atomic_mesh_export(self.mesh, output_path, file_type='ply')
         ensure_mesh_projection_pngs(output_path, force=True)
         return output_path
 

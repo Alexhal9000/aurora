@@ -13,6 +13,12 @@ import os
 from typing import Any, Optional
 
 import numpy as np
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    atomic_write_json,
+    atomic_np_savez,
+    atomic_write_bytes,
+)
 
 
 def _figures_cache_dir(directory: str) -> str:
@@ -99,6 +105,10 @@ def load_figure_mesh_cache(
         return None
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def save_figure_mesh_cache(
     directory: str,
     figure_id: str,
@@ -119,14 +129,12 @@ def save_figure_mesh_cache(
     meta = dict(meta or {})
     meta['figure_id'] = sanitize_figure_id(figure_id)
     meta['n_vertices'] = int(len(verts))
-    np.savez(npz_path, vertices=verts, faces=fac, distances=dist)
-    with open(meta_path, 'w', encoding='utf-8') as mf:
-        json.dump(meta, mf, indent=2)
+    atomic_np_savez(npz_path, vertices=verts, faces=fac, distances=dist)
+    atomic_write_json(meta_path, meta, indent=2, encoding='utf-8')
     if isinstance(gltf, str) and gltf.strip():
         glb_path = figure_mesh_glb_path(directory, figure_id)
         try:
-            with open(glb_path, 'wb') as gf:
-                gf.write(base64.b64decode(gltf))
+            atomic_write_bytes(glb_path, base64.b64decode(gltf))
         except (OSError, ValueError):
             pass
     return npz_path

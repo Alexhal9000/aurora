@@ -15,6 +15,7 @@ import sys
 from datetime import datetime, timezone
 
 
+
 def read_aurora_version() -> str:
     """Best-effort installed Aurora version (same locations as GetVersionView)."""
     version_paths = []

@@ -51,8 +51,10 @@ from pydicom import dcmread
 
 from .ALPACA import ALPACA
 from .registrationTools import RegistrationTools
+from . import antsWorker  # ANTs registrations run in a worker process (engine stays responsive)
 from .meshGridTools import PreservedMeshEditWriter, strip_ephemeral_scan_metadata
 from .coordinateFrames import (
+    list_extracted_scan_names,
     mesh_centroid_local_to_reference_prism_mm,
     mesh_local_to_shared_mm,
     mesh_reference_prism_corner_mm,
@@ -63,6 +65,16 @@ from .smartLandmarking import SmartLandmarkingView
 from .preprocessingTools import *
 
 import matplotlib
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    crash_safe_view,
+    request_subjects,
+    subject_transaction,
+    atomic_nib_save,
+    atomic_write_json,
+    atomic_copy,
+    load_nifti_readonly,
+)
 matplotlib.use('Agg') # Use non-interactive backend suitable for web servers
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D # Required for 3D plotting
@@ -175,9 +187,7 @@ def has_elastic_registration(scan_name, directory):
             metadata = json.load(jf)
             if metadata.get('reference', False):
                 # Check if there are any elastic_to in the json metadata on any of the subjects on the project matching the scan_name
-                for subject in os.listdir(os.path.join(directory, "extracted")):
-                    if subject == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", subject)):
-                        continue
+                for subject in list_extracted_scan_names(directory):
                     json_path = os.path.join(directory, "extracted", subject, f"{subject}.json")
                     if os.path.isfile(json_path):  # Safety check
                         with open(json_path, 'r') as jf:
@@ -892,6 +902,10 @@ def ants_origin_for_canvas_paste(reference_origin, reference_direction, paste_at
     return origin - direction @ (paste_at * spacing)
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def compute_and_save_landmark_distances(
     scan_dir,
     scan_name,
@@ -1007,8 +1021,7 @@ def compute_and_save_landmark_distances(
         'snap_distance': snap_list,
     }
     distances_path = os.path.join(scan_dir, f'{distances_basename}_landmark_distances.json')
-    with open(distances_path, 'w') as jf:
-        json.dump(distances_dict, jf, indent=4)
+    atomic_write_json(distances_path, distances_dict, indent=4)
 
     if update_landmarks_metadata:
         metadata['landmarks'] = {
@@ -1025,8 +1038,7 @@ def compute_and_save_landmark_distances(
         }
 
     # Persist any old_thresholds backfill from ensure_old_thresholds.
-    with open(json_path, 'w') as jf:
-        json.dump(metadata, jf, indent=4)
+    atomic_write_json(json_path, metadata, indent=4)
 
     del nifti_data, nifti_img, vertices, faces
     cleanup_memory()
@@ -2193,6 +2205,7 @@ def _write_ants_rigid_mat(R, t, out_path=None):
     if out_path is None:
         fd, out_path = tempfile.mkstemp(suffix=".mat")
         os.close(fd)
+        antsWorker.track_temp_output(out_path)  # removed when the alignment request ends
     tx = ants.create_ants_transform(
         transform_type="AffineTransform",
         precision="float",
@@ -3388,6 +3401,10 @@ class AlignToReferenceView(APIView):
             "reference_vertices_local": reference_vertices_local,
         }
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _save_preserved_aligned_mesh(
         self,
         directory,
@@ -3436,14 +3453,12 @@ class AlignToReferenceView(APIView):
             "is_watertight": bool(aligned_mesh.is_watertight),
         }
         strip_ephemeral_scan_metadata(scan_metadata)
-        with open(os.path.join(base_path, f"{scan_name}.json"), "w") as jf:
-            json.dump(scan_metadata, jf, indent=4)
+        atomic_write_json(os.path.join(base_path, f"{scan_name}.json"), scan_metadata, indent=4)
 
         edit_stem = f"{scan_name}_edit_{new_edit_number}_aligned"
         if transformed_guidepoints is not None:
             guidepoints_path = os.path.join(base_path, f"{edit_stem}_guidepoints.json")
-            with open(guidepoints_path, "w") as jf:
-                json.dump(np.asarray(transformed_guidepoints, dtype=np.float64).tolist(), jf, indent=4)
+            atomic_write_json(guidepoints_path, np.asarray(transformed_guidepoints, dtype=np.float64).tolist(), indent=4)
             print(f"Saved aligned preserved-mesh guidepoints: {guidepoints_path}")
         return new_edit_number, output_path
 
@@ -3537,6 +3552,10 @@ class AlignToReferenceView(APIView):
             }
 
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def transform_landmarks_after_alignment(self, directory, scan_name, latest_edit, new_edit_number,
                                             voxel_size, scan_metadata, method):
         """
@@ -3585,8 +3604,7 @@ class AlignToReferenceView(APIView):
                 dest_landmarks_path = os.path.join(
                     directory, "extracted", scan_name, f"{new_landmark_base}_landmarks.json"
                 )
-                with open(dest_landmarks_path, 'w') as jf:
-                    json.dump(transformed_landmarks, jf, indent=4)
+                atomic_write_json(dest_landmarks_path, transformed_landmarks, indent=4)
                 print(f"Saved aligned landmarks: {dest_landmarks_path}")
 
                 scan_dir = os.path.join(directory, "extracted", scan_name)
@@ -3609,7 +3627,7 @@ class AlignToReferenceView(APIView):
                         dest_landmark_distances_path = os.path.join(
                             directory, "extracted", scan_name, f"{new_landmark_base}_landmark_distances.json"
                         )
-                        shutil.copy(source_landmark_distances_paths[0], dest_landmark_distances_path)
+                        atomic_copy(source_landmark_distances_paths[0], dest_landmark_distances_path)
                         print(f"Copied landmark distances: {dest_landmark_distances_path}")
             else:
                 print(f"No landmarks remained for {scan_name} after alignment")
@@ -3877,6 +3895,9 @@ class AlignToReferenceView(APIView):
             # If all background values are at minimum, return minimum
             return min_value
 
+    # ANTs temp files of this request (run folders, loose .mat/.nii.gz) are removed
+    # when it returns or fails, even on error paths (see antsWorker.temp_scoped).
+    @antsWorker.temp_scoped
     def post(self, request):
         print("Aligning to reference scan")
         directory = request.data['directory']
@@ -3931,10 +3952,7 @@ class AlignToReferenceView(APIView):
 
         # Make a list of faulty files
         faulty_files = []
-        for file in os.listdir(os.path.join(directory, "extracted")):
-            # Skip project_settings.json file
-            if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                continue
+        for file in list_extracted_scan_names(directory, log_prefix="AlignToReference"):
             if file != reference:
                 json_path = os.path.join(directory, "extracted", file, f"{file}.json")
                 with open(json_path, 'r') as jf:
@@ -3943,8 +3961,7 @@ class AlignToReferenceView(APIView):
                         faulty_files.append(file)
         
         # Find all unique scan names by listing subdirectories in extracted folder
-        scan_names = [d for d in os.listdir(os.path.join(directory, "extracted")) 
-                     if os.path.isdir(os.path.join(directory, "extracted", d)) and d not in faulty_files]
+        scan_names = [d for d in list_extracted_scan_names(directory) if d not in faulty_files]
 
         scan_names.sort()
         
@@ -4250,629 +4267,565 @@ class AlignToReferenceView(APIView):
         # -------------------------------------- Process each scan --------------------------------------
         for idx, scan_name in enumerate(scan_names):
             try:
-                ants_initializer_record = None
-                gpu_initializer_record = None
-                dino_reg_result = None
-                print(f"Processing scan {idx + 1}/{total_scans}: {scan_name}")
-                scale_match = 1.0
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'align_to_reference', linked=propagate_linked):
+                    ants_initializer_record = None
+                    gpu_initializer_record = None
+                    dino_reg_result = None
+                    print(f"Processing scan {idx + 1}/{total_scans}: {scan_name}")
+                    scale_match = 1.0
 
-                # Find the latest edit for this scan. For voxel subjects the
-                # existing NIfTI path below still uses latest NIfTI edits; for
-                # preserved meshes this stem points to the latest PLY edit.
-                latest_edit, latest_edit_stem = self._latest_any_edit_stem(directory, scan_name)
+                    # Find the latest edit for this scan. For voxel subjects the
+                    # existing NIfTI path below still uses latest NIfTI edits; for
+                    # preserved meshes this stem points to the latest PLY edit.
+                    latest_edit, latest_edit_stem = self._latest_any_edit_stem(directory, scan_name)
 
 
-                # Send progress update 
-                channel_layer = get_channel_layer()
-                if channel_layer is not None:
-                    progress = ((idx+(0/9)) / total_scans)
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Extracting properties of {scan_name}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
-                    print("Extracting properties of ", scan_name)
-
-                # Check available memory
-                remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
-                print(f"Available memory: {remaining_memory:.2f} GB")
-
-                # Load the scan's metadata
-                scan_metadata = metadata_by_scan.get(scan_name) or self._load_subject_metadata(directory, scan_name)
-
-                # Already-aligned link main kept only so unaligned children can inherit
-                # the stored rigid transform — do not re-run ALPACA/ANTs on the main.
-                if scan_name in propagate_only_scans:
-                    print(f"Catch-up linked propagation for already-aligned {scan_name}")
-                    if method.lower() != 'alpaca':
-                        print(
-                            f"  Linked catch-up currently supports ALPACA only "
-                            f"(got {method}); skipping {scan_name}"
+                    # Send progress update 
+                    channel_layer = get_channel_layer()
+                    if channel_layer is not None:
+                        progress = ((idx+(0/9)) / total_scans)
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Extracting properties of {scan_name}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
                         )
-                        continue
-                    if self._is_preserved_mesh_metadata(scan_metadata):
-                        print(f"  Preserved-mesh catch-up not implemented for {scan_name}")
-                        continue
-                    try:
-                        geom = self._reconstruct_alpaca_propagation_geometry(
-                            directory, scan_name, scan_metadata, reference_shape
-                        )
-                        rotation = geom['rotation']
-                        padding_bottom_val = geom['padding_bottom_val']
-                        padding_top_val = geom['padding_top_val']
-                        translation = geom['translation']
-                        offset = geom['offset']
-                        scale_match = geom['scale_match']
-                        in_start_x, in_end_x = geom['in_start_x'], geom['in_end_x']
-                        in_start_y, in_end_y = geom['in_start_y'], geom['in_end_y']
-                        in_start_z, in_end_z = geom['in_start_z'], geom['in_end_z']
-                        out_start_x, out_end_x = geom['out_start_x'], geom['out_end_x']
-                        out_start_y, out_end_y = geom['out_start_y'], geom['out_end_y']
-                        out_start_z, out_end_z = geom['out_start_z'], geom['out_end_z']
-                    except Exception as catchup_err:
-                        print(f"  Could not reconstruct ALPACA geometry for {scan_name}: {catchup_err}")
-                        linked_propagation_results.append({
-                            'scan_name': scan_name,
-                            'status': 'failed',
-                            'reason': f'catch-up geometry: {catchup_err}',
-                        })
-                        continue
+                        print("Extracting properties of ", scan_name)
 
-                    if propagate_linked:
+                    # Check available memory
+                    remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
+                    print(f"Available memory: {remaining_memory:.2f} GB")
+
+                    # Load the scan's metadata
+                    scan_metadata = metadata_by_scan.get(scan_name) or self._load_subject_metadata(directory, scan_name)
+
+                    # Already-aligned link main kept only so unaligned children can inherit
+                    # the stored rigid transform — do not re-run ALPACA/ANTs on the main.
+                    if scan_name in propagate_only_scans:
+                        print(f"Catch-up linked propagation for already-aligned {scan_name}")
+                        if method.lower() != 'alpaca':
+                            print(
+                                f"  Linked catch-up currently supports ALPACA only "
+                                f"(got {method}); skipping {scan_name}"
+                            )
+                            continue
+                        if self._is_preserved_mesh_metadata(scan_metadata):
+                            print(f"  Preserved-mesh catch-up not implemented for {scan_name}")
+                            continue
                         try:
-                            siblings, sib_err = get_same_shape_siblings(directory, scan_name)
-                            if sib_err:
-                                print(f"Could not resolve siblings for {scan_name}: {sib_err}")
-                            elif siblings:
-                                print(f"Propagating stored alignment from {scan_name} to {len(siblings)} siblings: {siblings}")
-                                for sibling_name in siblings:
-                                    try:
-                                        sib_latest_edit, _ = self._latest_any_edit_stem(directory, sibling_name)
-                                        if sib_latest_edit >= 0:
-                                            sib_edit_files = glob.glob(os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_latest_edit}_*.nii.gz"))
-                                            if sib_edit_files and 'aligned' in os.path.basename(sib_edit_files[0]):
-                                                linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'already aligned'})
+                            geom = self._reconstruct_alpaca_propagation_geometry(
+                                directory, scan_name, scan_metadata, reference_shape
+                            )
+                            rotation = geom['rotation']
+                            padding_bottom_val = geom['padding_bottom_val']
+                            padding_top_val = geom['padding_top_val']
+                            translation = geom['translation']
+                            offset = geom['offset']
+                            scale_match = geom['scale_match']
+                            in_start_x, in_end_x = geom['in_start_x'], geom['in_end_x']
+                            in_start_y, in_end_y = geom['in_start_y'], geom['in_end_y']
+                            in_start_z, in_end_z = geom['in_start_z'], geom['in_end_z']
+                            out_start_x, out_end_x = geom['out_start_x'], geom['out_end_x']
+                            out_start_y, out_end_y = geom['out_start_y'], geom['out_end_y']
+                            out_start_z, out_end_z = geom['out_start_z'], geom['out_end_z']
+                        except Exception as catchup_err:
+                            print(f"  Could not reconstruct ALPACA geometry for {scan_name}: {catchup_err}")
+                            linked_propagation_results.append({
+                                'scan_name': scan_name,
+                                'status': 'failed',
+                                'reason': f'catch-up geometry: {catchup_err}',
+                            })
+                            continue
+
+                        if propagate_linked:
+                            try:
+                                siblings, sib_err = get_same_shape_siblings(directory, scan_name)
+                                if sib_err:
+                                    print(f"Could not resolve siblings for {scan_name}: {sib_err}")
+                                elif siblings:
+                                    print(f"Propagating stored alignment from {scan_name} to {len(siblings)} siblings: {siblings}")
+                                    for sibling_name in siblings:
+                                        try:
+                                            sib_latest_edit, _ = self._latest_any_edit_stem(directory, sibling_name)
+                                            if sib_latest_edit >= 0:
+                                                sib_edit_files = glob.glob(os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_latest_edit}_*.nii.gz"))
+                                                if sib_edit_files and 'aligned' in os.path.basename(sib_edit_files[0]):
+                                                    linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'already aligned'})
+                                                    continue
+                                            if has_elastic_registration(sibling_name, directory):
+                                                linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'elastic registration present'})
                                                 continue
-                                        if has_elastic_registration(sibling_name, directory):
-                                            linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'elastic registration present'})
-                                            continue
-                                        sib_metadata = self._load_subject_metadata(directory, sibling_name)
-                                        if self._is_preserved_mesh_metadata(sib_metadata):
-                                            linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'preserved mesh'})
-                                            continue
-                                        if sib_latest_edit >= 0:
-                                            sib_edit_files = glob.glob(os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_latest_edit}_*.nii.gz"))
-                                            sib_nifti_path = sib_edit_files[0] if sib_edit_files else os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
-                                        else:
-                                            sib_nifti_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
-                                        sib_img = nib.load(sib_nifti_path)
-                                        sib_dtype = sib_img.get_data_dtype()
-                                        sib_data = sib_img.get_fdata().astype(sib_dtype)
-                                        if scale_match != 1:
-                                            sib_data = ndimage.zoom(sib_data, scale_match, order=interpolation_order, mode='constant', cval=0)
-                                        sib_padded = np.pad(
-                                            sib_data.astype(sib_dtype),
-                                            ((padding_bottom_val[0], padding_top_val[0]),
-                                             (padding_bottom_val[1], padding_top_val[1]),
-                                             (padding_bottom_val[2], padding_top_val[2])),
-                                            mode='constant',
-                                            constant_values=0
-                                        ).astype(sib_dtype)
-                                        sib_rotated = np.zeros_like(sib_padded, dtype=sib_dtype)
-                                        ndimage.affine_transform(
-                                            sib_padded, rotation.T, offset=offset, output=sib_rotated,
-                                            output_shape=sib_padded.shape, order=interpolation_order,
-                                            mode='constant', prefilter=False, cval=0
-                                        )
-                                        sib_translated = np.zeros_like(sib_rotated, dtype=sib_dtype)
-                                        ndimage.shift(
-                                            sib_rotated, shift=translation, output=sib_translated,
-                                            order=interpolation_order, mode='constant', cval=0
-                                        )
-                                        sib_transformed = np.zeros_like(reference_data, dtype=sib_dtype)
-                                        sib_transformed[in_start_x:in_end_x, in_start_y:in_end_y, in_start_z:in_end_z] = (
-                                            sib_translated[out_start_x:out_end_x, out_start_y:out_end_y, out_start_z:out_end_z]
-                                        )
-                                        sib_background_value = np.array(0, dtype=sib_transformed.dtype)
-                                        if sib_transformed.shape[0] > 2 * border_width:
-                                            sib_transformed[:border_width, :, :] = sib_background_value
-                                            sib_transformed[-border_width:, :, :] = sib_background_value
-                                        if sib_transformed.shape[1] > 2 * border_width:
-                                            sib_transformed[:, :border_width, :] = sib_background_value
-                                            sib_transformed[:, -border_width:, :] = sib_background_value
-                                        if sib_transformed.shape[2] > 2 * border_width:
-                                            sib_transformed[:, :, :border_width] = sib_background_value
-                                            sib_transformed[:, :, -border_width:] = sib_background_value
-                                        sib_new_edit = sib_latest_edit + 1
-                                        sib_output_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_new_edit}_aligned.nii.gz")
-                                        sib_volume_to_save = self._volume_for_mesh_reference_save(sib_transformed, reference_is_preserved_mesh)
-                                        nib.save(nib.Nifti1Image(sib_volume_to_save, reference_affine_data), sib_output_path)
-                                        sib_metadata['alignment_to'] = reference
-                                        sib_metadata['alignment_shift'] = 0
-                                        sib_metadata['alignment_method'] = method
-                                        if sib_metadata.get('voxel_size') is not None:
-                                            sib_metadata['alignment_previous_voxel_size'] = sib_metadata['voxel_size']
-                                        sib_metadata['voxel_size'] = reference_voxel_size
-                                        if scale_match != 1:
-                                            sib_metadata['alignment_scale'] = float(scale_match)
-                                        else:
-                                            sib_metadata.pop('alignment_scale', None)
-                                        if 'alignment_calculated_parameters' in scan_metadata:
-                                            sib_metadata['alignment_calculated_parameters'] = scan_metadata['alignment_calculated_parameters']
-                                        if 'alignment_rigid_provenance' in scan_metadata:
-                                            sib_metadata['alignment_rigid_provenance'] = scan_metadata['alignment_rigid_provenance']
-                                        strip_ephemeral_scan_metadata(sib_metadata)
-                                        sib_json_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.json")
-                                        with open(sib_json_path, 'w') as jf:
-                                            json.dump(sib_metadata, jf, indent=4)
-                                        if 'lossy_compression' in sib_metadata:
-                                            self.registration_tools.save_as_lossy_nifti(
-                                                image_data=sib_volume_to_save,
-                                                voxel_size=reference_affine_data[0, 0],
-                                                json_file=sib_json_path,
-                                                output_file=sib_output_path.replace("_edit", "_lossy_edit"),
+                                            sib_metadata = self._load_subject_metadata(directory, sibling_name)
+                                            if self._is_preserved_mesh_metadata(sib_metadata):
+                                                linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'preserved mesh'})
+                                                continue
+                                            if sib_latest_edit >= 0:
+                                                sib_edit_files = glob.glob(os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_latest_edit}_*.nii.gz"))
+                                                sib_nifti_path = sib_edit_files[0] if sib_edit_files else os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
+                                            else:
+                                                sib_nifti_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
+                                            sib_img = nib.load(sib_nifti_path)
+                                            sib_dtype = sib_img.get_data_dtype()
+                                            sib_data = sib_img.get_fdata().astype(sib_dtype)
+                                            if scale_match != 1:
+                                                sib_data = ndimage.zoom(sib_data, scale_match, order=interpolation_order, mode='constant', cval=0)
+                                            sib_padded = np.pad(
+                                                sib_data.astype(sib_dtype),
+                                                ((padding_bottom_val[0], padding_top_val[0]),
+                                                 (padding_bottom_val[1], padding_top_val[1]),
+                                                 (padding_bottom_val[2], padding_top_val[2])),
+                                                mode='constant',
+                                                constant_values=0
+                                            ).astype(sib_dtype)
+                                            sib_rotated = np.zeros_like(sib_padded, dtype=sib_dtype)
+                                            ndimage.affine_transform(
+                                                sib_padded, rotation.T, offset=offset, output=sib_rotated,
+                                                output_shape=sib_padded.shape, order=interpolation_order,
+                                                mode='constant', prefilter=False, cval=0
                                             )
+                                            sib_translated = np.zeros_like(sib_rotated, dtype=sib_dtype)
+                                            ndimage.shift(
+                                                sib_rotated, shift=translation, output=sib_translated,
+                                                order=interpolation_order, mode='constant', cval=0
+                                            )
+                                            sib_transformed = np.zeros_like(reference_data, dtype=sib_dtype)
+                                            sib_transformed[in_start_x:in_end_x, in_start_y:in_end_y, in_start_z:in_end_z] = (
+                                                sib_translated[out_start_x:out_end_x, out_start_y:out_end_y, out_start_z:out_end_z]
+                                            )
+                                            sib_background_value = np.array(0, dtype=sib_transformed.dtype)
+                                            if sib_transformed.shape[0] > 2 * border_width:
+                                                sib_transformed[:border_width, :, :] = sib_background_value
+                                                sib_transformed[-border_width:, :, :] = sib_background_value
+                                            if sib_transformed.shape[1] > 2 * border_width:
+                                                sib_transformed[:, :border_width, :] = sib_background_value
+                                                sib_transformed[:, -border_width:, :] = sib_background_value
+                                            if sib_transformed.shape[2] > 2 * border_width:
+                                                sib_transformed[:, :, :border_width] = sib_background_value
+                                                sib_transformed[:, :, -border_width:] = sib_background_value
+                                            sib_new_edit = sib_latest_edit + 1
+                                            sib_output_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_new_edit}_aligned.nii.gz")
+                                            sib_volume_to_save = self._volume_for_mesh_reference_save(sib_transformed, reference_is_preserved_mesh)
+                                            atomic_nib_save(nib.Nifti1Image(sib_volume_to_save, reference_affine_data), sib_output_path)
+                                            sib_metadata['alignment_to'] = reference
+                                            sib_metadata['alignment_shift'] = 0
+                                            sib_metadata['alignment_method'] = method
+                                            if sib_metadata.get('voxel_size') is not None:
+                                                sib_metadata['alignment_previous_voxel_size'] = sib_metadata['voxel_size']
+                                            sib_metadata['voxel_size'] = reference_voxel_size
+                                            if scale_match != 1:
+                                                sib_metadata['alignment_scale'] = float(scale_match)
+                                            else:
+                                                sib_metadata.pop('alignment_scale', None)
+                                            if 'alignment_calculated_parameters' in scan_metadata:
+                                                sib_metadata['alignment_calculated_parameters'] = scan_metadata['alignment_calculated_parameters']
+                                            if 'alignment_rigid_provenance' in scan_metadata:
+                                                sib_metadata['alignment_rigid_provenance'] = scan_metadata['alignment_rigid_provenance']
+                                            strip_ephemeral_scan_metadata(sib_metadata)
+                                            sib_json_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.json")
+                                            atomic_write_json(sib_json_path, sib_metadata, indent=4)
+                                            if 'lossy_compression' in sib_metadata:
+                                                self.registration_tools.save_as_lossy_nifti(
+                                                    image_data=sib_volume_to_save,
+                                                    voxel_size=reference_affine_data[0, 0],
+                                                    json_file=sib_json_path,
+                                                    output_file=sib_output_path.replace("_edit", "_lossy_edit"),
+                                                )
+                                            linked_propagation_results.append({
+                                                'scan_name': sibling_name,
+                                                'status': 'success',
+                                                'edit': sib_new_edit,
+                                            })
+                                            print(f"  Catch-up propagated alignment to {sibling_name} (edit {sib_new_edit})")
+                                            cleanup_memory()
+                                        except Exception as sib_e:
+                                            linked_propagation_results.append({
+                                                'scan_name': sibling_name,
+                                                'status': 'failed',
+                                                'reason': str(sib_e),
+                                            })
+                                            print(f"  Error in catch-up propagation to {sibling_name}: {sib_e}")
+                            except Exception as prop_e:
+                                print(f"Error in linked catch-up for {scan_name}: {prop_e}")
+                        continue
+
+                    # --------------------------------------------------------------
+                    # Preserved PLY moving subject path
+                    # --------------------------------------------------------------
+                    # Mesh-only subjects have no voxel data to resample. For ALPACA
+                    # and manual guidepoints we align their PLY vertices directly and
+                    # save a new PLY edit, then skip all NIfTI-specific code below.
+                    if self._is_preserved_mesh_metadata(scan_metadata):
+                        if method.lower() not in ("alpaca", "manual-guidepoints"):
+                            print(f"Skipping preserved mesh subject {scan_name} for voxel-only method {method}")
+                            continue
+
+                        moving_vertices, moving_faces, _, moving_mesh_path = self._load_preserved_mesh_arrays(
+                            directory, scan_name, scan_metadata, latest_edit_stem
+                        )
+
+                        ref_prism_corner = None
+                        if reference_is_preserved_mesh:
+                            ref_prism_corner = mesh_reference_prism_corner_mm(
+                                reference_vertices_local,
+                                reference_metadata.get("mesh_metadata"),
+                                directory=directory,
+                                voxel_size=reference_voxel_size,
+                            )
+                            moving_vertices_for_align = mesh_centroid_local_to_reference_prism_mm(
+                                moving_vertices,
+                                scan_metadata.get("mesh_metadata"),
+                                mesh_vertices_for_prism=moving_vertices,
+                                reference_prism_corner_mm=ref_prism_corner,
+                            )
+                        else:
+                            moving_vertices_for_align = moving_vertices
+
+                        guidepoints_origin = None
+                        # Initial size match, then rigid alignment. Manual guidepoints
+                        # scale from the points themselves further down.
+                        if (
+                            scaling
+                            and method.lower() != "manual-guidepoints"
+                            and reference_vertices is not None
+                        ):
+                            raw_scale = centroid_size_scale_factor(
+                                reference_vertices, moving_vertices_for_align
+                            )
+                            if abs(raw_scale - 1.0) >= 1e-4:
+                                scale_match = raw_scale
+                                print(
+                                    f"Centroid-size scale for preserved mesh {scan_name}: {scale_match:.6f}"
+                                )
+                                moving_vertices_for_align = (
+                                    np.asarray(moving_vertices_for_align, dtype=np.float64) * scale_match
+                                )
+
+                        if method.lower() == "alpaca":
+                            if reference_vertices is None or reference_faces is None:
+                                raise ValueError("ALPACA preserved-mesh alignment requires a reference mesh.")
+                            transformation_data = alpaca.align_landmarks_to_mesh(
+                                reference_vertices,
+                                reference_faces,
+                                moving_vertices_for_align,
+                                moving_faces,
+                                os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"),
+                                scaling_mode=False,
+                                outer_surface=outer_surface,
+                            )
+                            # align_landmarks_to_mesh's 'transformation_matrix' field intentionally
+                            # omits the source/target centroid terms (voxel-volume callers add those
+                            # back themselves via explicit centroid-snapping when embedding into a
+                            # reference canvas). Preserved-mesh point clouds have no such separate
+                            # embedding step, so compose the full raw-to-raw transform here directly
+                            # from the same ingredients that pathway already returns.
+                            transformation_matrix = alpaca.compose_source_to_target_transform(
+                                np.linalg.inv(transformation_data["chosen_transform"]),
+                                transformation_data["target_centroid"],
+                                transformation_data["source_centroid"],
+                                transformation_data["normalization_scale_factor"],
+                            )
+                            transformed_vertices = alpaca.apply_rigid_transform(moving_vertices_for_align, transformation_matrix)
+                            _, source_guidepoints = self._load_guidepoints_for_stem(directory, scan_name, latest_edit_stem)
+                            if source_guidepoints is not None and float(scale_match) != 1.0:
+                                source_guidepoints = np.asarray(source_guidepoints, dtype=np.float64) * float(scale_match)
+                            transformed_guidepoints = (
+                                alpaca.apply_rigid_transform(source_guidepoints, transformation_matrix)
+                                if source_guidepoints is not None else None
+                            )
+                            # Manual homologous guidepoints only (project-wide). Per-pair auto
+                            # correspondences are not stored — they are not homologous across scans.
+                            if transformed_guidepoints is not None:
+                                guidepoints_origin = "manual"
+                            transform_summary = {
+                                "matrix": transformation_matrix.tolist(),
+                                "scale": float(scale_match),
+                            }
+                        else:
+                            _, subject_guidepoints = self._load_guidepoints_for_stem(directory, scan_name, latest_edit_stem)
+                            if subject_guidepoints is None:
+                                print(f"No guidepoints found for preserved mesh subject {scan_name}, skipping")
+                                continue
+                            if reference_is_preserved_mesh:
+                                subject_guidepoints = mesh_centroid_local_to_reference_prism_mm(
+                                    subject_guidepoints,
+                                    scan_metadata.get("mesh_metadata"),
+                                    mesh_vertices_for_prism=moving_vertices,
+                                    reference_prism_corner_mm=ref_prism_corner,
+                                    directory=directory,
+                                    voxel_size=reference_voxel_size,
+                                )
+                            if reference_guidepoints.shape != subject_guidepoints.shape:
+                                print(f"Guidepoint arrays for reference and subject {scan_name} have different shapes")
+                                continue
+
+                            scale_match = 1.0
+                            working_vertices = moving_vertices_for_align
+                            working_guidepoints = subject_guidepoints
+                            if scaling:
+                                raw_scale = centroid_size_scale_factor(
+                                    reference_guidepoints, subject_guidepoints
+                                )
+                                if abs(raw_scale - 1.0) >= 1e-4:
+                                    scale_match = raw_scale
+                                    print(
+                                        f"Guidepoint centroid-size scale for preserved mesh {scan_name}: "
+                                        f"{scale_match:.6f}"
+                                    )
+                                    working_vertices = np.asarray(moving_vertices_for_align, dtype=np.float64) * scale_match
+                                    working_guidepoints = np.asarray(subject_guidepoints, dtype=np.float64) * scale_match
+
+                            subject_centroid = np.mean(working_guidepoints, axis=0)
+                            reference_centroid = np.mean(reference_guidepoints, axis=0)
+                            rotation, _, _ = kabsch_rotation_matrix(
+                                working_guidepoints,
+                                reference_guidepoints,
+                                source_centroid=subject_centroid,
+                                target_centroid=reference_centroid,
+                            )
+                            # Preserved meshes are transformed as raw point clouds.
+                            # Do not use the voxel-image affine convention here:
+                            # volume warp uses affine_transform(matrix=R) for the inverse
+                            # of row-vector (v-c)@R; raw PLY vertices and guidepoints apply
+                            # that same R directly on row vectors.
+                            transformed_vertices = (working_vertices - subject_centroid) @ rotation + reference_centroid
+                            transformed_guidepoints = (working_guidepoints - subject_centroid) @ rotation + reference_centroid
+                            guidepoints_origin = "manual"
+                            transform_summary = {
+                                "rotation": rotation.tolist(),
+                                "source_centroid": subject_centroid.tolist(),
+                                "target_centroid": reference_centroid.tolist(),
+                                "scale": scale_match,
+                            }
+
+                        # Vertices are stored in the reference shared corner-origin mm frame.
+                        output_vertices = transformed_vertices
+                        output_faces = moving_faces
+                        output_guidepoints = transformed_guidepoints
+                        if not reference_is_preserved_mesh:
+                            # Voxel-derived meshes (NPZ/GLB) are always generated from a
+                            # volume with axes 0 and 2 swapped (see MarchingCubesView and
+                            # _load_voxel_subject_display_mesh) to match the BabylonJS
+                            # display convention. The ALPACA/guidepoint reference mesh used
+                            # above for alignment is built from the raw (unswapped) NIfTI
+                            # data, so the aligned output must be swapped back into that
+                            # same convention to land in the voxel reference's real shared
+                            # coordinate space. This is a deterministic geometric transform,
+                            # not a stored flag: it is re-derived every time purely from
+                            # whether the reference is voxel-based.
+                            output_vertices = self._swap_xz_for_voxel_display_basis(transformed_vertices)
+                            output_faces = np.asarray(moving_faces, dtype=np.int64)[:, ::-1]
+                            output_guidepoints = (
+                                self._swap_xz_for_voxel_display_basis(transformed_guidepoints)
+                                if transformed_guidepoints is not None else None
+                            )
+
+                        alignment_rigid_provenance = build_alignment_rigid_provenance(
+                            method, scaling, outer_surface, interpolation, ants_rigid_opts, ants_initializer_record,
+                            scale_factor=scale_match,
+                        )
+
+                        new_edit_number, output_path = self._save_preserved_aligned_mesh(
+                            directory,
+                            scan_name,
+                            scan_metadata,
+                            output_vertices,
+                            output_faces,
+                            reference,
+                            method,
+                            moving_mesh_path,
+                            transform_summary,
+                            transformed_guidepoints=output_guidepoints,
+                            guidepoints_origin=guidepoints_origin,
+                            alignment_rigid_provenance=alignment_rigid_provenance,
+                        )
+                        print(f"Saved preserved mesh aligned edit for {scan_name}: {output_path}")
+
+                        # Linked children must inherit the same rigid transform before we
+                        # `continue` past the voxel sibling-propagation block below.
+                        if propagate_linked:
+                            try:
+                                link_group = get_link_group(directory, scan_name)
+                                mesh_siblings = [
+                                    name for name in (link_group or {}).get("children", [])
+                                    if name != scan_name
+                                ]
+                                if mesh_siblings:
+                                    print(
+                                        f"Propagating preserved-mesh alignment from {scan_name} "
+                                        f"to {len(mesh_siblings)} linked members: {mesh_siblings}"
+                                    )
+                                for sibling_name in mesh_siblings:
+                                    try:
+                                        sib_metadata = self._load_subject_metadata(directory, sibling_name)
+                                        if not self._is_preserved_mesh_metadata(sib_metadata):
+                                            linked_propagation_results.append({
+                                                'scan_name': sibling_name,
+                                                'status': 'skipped',
+                                                'reason': 'voxel sibling of mesh main (no shared NIfTI canvas)',
+                                            })
+                                            continue
+                                        sib_latest_edit, sib_latest_stem = self._latest_any_edit_stem(
+                                            directory, sibling_name
+                                        )
+                                        if sib_latest_edit >= 0 and sib_latest_stem and 'aligned' in sib_latest_stem:
+                                            linked_propagation_results.append({
+                                                'scan_name': sibling_name,
+                                                'status': 'skipped',
+                                                'reason': 'already aligned',
+                                            })
+                                            continue
+                                        if has_elastic_registration(sibling_name, directory):
+                                            linked_propagation_results.append({
+                                                'scan_name': sibling_name,
+                                                'status': 'skipped',
+                                                'reason': 'elastic registration present',
+                                            })
+                                            continue
+
+                                        sib_vertices, sib_faces, _, sib_mesh_path = self._load_preserved_mesh_arrays(
+                                            directory, sibling_name, sib_metadata, sib_latest_stem
+                                        )
+                                        if reference_is_preserved_mesh:
+                                            sib_vertices_for_align = mesh_centroid_local_to_reference_prism_mm(
+                                                sib_vertices,
+                                                sib_metadata.get("mesh_metadata"),
+                                                mesh_vertices_for_prism=sib_vertices,
+                                                reference_prism_corner_mm=ref_prism_corner,
+                                                directory=directory,
+                                                voxel_size=reference_voxel_size,
+                                            )
+                                        else:
+                                            sib_vertices_for_align = sib_vertices
+
+                                        if method.lower() == "alpaca":
+                                            sib_input = np.asarray(sib_vertices_for_align, dtype=np.float64) * float(scale_match)
+                                            sib_transformed = alpaca.apply_rigid_transform(
+                                                sib_input, transformation_matrix
+                                            )
+                                            _, sib_gps = self._load_guidepoints_for_stem(
+                                                directory, sibling_name, sib_latest_stem
+                                            )
+                                            if sib_gps is not None and float(scale_match) != 1.0:
+                                                sib_gps = np.asarray(sib_gps, dtype=np.float64) * float(scale_match)
+                                            sib_transformed_gps = (
+                                                alpaca.apply_rigid_transform(sib_gps, transformation_matrix)
+                                                if sib_gps is not None else None
+                                            )
+                                        else:
+                                            working_sib = sib_vertices_for_align * scale_match
+                                            sib_transformed = (
+                                                (working_sib - subject_centroid) @ rotation + reference_centroid
+                                            )
+                                            _, sib_gps = self._load_guidepoints_for_stem(
+                                                directory, sibling_name, sib_latest_stem
+                                            )
+                                            if sib_gps is not None:
+                                                if reference_is_preserved_mesh:
+                                                    sib_gps = mesh_centroid_local_to_reference_prism_mm(
+                                                        sib_gps,
+                                                        sib_metadata.get("mesh_metadata"),
+                                                        mesh_vertices_for_prism=sib_vertices,
+                                                        reference_prism_corner_mm=ref_prism_corner,
+                                                        directory=directory,
+                                                        voxel_size=reference_voxel_size,
+                                                    )
+                                                working_sib_gps = sib_gps * scale_match
+                                                sib_transformed_gps = (
+                                                    (working_sib_gps - subject_centroid) @ rotation
+                                                    + reference_centroid
+                                                )
+                                            else:
+                                                sib_transformed_gps = None
+
+                                        sib_output_vertices = sib_transformed
+                                        sib_output_faces = sib_faces
+                                        sib_output_gps = sib_transformed_gps
+                                        if not reference_is_preserved_mesh:
+                                            sib_output_vertices = self._swap_xz_for_voxel_display_basis(sib_transformed)
+                                            sib_output_faces = np.asarray(sib_faces, dtype=np.int64)[:, ::-1]
+                                            sib_output_gps = (
+                                                self._swap_xz_for_voxel_display_basis(sib_transformed_gps)
+                                                if sib_transformed_gps is not None else None
+                                            )
+
+                                        sib_edit, sib_path = self._save_preserved_aligned_mesh(
+                                            directory,
+                                            sibling_name,
+                                            sib_metadata,
+                                            sib_output_vertices,
+                                            sib_output_faces,
+                                            reference,
+                                            method,
+                                            sib_mesh_path,
+                                            transform_summary,
+                                            transformed_guidepoints=sib_output_gps,
+                                            guidepoints_origin=guidepoints_origin,
+                                            alignment_rigid_provenance=alignment_rigid_provenance,
+                                        )
                                         linked_propagation_results.append({
                                             'scan_name': sibling_name,
                                             'status': 'success',
-                                            'edit': sib_new_edit,
+                                            'edit': sib_edit,
                                         })
-                                        print(f"  Catch-up propagated alignment to {sibling_name} (edit {sib_new_edit})")
-                                        cleanup_memory()
+                                        print(f"  Propagated preserved-mesh alignment to {sibling_name}: {sib_path}")
                                     except Exception as sib_e:
                                         linked_propagation_results.append({
                                             'scan_name': sibling_name,
                                             'status': 'failed',
                                             'reason': str(sib_e),
                                         })
-                                        print(f"  Error in catch-up propagation to {sibling_name}: {sib_e}")
-                        except Exception as prop_e:
-                            print(f"Error in linked catch-up for {scan_name}: {prop_e}")
-                    continue
+                                        print(f"  Error propagating preserved-mesh alignment to {sibling_name}: {sib_e}")
+                            except Exception as prop_e:
+                                print(f"Error in preserved-mesh linked propagation for {scan_name}: {prop_e}")
 
-                # --------------------------------------------------------------
-                # Preserved PLY moving subject path
-                # --------------------------------------------------------------
-                # Mesh-only subjects have no voxel data to resample. For ALPACA
-                # and manual guidepoints we align their PLY vertices directly and
-                # save a new PLY edit, then skip all NIfTI-specific code below.
-                if self._is_preserved_mesh_metadata(scan_metadata):
-                    if method.lower() not in ("alpaca", "manual-guidepoints"):
-                        print(f"Skipping preserved mesh subject {scan_name} for voxel-only method {method}")
                         continue
 
-                    moving_vertices, moving_faces, _, moving_mesh_path = self._load_preserved_mesh_arrays(
-                        directory, scan_name, scan_metadata, latest_edit_stem
-                    )
-
-                    ref_prism_corner = None
-                    if reference_is_preserved_mesh:
-                        ref_prism_corner = mesh_reference_prism_corner_mm(
-                            reference_vertices_local,
-                            reference_metadata.get("mesh_metadata"),
-                            directory=directory,
-                            voxel_size=reference_voxel_size,
-                        )
-                        moving_vertices_for_align = mesh_centroid_local_to_reference_prism_mm(
-                            moving_vertices,
-                            scan_metadata.get("mesh_metadata"),
-                            mesh_vertices_for_prism=moving_vertices,
-                            reference_prism_corner_mm=ref_prism_corner,
-                        )
+                    # Load voxel scan data for the existing NIfTI alignment path.
+                    latest_nifti_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_nifti_edit}_*.nii.gz")):
+                        latest_nifti_edit += 1
+                    latest_nifti_edit -= 1
+                    latest_edit = latest_nifti_edit
+                    if latest_nifti_edit >= 0:
+                        scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_nifti_edit}_*.nii.gz"))[0]
                     else:
-                        moving_vertices_for_align = moving_vertices
+                        scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
 
-                    guidepoints_origin = None
-                    # Initial size match, then rigid alignment. Manual guidepoints
-                    # scale from the points themselves further down.
-                    if (
-                        scaling
-                        and method.lower() != "manual-guidepoints"
-                        and reference_vertices is not None
-                    ):
-                        raw_scale = centroid_size_scale_factor(
-                            reference_vertices, moving_vertices_for_align
-                        )
-                        if abs(raw_scale - 1.0) >= 1e-4:
-                            scale_match = raw_scale
-                            print(
-                                f"Centroid-size scale for preserved mesh {scan_name}: {scale_match:.6f}"
-                            )
-                            moving_vertices_for_align = (
-                                np.asarray(moving_vertices_for_align, dtype=np.float64) * scale_match
-                            )
+                    # Load the scan data
+                    nifti_img = nib.load(scan_path)
+                    nifti_affine_data = nifti_img.affine
+                    original_dtype = nifti_img.get_data_dtype()
+                    scan_data = nifti_img.get_fdata().astype(original_dtype)
 
-                    if method.lower() == "alpaca":
-                        if reference_vertices is None or reference_faces is None:
-                            raise ValueError("ALPACA preserved-mesh alignment requires a reference mesh.")
-                        transformation_data = alpaca.align_landmarks_to_mesh(
-                            reference_vertices,
-                            reference_faces,
-                            moving_vertices_for_align,
-                            moving_faces,
-                            os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"),
-                            scaling_mode=False,
-                            outer_surface=outer_surface,
-                        )
-                        # align_landmarks_to_mesh's 'transformation_matrix' field intentionally
-                        # omits the source/target centroid terms (voxel-volume callers add those
-                        # back themselves via explicit centroid-snapping when embedding into a
-                        # reference canvas). Preserved-mesh point clouds have no such separate
-                        # embedding step, so compose the full raw-to-raw transform here directly
-                        # from the same ingredients that pathway already returns.
-                        transformation_matrix = alpaca.compose_source_to_target_transform(
-                            np.linalg.inv(transformation_data["chosen_transform"]),
-                            transformation_data["target_centroid"],
-                            transformation_data["source_centroid"],
-                            transformation_data["normalization_scale_factor"],
-                        )
-                        transformed_vertices = alpaca.apply_rigid_transform(moving_vertices_for_align, transformation_matrix)
-                        _, source_guidepoints = self._load_guidepoints_for_stem(directory, scan_name, latest_edit_stem)
-                        if source_guidepoints is not None and float(scale_match) != 1.0:
-                            source_guidepoints = np.asarray(source_guidepoints, dtype=np.float64) * float(scale_match)
-                        transformed_guidepoints = (
-                            alpaca.apply_rigid_transform(source_guidepoints, transformation_matrix)
-                            if source_guidepoints is not None else None
-                        )
-                        # Manual homologous guidepoints only (project-wide). Per-pair auto
-                        # correspondences are not stored — they are not homologous across scans.
-                        if transformed_guidepoints is not None:
-                            guidepoints_origin = "manual"
-                        transform_summary = {
-                            "matrix": transformation_matrix.tolist(),
-                            "scale": float(scale_match),
-                        }
+                    # Get threshold from scan metadata
+                    threshold = scan_metadata['threshold']   
+
+                    # Get background value as we have done it before using the histogram of the Gaussian smoothed nifti data
+                    background_value = self.get_background_value(scan_data, threshold)
+                    print(f"Background value obtained: {background_value}")
+
+                    # Get voxel size from metadata and save original for landmark transformation
+                    voxel_size = scan_metadata['voxel_size']
+                    original_voxel_size = voxel_size
+
+                    # Resample scan data to match reference voxel size
+                    if round(voxel_size, 4) != round(reference_voxel_size, 4):
+                        zoom_factor = voxel_size / reference_voxel_size
+                        print(f"voxels size of subject {scan_name} is {round(voxel_size, 4)} vs reference {round(reference_voxel_size, 4)}")
+                        print("Resampling scan data by a factor of ", zoom_factor)
+                        prog_message = f'Resampling {scan_name} by a factor of {zoom_factor}...'
                     else:
-                        _, subject_guidepoints = self._load_guidepoints_for_stem(directory, scan_name, latest_edit_stem)
-                        if subject_guidepoints is None:
-                            print(f"No guidepoints found for preserved mesh subject {scan_name}, skipping")
-                            continue
-                        if reference_is_preserved_mesh:
-                            subject_guidepoints = mesh_centroid_local_to_reference_prism_mm(
-                                subject_guidepoints,
-                                scan_metadata.get("mesh_metadata"),
-                                mesh_vertices_for_prism=moving_vertices,
-                                reference_prism_corner_mm=ref_prism_corner,
-                                directory=directory,
-                                voxel_size=reference_voxel_size,
-                            )
-                        if reference_guidepoints.shape != subject_guidepoints.shape:
-                            print(f"Guidepoint arrays for reference and subject {scan_name} have different shapes")
-                            continue
-
-                        scale_match = 1.0
-                        working_vertices = moving_vertices_for_align
-                        working_guidepoints = subject_guidepoints
-                        if scaling:
-                            raw_scale = centroid_size_scale_factor(
-                                reference_guidepoints, subject_guidepoints
-                            )
-                            if abs(raw_scale - 1.0) >= 1e-4:
-                                scale_match = raw_scale
-                                print(
-                                    f"Guidepoint centroid-size scale for preserved mesh {scan_name}: "
-                                    f"{scale_match:.6f}"
-                                )
-                                working_vertices = np.asarray(moving_vertices_for_align, dtype=np.float64) * scale_match
-                                working_guidepoints = np.asarray(subject_guidepoints, dtype=np.float64) * scale_match
-
-                        subject_centroid = np.mean(working_guidepoints, axis=0)
-                        reference_centroid = np.mean(reference_guidepoints, axis=0)
-                        rotation, _, _ = kabsch_rotation_matrix(
-                            working_guidepoints,
-                            reference_guidepoints,
-                            source_centroid=subject_centroid,
-                            target_centroid=reference_centroid,
-                        )
-                        # Preserved meshes are transformed as raw point clouds.
-                        # Do not use the voxel-image affine convention here:
-                        # volume warp uses affine_transform(matrix=R) for the inverse
-                        # of row-vector (v-c)@R; raw PLY vertices and guidepoints apply
-                        # that same R directly on row vectors.
-                        transformed_vertices = (working_vertices - subject_centroid) @ rotation + reference_centroid
-                        transformed_guidepoints = (working_guidepoints - subject_centroid) @ rotation + reference_centroid
-                        guidepoints_origin = "manual"
-                        transform_summary = {
-                            "rotation": rotation.tolist(),
-                            "source_centroid": subject_centroid.tolist(),
-                            "target_centroid": reference_centroid.tolist(),
-                            "scale": scale_match,
-                        }
-
-                    # Vertices are stored in the reference shared corner-origin mm frame.
-                    output_vertices = transformed_vertices
-                    output_faces = moving_faces
-                    output_guidepoints = transformed_guidepoints
-                    if not reference_is_preserved_mesh:
-                        # Voxel-derived meshes (NPZ/GLB) are always generated from a
-                        # volume with axes 0 and 2 swapped (see MarchingCubesView and
-                        # _load_voxel_subject_display_mesh) to match the BabylonJS
-                        # display convention. The ALPACA/guidepoint reference mesh used
-                        # above for alignment is built from the raw (unswapped) NIfTI
-                        # data, so the aligned output must be swapped back into that
-                        # same convention to land in the voxel reference's real shared
-                        # coordinate space. This is a deterministic geometric transform,
-                        # not a stored flag: it is re-derived every time purely from
-                        # whether the reference is voxel-based.
-                        output_vertices = self._swap_xz_for_voxel_display_basis(transformed_vertices)
-                        output_faces = np.asarray(moving_faces, dtype=np.int64)[:, ::-1]
-                        output_guidepoints = (
-                            self._swap_xz_for_voxel_display_basis(transformed_guidepoints)
-                            if transformed_guidepoints is not None else None
-                        )
-
-                    alignment_rigid_provenance = build_alignment_rigid_provenance(
-                        method, scaling, outer_surface, interpolation, ants_rigid_opts, ants_initializer_record,
-                        scale_factor=scale_match,
-                    )
-
-                    new_edit_number, output_path = self._save_preserved_aligned_mesh(
-                        directory,
-                        scan_name,
-                        scan_metadata,
-                        output_vertices,
-                        output_faces,
-                        reference,
-                        method,
-                        moving_mesh_path,
-                        transform_summary,
-                        transformed_guidepoints=output_guidepoints,
-                        guidepoints_origin=guidepoints_origin,
-                        alignment_rigid_provenance=alignment_rigid_provenance,
-                    )
-                    print(f"Saved preserved mesh aligned edit for {scan_name}: {output_path}")
-
-                    # Linked children must inherit the same rigid transform before we
-                    # `continue` past the voxel sibling-propagation block below.
-                    if propagate_linked:
-                        try:
-                            link_group = get_link_group(directory, scan_name)
-                            mesh_siblings = [
-                                name for name in (link_group or {}).get("children", [])
-                                if name != scan_name
-                            ]
-                            if mesh_siblings:
-                                print(
-                                    f"Propagating preserved-mesh alignment from {scan_name} "
-                                    f"to {len(mesh_siblings)} linked members: {mesh_siblings}"
-                                )
-                            for sibling_name in mesh_siblings:
-                                try:
-                                    sib_metadata = self._load_subject_metadata(directory, sibling_name)
-                                    if not self._is_preserved_mesh_metadata(sib_metadata):
-                                        linked_propagation_results.append({
-                                            'scan_name': sibling_name,
-                                            'status': 'skipped',
-                                            'reason': 'voxel sibling of mesh main (no shared NIfTI canvas)',
-                                        })
-                                        continue
-                                    sib_latest_edit, sib_latest_stem = self._latest_any_edit_stem(
-                                        directory, sibling_name
-                                    )
-                                    if sib_latest_edit >= 0 and sib_latest_stem and 'aligned' in sib_latest_stem:
-                                        linked_propagation_results.append({
-                                            'scan_name': sibling_name,
-                                            'status': 'skipped',
-                                            'reason': 'already aligned',
-                                        })
-                                        continue
-                                    if has_elastic_registration(sibling_name, directory):
-                                        linked_propagation_results.append({
-                                            'scan_name': sibling_name,
-                                            'status': 'skipped',
-                                            'reason': 'elastic registration present',
-                                        })
-                                        continue
-
-                                    sib_vertices, sib_faces, _, sib_mesh_path = self._load_preserved_mesh_arrays(
-                                        directory, sibling_name, sib_metadata, sib_latest_stem
-                                    )
-                                    if reference_is_preserved_mesh:
-                                        sib_vertices_for_align = mesh_centroid_local_to_reference_prism_mm(
-                                            sib_vertices,
-                                            sib_metadata.get("mesh_metadata"),
-                                            mesh_vertices_for_prism=sib_vertices,
-                                            reference_prism_corner_mm=ref_prism_corner,
-                                            directory=directory,
-                                            voxel_size=reference_voxel_size,
-                                        )
-                                    else:
-                                        sib_vertices_for_align = sib_vertices
-
-                                    if method.lower() == "alpaca":
-                                        sib_input = np.asarray(sib_vertices_for_align, dtype=np.float64) * float(scale_match)
-                                        sib_transformed = alpaca.apply_rigid_transform(
-                                            sib_input, transformation_matrix
-                                        )
-                                        _, sib_gps = self._load_guidepoints_for_stem(
-                                            directory, sibling_name, sib_latest_stem
-                                        )
-                                        if sib_gps is not None and float(scale_match) != 1.0:
-                                            sib_gps = np.asarray(sib_gps, dtype=np.float64) * float(scale_match)
-                                        sib_transformed_gps = (
-                                            alpaca.apply_rigid_transform(sib_gps, transformation_matrix)
-                                            if sib_gps is not None else None
-                                        )
-                                    else:
-                                        working_sib = sib_vertices_for_align * scale_match
-                                        sib_transformed = (
-                                            (working_sib - subject_centroid) @ rotation + reference_centroid
-                                        )
-                                        _, sib_gps = self._load_guidepoints_for_stem(
-                                            directory, sibling_name, sib_latest_stem
-                                        )
-                                        if sib_gps is not None:
-                                            if reference_is_preserved_mesh:
-                                                sib_gps = mesh_centroid_local_to_reference_prism_mm(
-                                                    sib_gps,
-                                                    sib_metadata.get("mesh_metadata"),
-                                                    mesh_vertices_for_prism=sib_vertices,
-                                                    reference_prism_corner_mm=ref_prism_corner,
-                                                    directory=directory,
-                                                    voxel_size=reference_voxel_size,
-                                                )
-                                            working_sib_gps = sib_gps * scale_match
-                                            sib_transformed_gps = (
-                                                (working_sib_gps - subject_centroid) @ rotation
-                                                + reference_centroid
-                                            )
-                                        else:
-                                            sib_transformed_gps = None
-
-                                    sib_output_vertices = sib_transformed
-                                    sib_output_faces = sib_faces
-                                    sib_output_gps = sib_transformed_gps
-                                    if not reference_is_preserved_mesh:
-                                        sib_output_vertices = self._swap_xz_for_voxel_display_basis(sib_transformed)
-                                        sib_output_faces = np.asarray(sib_faces, dtype=np.int64)[:, ::-1]
-                                        sib_output_gps = (
-                                            self._swap_xz_for_voxel_display_basis(sib_transformed_gps)
-                                            if sib_transformed_gps is not None else None
-                                        )
-
-                                    sib_edit, sib_path = self._save_preserved_aligned_mesh(
-                                        directory,
-                                        sibling_name,
-                                        sib_metadata,
-                                        sib_output_vertices,
-                                        sib_output_faces,
-                                        reference,
-                                        method,
-                                        sib_mesh_path,
-                                        transform_summary,
-                                        transformed_guidepoints=sib_output_gps,
-                                        guidepoints_origin=guidepoints_origin,
-                                        alignment_rigid_provenance=alignment_rigid_provenance,
-                                    )
-                                    linked_propagation_results.append({
-                                        'scan_name': sibling_name,
-                                        'status': 'success',
-                                        'edit': sib_edit,
-                                    })
-                                    print(f"  Propagated preserved-mesh alignment to {sibling_name}: {sib_path}")
-                                except Exception as sib_e:
-                                    linked_propagation_results.append({
-                                        'scan_name': sibling_name,
-                                        'status': 'failed',
-                                        'reason': str(sib_e),
-                                    })
-                                    print(f"  Error propagating preserved-mesh alignment to {sibling_name}: {sib_e}")
-                        except Exception as prop_e:
-                            print(f"Error in preserved-mesh linked propagation for {scan_name}: {prop_e}")
-
-                    continue
-
-                # Load voxel scan data for the existing NIfTI alignment path.
-                latest_nifti_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_nifti_edit}_*.nii.gz")):
-                    latest_nifti_edit += 1
-                latest_nifti_edit -= 1
-                latest_edit = latest_nifti_edit
-                if latest_nifti_edit >= 0:
-                    scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_nifti_edit}_*.nii.gz"))[0]
-                else:
-                    scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
-
-                # Load the scan data
-                nifti_img = nib.load(scan_path)
-                nifti_affine_data = nifti_img.affine
-                original_dtype = nifti_img.get_data_dtype()
-                scan_data = nifti_img.get_fdata().astype(original_dtype)
-
-                # Get threshold from scan metadata
-                threshold = scan_metadata['threshold']   
-
-                # Get background value as we have done it before using the histogram of the Gaussian smoothed nifti data
-                background_value = self.get_background_value(scan_data, threshold)
-                print(f"Background value obtained: {background_value}")
-
-                # Get voxel size from metadata and save original for landmark transformation
-                voxel_size = scan_metadata['voxel_size']
-                original_voxel_size = voxel_size
-
-                # Resample scan data to match reference voxel size
-                if round(voxel_size, 4) != round(reference_voxel_size, 4):
-                    zoom_factor = voxel_size / reference_voxel_size
-                    print(f"voxels size of subject {scan_name} is {round(voxel_size, 4)} vs reference {round(reference_voxel_size, 4)}")
-                    print("Resampling scan data by a factor of ", zoom_factor)
-                    prog_message = f'Resampling {scan_name} by a factor of {zoom_factor}...'
-                else:
-                    zoom_factor = 1
-                    prog_message = f'No resampling needed for {scan_name}...'
-
-                # Send progress update 
-                channel_layer = get_channel_layer()
-                if channel_layer is not None:
-                    progress = ((idx+(1/9)) / total_scans)
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': prog_message,
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                )
-
-                if zoom_factor != 1:
-                    scan_data = zoom(scan_data, zoom_factor, order=1, mode='constant', cval=background_value) # linear interpolation
-                    voxel_size = reference_voxel_size
-                    print("Resampling done, the data type is ", scan_data.dtype)
-
-                nifti_img = None
-                cleanup_memory()
-
-                # Initial size match, after voxel spacing already matches the reference.
-                # Manual guidepoints scale from the points themselves in that branch.
-                # The volume is zoomed once here; later warps must not zoom again.
-                if scaling and method.lower() != 'manual-guidepoints':
-                    subject_size_vertices = post_threshold_mesh_vertices(
-                        scan_data,
-                        threshold,
-                        voxel_size,
-                        smooth=True,
-                    )
-                    reference_points_for_scale = reference_size_vertices
-                    if reference_points_for_scale is None and reference_vertices is not None:
-                        reference_points_for_scale = reference_vertices
-                    if reference_points_for_scale is None or subject_size_vertices is None:
-                        print(
-                            f"Skipping centroid-size scale for {scan_name}: "
-                            "post-threshold mesh could not be measured"
-                        )
-                    else:
-                        raw_scale = centroid_size_scale_factor(
-                            reference_points_for_scale, subject_size_vertices
-                        )
-                        scan_data, scale_match = zoom_volume_to_scale(
-                            scan_data,
-                            raw_scale,
-                            background_value,
-                            order=interpolation_order,
-                        )
-                        if scale_match != 1.0:
-                            print(
-                                f"Centroid-size scale for {scan_name}: {scale_match:.6f} "
-                                "(post-threshold mesh, after voxel-size match)"
-                            )
-
-                # Now branch based on the alignment method
-                padded_scan_centroid = None
-
-                # -------------------------------------------------------------------------------------------------------
-                # -------------------------------------------------- ALPACA Method --------------------------------------
-                # -------------------------------------------------------------------------------------------------------
-
-                if method.lower() == 'alpaca':
-                    # === ALPACA Method (existing code) ===
+                        zoom_factor = 1
+                        prog_message = f'No resampling needed for {scan_name}...'
 
                     # Send progress update 
                     channel_layer = get_channel_layer()
@@ -4884,803 +4837,1001 @@ class AlignToReferenceView(APIView):
                                 'type': 'send_progress',
                                 'progress': progress,
                                 'scan_name': scan_name,
-                                'custom_message': f'Generating 3D mesh and landmarking {scan_name}...',
+                                'custom_message': prog_message,
                                 'total': total_scans,
                                 'current': idx + 1,
                             }
-                        )
-                        print("Generating 3D mesh and landmarking ", scan_name)
-                    
-                    # Check available memory
-                    remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
-                    print(f"Available memory: {remaining_memory:.2f} GB")
+                    )
 
-                    # Print signal to noise ratio
-                    print("Signal to noise ratio: ", np.mean(scan_data) / np.std(scan_data))
+                    if zoom_factor != 1:
+                        scan_data = zoom(scan_data, zoom_factor, order=1, mode='constant', cval=background_value) # linear interpolation
+                        voxel_size = reference_voxel_size
+                        print("Resampling done, the data type is ", scan_data.dtype)
 
-                    # Marching cubes to get the surface mesh
-                    volume = gaussian_filter(scan_data, sigma=1.0)         
-
-                    # Print signal to noise ratio after gaussian filtering
-                    print("Signal to noise ratio after gaussian filtering: ", np.mean(volume) / np.std(volume))
-
-                    # Apply the Marching Cubes algorithm to extract the mesh's vertices and faces from the volume data
-                    vertices, faces, _, _ = measure.marching_cubes(volume, level=threshold, spacing=(reference_voxel_size, reference_voxel_size, reference_voxel_size))
-
-                    # Invert the faces
-                    faces = faces[:, ::-1]
-
-                    # Remove unused variables and collect garbage
-                    volume = None                    
+                    nifti_img = None
                     cleanup_memory()
 
-                    # Send progress update 
-                    channel_layer = get_channel_layer()
-                    if channel_layer is not None:
-                        progress = ((idx+(2/9)) / total_scans)
-                        async_to_sync(channel_layer.group_send)(
-                            'progress_group',
-                            {
-                                'type': 'send_progress',
-                                'progress': progress,
-                                'scan_name': scan_name,
-                                'custom_message': f'Calculating rough mesh alignment from {scan_name} to the reference scan...',
-                                'total': total_scans,
-                                'current': idx + 1,
-                            }
+                    # Initial size match, after voxel spacing already matches the reference.
+                    # Manual guidepoints scale from the points themselves in that branch.
+                    # The volume is zoomed once here; later warps must not zoom again.
+                    if scaling and method.lower() != 'manual-guidepoints':
+                        subject_size_vertices = post_threshold_mesh_vertices(
+                            scan_data,
+                            threshold,
+                            voxel_size,
+                            smooth=True,
                         )
-                        print("Calculating rough mesh alignment from ", scan_name, " to the reference scan")
-                    # Check available memory
-                    remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
-                    print(f"Available memory: {remaining_memory:.2f} GB")
-
-                    # Decimate if the number of vertices is too high and outer_surface is False
-                    if len(vertices) > 15000000 and not outer_surface:
-                        decimation_factor = max(min(1, 1-(15000000/len(vertices))), 0)
-                        print("vertices before decimation: ", vertices.shape)
-                        # Simplify the mesh by decimation
-                        vertices, faces = fast_simplification.simplify(vertices, faces, decimation_factor)
-                        print("vertices after decimation: ", vertices.shape)
-                        cleanup_memory()
-                    else:
-                        print("not simplifying mesh")
-                    
-                    # Size was already matched by the centroid-size resample above.
-                    # ALPACA stays rigid: rotation and translation only.
-                    transformation_data = alpaca.align_landmarks_to_mesh(reference_vertices, reference_faces, vertices, faces, os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), scaling_mode=False, outer_surface=outer_surface)
-                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
-                        scan_metadata = json.load(jf)
-                    transformation_matrix = transformation_data['transformation_matrix']
-                    target_centroid = transformation_data['target_centroid']
-                    source_centroid = transformation_data['source_centroid']
-
-                    # Convert centroids from physical space to voxel space
-                    target_centroid = target_centroid / voxel_size
-                    source_centroid = source_centroid / voxel_size 
-                    # Get rotation and translation
-                    rotation = transformation_matrix[:3, :3]
-                    # Convert translation from physical space to voxel space
-                    translation = transformation_matrix[:3, 3] / voxel_size
-
-                    # Remove unused variables and collect garbage
-                    transformation_matrix = None
-                    transformation_data = None
-                    vertices = None
-                    faces = None
-                    cleanup_memory()
-
-                    # Send progress update for applying alignment
-                    channel_layer = get_channel_layer()
-                    if channel_layer is not None:
-                        progress = ((idx+(3/9)) / total_scans)
-                        async_to_sync(channel_layer.group_send)(
-                            'progress_group',
-                            {
-                                'type': 'send_progress',
-                                'progress': progress,
-                                'scan_name': scan_name,
-                                'custom_message': f'Applying the calculated rough alignment to the voxel data from {scan_name}...',
-                                'total': total_scans,
-                                'current': idx + 1,
-                            }
-                        )
-                        print("Applying the calculated rough alignment to the voxel data from ", scan_name)
-                    
-                    # Pad before rotation so corners are not clipped (same corner-expansion
-                    # strategy as manual guidepoints).
-                    padding_bottom_val, padding_top_val = self._padding_for_rigid_volume_warp(
-                        scan_data.shape,
-                        target_centroid,
-                        rotation,
-                    )
-                    print(
-                        f"ALPACA warp padding low={padding_bottom_val.tolist()} "
-                        f"high={padding_top_val.tolist()}"
-                    )
-
-                    # Pad the scan data
-                    padded_scan_data = np.pad(
-                        scan_data.astype(original_dtype), 
-                        ((padding_bottom_val[0], padding_top_val[0]), 
-                         (padding_bottom_val[1], padding_top_val[1]), 
-                         (padding_bottom_val[2], padding_top_val[2])),
-                        mode='constant',
-                        constant_values=background_value
-                    ).astype(original_dtype)
-
-                    scan_data = None
-                    cleanup_memory()
-                    
-                    # Update the centroid coordinates and apply rotation
-                    padded_target_centroid = target_centroid + padding_bottom_val
-                    offset = padded_target_centroid - np.dot(rotation.T, padded_target_centroid)
-
-                    output_array_rotated = np.zeros_like(padded_scan_data, dtype=original_dtype)
-                    
-                    # Apply rotation
-                    ndimage.affine_transform(
-                        padded_scan_data,
-                        rotation.T,
-                        offset=offset,
-                        output=output_array_rotated,
-                        output_shape=padded_scan_data.shape,
-                        order=interpolation_order,
-                        mode='constant',
-                        prefilter=False,
-                        cval=background_value
-                    )
-
-                    padded_scan_data = None
-                    cleanup_memory()
-                    output_array_translated = np.zeros_like(output_array_rotated, dtype=original_dtype)
-
-                    # Apply translation
-                    ndimage.shift(
-                        output_array_rotated,
-                        shift=translation,
-                        output=output_array_translated,
-                        order=0,
-                        mode='constant',
-                        cval=background_value
-                    )
-                                        
-
-                    # --- Create a canvas to store the transformed data ---
-                    transformed_data_canvas = np.full_like(reference_data, background_value)
-
-                    # Reassign variables
-                    reference_centroid_voxel = source_centroid
-                    transformed_data_centroid = padded_target_centroid
-                    transformed_data = output_array_translated
-
-                    # Calculate crop indices
-                    in_start_x = max(0, int(reference_centroid_voxel[0]) - int(transformed_data_centroid[0]))
-                    in_start_y = max(0, int(reference_centroid_voxel[1]) - int(transformed_data_centroid[1]))
-                    in_start_z = max(0, int(reference_centroid_voxel[2]) - int(transformed_data_centroid[2]))
-
-                    in_end_x = min(reference_shape[0], int(reference_centroid_voxel[0]) - int(transformed_data_centroid[0]) + transformed_data.shape[0])
-                    in_end_y = min(reference_shape[1], int(reference_centroid_voxel[1]) - int(transformed_data_centroid[1]) + transformed_data.shape[1])
-                    in_end_z = min(reference_shape[2], int(reference_centroid_voxel[2]) - int(transformed_data_centroid[2]) + transformed_data.shape[2])        
-
-                    out_start_x = max(0, int(transformed_data_centroid[0]) - int(reference_centroid_voxel[0]))
-                    out_start_y = max(0, int(transformed_data_centroid[1]) - int(reference_centroid_voxel[1]))
-                    out_start_z = max(0, int(transformed_data_centroid[2]) - int(reference_centroid_voxel[2]))
-
-                    out_end_x = min(transformed_data.shape[0], int(transformed_data_centroid[0]) - int(reference_centroid_voxel[0]) + reference_shape[0])
-                    out_end_y = min(transformed_data.shape[1], int(transformed_data_centroid[1]) - int(reference_centroid_voxel[1]) + reference_shape[1])
-                    out_end_z = min(transformed_data.shape[2], int(transformed_data_centroid[2]) - int(reference_centroid_voxel[2]) + reference_shape[2])
-
-
-                    # Verify that this will be a match and not cause an index error
-                    if in_end_x - in_start_x != out_end_x - out_start_x or in_end_y - in_start_y != out_end_y - out_start_y or in_end_z - in_start_z != out_end_z - out_start_z:
-                        print(f"Index error will occur, skipping {scan_name}")
-                        print("x in width: ", in_end_x - in_start_x, "out width: ", out_end_x - out_start_x)
-                        print("y in width: ", in_end_y - in_start_y, "out width: ", out_end_y - out_start_y)
-                        print("z in width: ", in_end_z - in_start_z, "out width: ", out_end_z - out_start_z)
-                        continue
-
-                    # Copy the valid portion of the data
-                    transformed_data_canvas[
-                        in_start_x:in_end_x,                     
-                        in_start_y:in_end_y, 
-                        in_start_z:in_end_z] = transformed_data[
-                                                    out_start_x:out_end_x,
-                                                    out_start_y:out_end_y,
-                                                    out_start_z:out_end_z
-                                                ]  
-
-                    transformed_data = transformed_data_canvas
-
-                    # Create an x-voxel gap around the data by setting border voxels to background_value.
-                    # This helps prevent edge artifacts in subsequent elastic registration steps.
-                    
-                    if transformed_data.shape[0] > 2 * border_width:
-                        transformed_data[:border_width, :, :] = background_value
-                        transformed_data[-border_width:, :, :] = background_value
-                    if transformed_data.shape[1] > 2 * border_width:
-                        transformed_data[:, :border_width, :] = background_value
-                        transformed_data[:, -border_width:, :] = background_value
-                    if transformed_data.shape[2] > 2 * border_width:
-                        transformed_data[:, :, :border_width] = background_value
-                        transformed_data[:, :, -border_width:] = background_value
-
-                    # Print shapes to assert that the data is correctly aligned
-                    print("reference_data shape: ", reference_data.shape)
-                    print("transformed_data shape: ", transformed_data.shape)
-
-                    # Clean up memory
-                    output_array_translated = None
-                    output_array_rotated = None
-                    cleanup_memory()
-
-                    # Store alignment embedding for landmark transformation
-                    self.store_alignment_embedding('alpaca', {
-                        'padding_bottom_val': padding_bottom_val,
-                        'padding_top_val': padding_top_val,
-                        'rotation': rotation,
-                        'offset': offset,
-                        'translation': translation,
-                        'source_centroid': source_centroid,
-                        'target_centroid': target_centroid,
-                        'padded_target_centroid': padded_target_centroid,
-                        'crop_indices': {
-                            'x': (in_start_x, in_end_x),
-                            'y': (in_start_y, in_end_y),
-                            'z': (in_start_z, in_end_z),
-                        },
-                        'reference_shape': reference_shape,
-                        'reference_voxel_size': reference_voxel_size,
-                        'original_voxel_size': original_voxel_size,
-                        'scale_match': scale_match,
-                    })
-
-                    # Match variable name used by shared metadata so alignment_rotation_center_voxel is saved correctly
-                    padded_scan_centroid = padded_target_centroid
-
-                # -------------------------------------------------------------------------------------------------------
-                # -------------------------- ANTs / GPU Rigid Method (voxel intensity rigid) ----------------------------
-                # -------------------------------------------------------------------------------------------------------
-
-                elif method.lower() in ('ants', 'gpu-rigid'):
-                    gpu_rigid_R = None
-                    gpu_rigid_t = None
-                    # === ANTs Method (new code based on commented section) ===
-                    
-                    # Send progress update for ANTs alignment
-                    channel_layer = get_channel_layer()
-                    if channel_layer is not None:
-                        progress = ((idx+(3/9)) / total_scans)
-                        async_to_sync(channel_layer.group_send)(
-                            'progress_group',
-                            {
-                                'type': 'send_progress',
-                                'progress': progress,
-                                'scan_name': scan_name,
-                                'custom_message': f'Preparing ANTs-based alignment for {scan_name}...',
-                                'total': total_scans,
-                                'current': idx + 1,
-                            }
-                        )     
-
-                    # === Union canvas (content-mask centroids, paste not shift) ===
-                    _ants_rigid_log(scan_name, "union canvas layout starting")
-
-                    reference_content_mask = _content_mask_from_threshold(
-                        reference_data, reference_threshold, sigma=1.0
-                    )
-                    scan_content_mask = _content_mask_from_threshold(
-                        scan_data, threshold, sigma=1.0
-                    )
-
-                    reference_centroid = _centroid_of_mask(reference_content_mask)
-                    scan_centroid = _centroid_of_mask(scan_content_mask)
-                    ref_content_low, ref_content_high = _mask_bbox(reference_content_mask)
-                    mov_content_low, mov_content_high = _mask_bbox(scan_content_mask)
-
-                    print("Reference centroid (content mask):", reference_centroid)
-                    print("Scan centroid (content mask):", scan_centroid)
-
-                    canvas_margin = int(max(32, round(max(reference_shape) * 0.06)))
-                    ref_extent = np.asarray(ref_content_high - ref_content_low, dtype=np.float64)
-                    mov_extent = np.asarray(mov_content_high - mov_content_low, dtype=np.float64)
-                    rotation_margin = int(
-                        max(64, round(max(np.linalg.norm(ref_extent), np.linalg.norm(mov_extent)) * 0.15))
-                    )
-                    # Shrink oversized moving bbox (e.g. scanner disk artifact) vs reference.
-                    # Paired .nii.mask.gz files are sub-anatomical segmentations, not head geometry.
-                    mov_cap = ref_extent * 1.35 + 2.0 * rotation_margin
-                    raw_mov_extent = mov_content_high - mov_content_low
-                    mov_content_low, mov_content_high = _cap_mask_bbox_to_extent(
-                        mov_content_low,
-                        mov_content_high,
-                        scan_centroid,
-                        mov_cap,
-                        scan_data.shape,
-                    )
-                    mov_extent = np.asarray(mov_content_high - mov_content_low, dtype=np.float64)
-                    if np.any((mov_content_high - mov_content_low) < raw_mov_extent):
-                        _ants_rigid_log(
-                            scan_name,
-                            f"capped moving content bbox to ref-scaled extent "
-                            f"(max {mov_cap.astype(int).tolist()} vox)",
-                        )
-                    max_est_voxels = int(
-                        (ants_rigid_opts if method.lower() == 'ants' else gpu_rigid_opts).get(
-                            "max_estimation_voxels", 40_000_000
-                        )
-                    )
-                    union_layout = build_union_registration_canvas(
-                        reference_centroid,
-                        scan_centroid,
-                        ref_content_low,
-                        ref_content_high,
-                        mov_content_low,
-                        mov_content_high,
-                        canvas_margin,
-                        max_estimation_voxels=max_est_voxels,
-                        rotation_margin_voxels=rotation_margin,
-                    )
-                    canvas_shape = union_layout["canvas_shape"]
-                    ref_paste = union_layout["ref_paste"]
-                    mov_paste = union_layout["mov_paste"]
-                    centroid_delta = union_layout["centroid_delta"]
-                    estimation_stride = int(union_layout["estimation_stride"])
-                    estimation_shape = union_layout["estimation_shape"]
-
-                    reference_on_canvas = paste_volume_on_canvas_clipped(
-                        reference_data,
-                        ref_paste,
-                        canvas_shape,
-                        background_value,
-                    )
-                    moving_on_canvas = paste_volume_on_canvas_clipped(
-                        scan_data,
-                        mov_paste,
-                        canvas_shape,
-                        background_value,
-                    )
-
-                    use_reg_mask = bool(
-                        (ants_rigid_opts if method.lower() == 'ants' else gpu_rigid_opts).get(
-                            "use_registration_mask", True
-                        )
-                    )
-                    reference_mask_on_canvas = None
-                    moving_mask_on_canvas = None
-                    if use_reg_mask:
-                        reference_mask_on_canvas = paste_volume_on_canvas_clipped(
-                            reference_content_mask.astype(np.uint8),
-                            ref_paste,
-                            canvas_shape,
-                            0,
-                        ).astype(bool)
-                        moving_mask_on_canvas = paste_volume_on_canvas_clipped(
-                            scan_content_mask.astype(np.uint8),
-                            mov_paste,
-                            canvas_shape,
-                            0,
-                        ).astype(bool)
-
-                    _ants_rigid_log(
-                        scan_name,
-                        f"estimation canvas: shape {canvas_shape} stride={estimation_stride} "
-                        f"est_grid={estimation_shape} rotation_margin={rotation_margin} "
-                        f"(ref paste {ref_paste.tolist()}, mov paste {mov_paste.tolist()}, "
-                        f"delta {centroid_delta.tolist()})",
-                    )
-                    if estimation_stride >= 4:
-                        _ants_rigid_log(
-                            scan_name,
-                            f"estimation stride {estimation_stride} forced by canvas size "
-                            f"({int(np.prod(estimation_shape)):,} voxels); tighten canvas "
-                            f"(crop artifact) or raise max_estimation_voxels for stride 2–3",
-                        )
-
-                    moving_image_range = [float(np.min(scan_data)), float(np.max(scan_data))]
-                    
-                    method_label = "GPU Rigid" if method.lower() == "gpu-rigid" else "ANTs"
-                    if channel_layer is not None:
-                        progress = ((idx+(4/9)) / total_scans)
-                        async_to_sync(channel_layer.group_send)(
-                            'progress_group',
-                            {
-                                'type': 'send_progress',
-                                'progress': progress,
-                                'scan_name': scan_name,
-                                'custom_message': f'Performing {method_label} registration for {scan_name}...',
-                                'total': total_scans,
-                                'current': idx + 1,
-                            }
-                        )
-                    
-                    # Store original data type and range
-                    reference_range = [float(np.min(reference_data)), float(np.max(reference_data))]
-                    
-                    print(f"Original dtype: {original_dtype}")
-                    print(f"Moving image range: {moving_image_range}")
-                    print(f"Reference range: {reference_range}")                
-
-                    reference_base_path = self.get_reference_base_path(directory, reference)
-                    fixed_image_ants = ants.image_read(os.path.join(reference_base_path, f"{reference}.nii.gz"))
-                    fixed_image_spacing = fixed_image_ants.spacing
-                    fixed_image_origin = fixed_image_ants.origin
-                    fixed_image_direction = fixed_image_ants.direction
-
-                    fixed_image_ants = None
-                    cleanup_memory()
-
-                    half_spacing = tuple(float(s) * estimation_stride for s in fixed_image_spacing)
-                    ants_canvas_origin = ants_origin_for_canvas_paste(
-                        fixed_image_origin,
-                        fixed_image_direction,
-                        ref_paste,
-                        fixed_image_spacing,
-                    )
-                    ants_rotation_center_voxel = np.asarray(reference_centroid, dtype=np.float64)
-                    est_slices = tuple(slice(None, None, estimation_stride) for _ in range(3))
-
-                    adjusted_background_value = self.registration_tools.get_adjusted_background_value(
-                        background_value, scan_data.astype(np.float32), new_min=-1, new_max=1
-                    )
-                    print(f"Adjusted background value: {adjusted_background_value} from {background_value}")
-                    
-                    print(
-                        f"Creating normalized ANTs images for estimation "
-                        f"(stride={estimation_stride}, grid={estimation_shape})"
-                    )
-
-                    fixed_image_data = ants.from_numpy(
-                        self.registration_tools.min_max_normalize(
-                            reference_on_canvas[est_slices].astype(np.float32), new_min=-1, new_max=1
-                        ),
-                        spacing=half_spacing,
-                        origin=tuple(float(x) for x in ants_canvas_origin),
-                        direction=fixed_image_direction,
-                    )
-
-                    moving_image_data = ants.from_numpy(
-                        self.registration_tools.min_max_normalize(
-                            moving_on_canvas[est_slices].astype(np.float32), new_min=-1, new_max=1
-                        ),
-                        spacing=half_spacing,
-                        origin=tuple(float(x) for x in ants_canvas_origin),
-                        direction=fixed_image_direction,
-                    )
-
-                    fixed_image_mask = None
-                    moving_image_mask = None
-                    if use_reg_mask and reference_mask_on_canvas is not None:
-                        fixed_image_mask = _ants_binary_mask_image(
-                            reference_mask_on_canvas[est_slices],
-                            half_spacing,
-                            ants_canvas_origin,
-                            fixed_image_direction,
-                            dilate_iters=3,
-                        )
-                        moving_image_mask = _ants_binary_mask_image(
-                            moving_mask_on_canvas[est_slices],
-                            half_spacing,
-                            ants_canvas_origin,
-                            fixed_image_direction,
-                            dilate_iters=3,
-                        )
-                        _ants_rigid_log(scan_name, "content masks enabled for Rigid registration")
-                    elif use_reg_mask:
-                        _ants_rigid_log(scan_name, "content masks requested but unavailable")
-                    else:
-                        _ants_rigid_log(
-                            scan_name,
-                            "masks off — Mattes MI uses full voxel grid (texture-driven)",
-                        )
-                
-                    cleanup_memory()
-
-                    if method.lower() == 'gpu-rigid':
-                        _ants_rigid_log(scan_name, f"=== GPU Rigid (FireANTs): {scan_name} -> {reference} ===")
-                        _ants_rigid_log(scan_name, f"gpu_rigid_options: {gpu_rigid_opts}")
-                        _ants_rigid_log(
-                            scan_name,
-                            f"estimation grid shape fixed={fixed_image_data.shape} moving={moving_image_data.shape}, "
-                            f"spacing={fixed_image_data.spacing}, stride={estimation_stride}",
-                        )
-                        try:
-                            gpu_debug_dir = None
-                            if gpu_rigid_opts.get("debug_checkpoints", True):
-                                gpu_debug_dir = resolve_gpu_rigid_debug_dir(directory, scan_name)
-                                _ants_rigid_log(scan_name, f"GPU Rigid debug checkpoints → {gpu_debug_dir}")
-                            gpu_result = run_gpu_rigid_registration(
-                                fixed_image_data,
-                                moving_image_data,
-                                gpu_rigid_opts,
-                                scan_name=scan_name,
-                                fixed_mask=fixed_image_mask,
-                                moving_mask=moving_image_mask,
-                                reference_shape=reference_shape,
-                                canvas_shape=canvas_shape,
-                                estimation_stride=estimation_stride,
-                                debug_dir=gpu_debug_dir,
-                                reference_name=reference,
+                        reference_points_for_scale = reference_size_vertices
+                        if reference_points_for_scale is None and reference_vertices is not None:
+                            reference_points_for_scale = reference_vertices
+                        if reference_points_for_scale is None or subject_size_vertices is None:
+                            print(
+                                f"Skipping centroid-size scale for {scan_name}: "
+                                "post-threshold mesh could not be measured"
                             )
-                        except GpuRigidError as exc:
-                            print(f"GPU Rigid failed for {scan_name}: {exc}")
-                            if gpu_rigid_opts.get("debug_checkpoints", True):
+                        else:
+                            raw_scale = centroid_size_scale_factor(
+                                reference_points_for_scale, subject_size_vertices
+                            )
+                            scan_data, scale_match = zoom_volume_to_scale(
+                                scan_data,
+                                raw_scale,
+                                background_value,
+                                order=interpolation_order,
+                            )
+                            if scale_match != 1.0:
                                 print(
-                                    f"GPU Rigid debug checkpoints saved under "
-                                    f"extracted/{scan_name}/gpu-rigid-debug/"
+                                    f"Centroid-size scale for {scan_name}: {scale_match:.6f} "
+                                    "(post-threshold mesh, after voxel-size match)"
                                 )
-                            continue
-                        gpu_initializer_record = gpu_result.get("initializer_record")
-                        mat_path = gpu_result["mat_path"]
-                        gpu_rigid_R = gpu_result.get("R")
-                        gpu_rigid_t = gpu_result.get("t")
-                        rigid_transform = {"fwdtransforms": [mat_path]}
-                        _log_ants_rigid_transform_summary(scan_name, mat_path)
-                    else:
-                        _ants_rigid_log(scan_name, f"=== ANTs rigid: {scan_name} -> {reference} ===")
-                        _ants_rigid_log(scan_name, _format_ants_rigid_opts_for_log(ants_rigid_opts))
-                        _ants_rigid_log(
-                            scan_name,
-                            f"estimation grid shape fixed={fixed_image_data.shape} moving={moving_image_data.shape}, "
-                            f"spacing={fixed_image_data.spacing}, stride={estimation_stride}",
-                        )
 
-                        # affine_initializer → Affine registration → project to rigid (R,t only).
-                        initial_transform, ants_initializer_record = compute_ants_rigid_initial_transform(
-                            fixed_image_data, moving_image_data, ants_rigid_opts, scan_name=scan_name
-                        )
-                        if isinstance(initial_transform, str):
-                            _ants_rigid_log(scan_name, f"Affine registration initial_transform file: {initial_transform}")
-                        else:
-                            _ants_rigid_log(scan_name, f"Affine registration initial_transform: {initial_transform}")
+                    # Now branch based on the alignment method
+                    padded_scan_centroid = None
 
-                        reg_identity_ncc, reg_identity_iou = _score_rigid_on_overlap(
-                            fixed_image_data, moving_image_data, np.eye(3), np.zeros(3)
-                        )
-                        _ants_rigid_log(
-                            scan_name,
-                            f"registration-grid identity baseline: ncc={reg_identity_ncc:.3f} "
-                            f"iou={reg_identity_iou:.3f}",
-                        )
+                    # -------------------------------------------------------------------------------------------------------
+                    # -------------------------------------------------- ALPACA Method --------------------------------------
+                    # -------------------------------------------------------------------------------------------------------
 
-                        def _run_affine_registration(initial_tx, use_masks=True):
-                            reg_kwargs = {
-                                "fixed": fixed_image_data,
-                                "moving": moving_image_data,
-                                "type_of_transform": "Affine",
-                                "aff_metric": ants_rigid_opts["aff_metric"],
-                                "aff_iterations": ants_rigid_opts["aff_iterations"],
-                                "aff_shrink_factors": ants_rigid_opts["aff_shrink_factors"],
-                                "aff_smoothing_sigmas": ants_rigid_opts["aff_smoothing_sigmas"],
-                                "aff_sampling": ants_rigid_opts["aff_sampling"],
-                                "aff_random_sampling_rate": ants_rigid_opts["aff_random_sampling_rate"],
-                                "grad_step": ants_rigid_opts["grad_step"],
-                                "use_histogram_matching": ants_rigid_opts["use_histogram_matching"],
-                                "initial_transform": initial_tx,
-                                "singleprecision": ants_rigid_opts["singleprecision"],
-                                "verbose": True,
-                            }
-                            if use_masks and fixed_image_mask is not None:
-                                reg_kwargs["mask"] = fixed_image_mask
-                            if use_masks and moving_image_mask is not None:
-                                reg_kwargs["moving_mask"] = moving_image_mask
-                            return ants.registration(**reg_kwargs)
+                    if method.lower() == 'alpaca':
+                        # === ALPACA Method (existing code) ===
 
-                        def _registration_quality_ok_from_mat(mat_path):
-                            if not mat_path:
-                                return False, None, -1.0, 0.0
-                            ncc, iou = _score_ants_rigid_transform(
-                                fixed_image_data, moving_image_data, mat_path
+                        # Send progress update 
+                        channel_layer = get_channel_layer()
+                        if channel_layer is not None:
+                            progress = ((idx+(1/9)) / total_scans)
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': scan_name,
+                                    'custom_message': f'Generating 3D mesh and landmarking {scan_name}...',
+                                    'total': total_scans,
+                                    'current': idx + 1,
+                                }
                             )
-                            improved = (
-                                iou >= reg_identity_iou - 0.01
-                                and (ncc >= reg_identity_ncc + 0.01 or iou >= reg_identity_iou + 0.02)
-                            )
-                            return improved, mat_path, ncc, iou
+                            print("Generating 3D mesh and landmarking ", scan_name)
+                    
+                        # Check available memory
+                        remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
+                        print(f"Available memory: {remaining_memory:.2f} GB")
 
-                        started_from_initializer = _initial_transform_from_initializer(initial_transform)
+                        # Print signal to noise ratio
+                        print("Signal to noise ratio: ", np.mean(scan_data) / np.std(scan_data))
 
-                        _ants_rigid_log(
-                            scan_name,
-                            "ants.registration (Affine) starting — ITK iteration log follows below",
-                        )
-                        affine_reg = _ants_run_with_heartbeat(
-                            scan_name,
-                            "ants.registration (Affine)",
-                            lambda: _run_affine_registration(initial_transform, use_masks=True),
-                            interval_sec=45.0,
-                        )
-                        rigid_transform, mat_path = project_affine_mat_path_to_rigid_transform(
-                            affine_reg, scan_name=scan_name
-                        )
-                        ok, mat_path, reg_ncc, reg_iou = _registration_quality_ok_from_mat(mat_path)
-                        if not ok and fixed_image_mask is not None:
-                            _ants_rigid_log(
-                                scan_name,
-                                f"ants.registration weak with masks (ncc={reg_ncc:.3f} iou={reg_iou:.3f}); "
-                                "retrying same initial transform without masks",
-                            )
-                            affine_reg = _ants_run_with_heartbeat(
-                                scan_name,
-                                "ants.registration (Affine, no masks)",
-                                lambda: _run_affine_registration(initial_transform, use_masks=False),
-                                interval_sec=45.0,
-                            )
-                            rigid_transform, mat_path = project_affine_mat_path_to_rigid_transform(
-                                affine_reg, scan_name=scan_name
-                            )
-                            ok, mat_path, reg_ncc, reg_iou = _registration_quality_ok_from_mat(mat_path)
-                        if not ok and not started_from_initializer:
-                            _ants_rigid_log(
-                                scan_name,
-                                f"ants.registration result weak (ncc={reg_ncc:.3f} iou={reg_iou:.3f} "
-                                f"vs identity ncc={reg_identity_ncc:.3f} iou={reg_identity_iou:.3f}); "
-                                "retrying from Identity",
-                            )
-                            affine_reg = _ants_run_with_heartbeat(
-                                scan_name,
-                                "ants.registration (Affine retry Identity)",
-                                lambda: _run_affine_registration(["Identity"], use_masks=False),
-                                interval_sec=45.0,
-                            )
-                            rigid_transform, mat_path = project_affine_mat_path_to_rigid_transform(
-                                affine_reg, scan_name=scan_name
-                            )
-                            ok, mat_path, reg_ncc, reg_iou = _registration_quality_ok_from_mat(mat_path)
-                            _ants_rigid_log(
-                                scan_name,
-                                f"Identity retry quality: ncc={reg_ncc:.3f} iou={reg_iou:.3f}",
-                            )
-                        elif not ok and started_from_initializer:
-                            _ants_rigid_log(
-                                scan_name,
-                                f"keeping initializer-based Affine→rigid result despite weak score vs identity "
-                                f"(ncc={reg_ncc:.3f} iou={reg_iou:.3f} vs identity ncc={reg_identity_ncc:.3f} "
-                                f"iou={reg_identity_iou:.3f})",
-                            )
-                        else:
-                            _ants_rigid_log(
-                                scan_name,
-                                f"registration quality ok: ncc={reg_ncc:.3f} iou={reg_iou:.3f}",
-                            )
+                        # Marching cubes to get the surface mesh
+                        volume = gaussian_filter(scan_data, sigma=1.0)         
 
-                        if mat_path:
-                            _log_ants_rigid_transform_summary(scan_name, mat_path)
+                        # Print signal to noise ratio after gaussian filtering
+                        print("Signal to noise ratio after gaussian filtering: ", np.mean(volume) / np.std(volume))
 
-                    moving_image_data = None
-                    fixed_image_data = None
-                    fixed_image_mask = None
-                    moving_image_mask = None
-                    reference_mask_on_canvas = None
-                    moving_mask_on_canvas = None
-                    if method.lower() != "gpu-rigid":
-                        reference_on_canvas = None
-                        moving_on_canvas = None
-                    if method.lower() == "gpu-rigid":
-                        try:
-                            import torch
+                        # Apply the Marching Cubes algorithm to extract the mesh's vertices and faces from the volume data
+                        vertices, faces, _, _ = measure.marching_cubes(volume, level=threshold, spacing=(reference_voxel_size, reference_voxel_size, reference_voxel_size))
 
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                    cleanup_memory()
+                        # Invert the faces
+                        faces = faces[:, ::-1]
 
-                    print("Rigid transformation complete")
-
-                    if method.lower() == "gpu-rigid":
-                        if gpu_rigid_R is None or gpu_rigid_t is None:
-                            print(f"GPU Rigid missing R/t for {scan_name}, skipping")
-                            continue
-                        _ants_rigid_log(
-                            scan_name,
-                            "Applying GPU pose on union canvas (same frame as estimation/debug)",
-                        )
-                        warped_canvas = apply_rigid_rt_on_union_canvas(
-                            moving_on_canvas,
-                            gpu_rigid_R,
-                            gpu_rigid_t,
-                            spacing=fixed_image_spacing,
-                            reference_origin=fixed_image_origin,
-                            direction=fixed_image_direction,
-                            ref_paste=ref_paste,
-                            reference_canvas=reference_on_canvas,
-                            defaultvalue=background_value,
-                        )
-                        reference_on_canvas = None
-                        moving_on_canvas = None
+                        # Remove unused variables and collect garbage
+                        volume = None                    
                         cleanup_memory()
-                        transformed_data = crop_registration_canvas_to_reference(
-                            warped_canvas, ref_paste, reference_shape
+
+                        # Send progress update 
+                        channel_layer = get_channel_layer()
+                        if channel_layer is not None:
+                            progress = ((idx+(2/9)) / total_scans)
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': scan_name,
+                                    'custom_message': f'Calculating rough mesh alignment from {scan_name} to the reference scan...',
+                                    'total': total_scans,
+                                    'current': idx + 1,
+                                }
+                            )
+                            print("Calculating rough mesh alignment from ", scan_name, " to the reference scan")
+                        # Check available memory
+                        remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
+                        print(f"Available memory: {remaining_memory:.2f} GB")
+
+                        # Decimate if the number of vertices is too high and outer_surface is False
+                        if len(vertices) > 15000000 and not outer_surface:
+                            decimation_factor = max(min(1, 1-(15000000/len(vertices))), 0)
+                            print("vertices before decimation: ", vertices.shape)
+                            # Simplify the mesh by decimation
+                            vertices, faces = fast_simplification.simplify(vertices, faces, decimation_factor)
+                            print("vertices after decimation: ", vertices.shape)
+                            cleanup_memory()
+                        else:
+                            print("not simplifying mesh")
+                    
+                        # Size was already matched by the centroid-size resample above.
+                        # ALPACA stays rigid: rotation and translation only.
+                        transformation_data = alpaca.align_landmarks_to_mesh(reference_vertices, reference_faces, vertices, faces, os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), scaling_mode=False, outer_surface=outer_surface)
+                        with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
+                            scan_metadata = json.load(jf)
+                        transformation_matrix = transformation_data['transformation_matrix']
+                        target_centroid = transformation_data['target_centroid']
+                        source_centroid = transformation_data['source_centroid']
+
+                        # Convert centroids from physical space to voxel space
+                        target_centroid = target_centroid / voxel_size
+                        source_centroid = source_centroid / voxel_size 
+                        # Get rotation and translation
+                        rotation = transformation_matrix[:3, :3]
+                        # Convert translation from physical space to voxel space
+                        translation = transformation_matrix[:3, 3] / voxel_size
+
+                        # Remove unused variables and collect garbage
+                        transformation_matrix = None
+                        transformation_data = None
+                        vertices = None
+                        faces = None
+                        cleanup_memory()
+
+                        # Send progress update for applying alignment
+                        channel_layer = get_channel_layer()
+                        if channel_layer is not None:
+                            progress = ((idx+(3/9)) / total_scans)
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': scan_name,
+                                    'custom_message': f'Applying the calculated rough alignment to the voxel data from {scan_name}...',
+                                    'total': total_scans,
+                                    'current': idx + 1,
+                                }
+                            )
+                            print("Applying the calculated rough alignment to the voxel data from ", scan_name)
+                    
+                        # Pad before rotation so corners are not clipped (same corner-expansion
+                        # strategy as manual guidepoints).
+                        padding_bottom_val, padding_top_val = self._padding_for_rigid_volume_warp(
+                            scan_data.shape,
+                            target_centroid,
+                            rotation,
                         )
-                        del warped_canvas
-                        rotation = np.asarray(gpu_rigid_R, dtype=np.float64).T
-                        padding_low = np.zeros(3, dtype=np.int64)
-                        padding_high = np.zeros(3, dtype=np.int64)
-                        offset = np.zeros(3, dtype=np.float64)
-                        centroid_translation = np.zeros(3, dtype=np.float64)
-                        padded_scan_centroid = np.asarray(scan_centroid, dtype=np.float64)
-                        reference_centroid_voxel = np.asarray(reference_centroid, dtype=np.float64)
-                        rs = tuple(int(s) for s in reference_shape)
-                        in_start_x, in_end_x = 0, rs[0]
-                        in_start_y, in_end_y = 0, rs[1]
-                        in_start_z, in_end_z = 0, rs[2]
-                        out_start_x, out_end_x = 0, rs[0]
-                        out_start_y, out_end_y = 0, rs[1]
-                        out_start_z, out_end_z = 0, rs[2]
-                        padding_bottom_val = padding_low
-                        padding_top_val = padding_high
-                        translation = centroid_translation
                         print(
-                            f"After GPU canvas apply: {np.min(transformed_data)} to {np.max(transformed_data)}"
+                            f"ALPACA warp padding low={padding_bottom_val.tolist()} "
+                            f"high={padding_top_val.tolist()}"
                         )
-                        self.store_alignment_embedding(
-                            method,
-                            {
-                                "padding_low": padding_low,
-                                "padding_high": padding_high,
-                                "rotation": rotation,
-                                "offset": offset,
-                                "centroid_translation": centroid_translation,
-                                "padded_scan_centroid": padded_scan_centroid,
-                                "reference_centroid_voxel": reference_centroid_voxel,
-                                "crop_indices": {
-                                    "x": (in_start_x, in_end_x),
-                                    "y": (in_start_y, in_end_y),
-                                    "z": (in_start_z, in_end_z),
-                                },
-                                "reference_shape": reference_shape,
-                                "reference_voxel_size": reference_voxel_size,
-                                "original_voxel_size": original_voxel_size,
-                                "scale_match": float(scale_match),
-                            },
-                        )
+
+                        # Pad the scan data
+                        padded_scan_data = np.pad(
+                            scan_data.astype(original_dtype), 
+                            ((padding_bottom_val[0], padding_top_val[0]), 
+                             (padding_bottom_val[1], padding_top_val[1]), 
+                             (padding_bottom_val[2], padding_top_val[2])),
+                            mode='constant',
+                            constant_values=background_value
+                        ).astype(original_dtype)
+
                         scan_data = None
                         cleanup_memory()
-                    else:
-                        print("Projecting ANTs pose into scipy rigid and applying on reference FOV")
+                    
+                        # Update the centroid coordinates and apply rotation
+                        padded_target_centroid = target_centroid + padding_bottom_val
+                        offset = padded_target_centroid - np.dot(rotation.T, padded_target_centroid)
 
-                        ants_mat_path = mat_path
-                        if not ants_mat_path or not os.path.isfile(ants_mat_path):
-                            for candidate in (
-                                list(rigid_transform.get('fwdtransforms') or [])
-                                + list(rigid_transform.get('invtransforms') or [])
-                            ):
-                                if isinstance(candidate, str) and candidate.endswith('.mat') and os.path.isfile(candidate):
-                                    ants_mat_path = candidate
-                                    break
-                        if not ants_mat_path:
-                            print(f"No GenericAffine .mat from registration for {scan_name}, skipping")
+                        output_array_rotated = np.zeros_like(padded_scan_data, dtype=original_dtype)
+                    
+                        # Apply rotation
+                        ndimage.affine_transform(
+                            padded_scan_data,
+                            rotation.T,
+                            offset=offset,
+                            output=output_array_rotated,
+                            output_shape=padded_scan_data.shape,
+                            order=interpolation_order,
+                            mode='constant',
+                            prefilter=False,
+                            cval=background_value
+                        )
+
+                        padded_scan_data = None
+                        cleanup_memory()
+                        output_array_translated = np.zeros_like(output_array_rotated, dtype=original_dtype)
+
+                        # Apply translation
+                        ndimage.shift(
+                            output_array_rotated,
+                            shift=translation,
+                            output=output_array_translated,
+                            order=0,
+                            mode='constant',
+                            cval=background_value
+                        )
+                                        
+
+                        # --- Create a canvas to store the transformed data ---
+                        transformed_data_canvas = np.full_like(reference_data, background_value)
+
+                        # Reassign variables
+                        reference_centroid_voxel = source_centroid
+                        transformed_data_centroid = padded_target_centroid
+                        transformed_data = output_array_translated
+
+                        # Calculate crop indices
+                        in_start_x = max(0, int(reference_centroid_voxel[0]) - int(transformed_data_centroid[0]))
+                        in_start_y = max(0, int(reference_centroid_voxel[1]) - int(transformed_data_centroid[1]))
+                        in_start_z = max(0, int(reference_centroid_voxel[2]) - int(transformed_data_centroid[2]))
+
+                        in_end_x = min(reference_shape[0], int(reference_centroid_voxel[0]) - int(transformed_data_centroid[0]) + transformed_data.shape[0])
+                        in_end_y = min(reference_shape[1], int(reference_centroid_voxel[1]) - int(transformed_data_centroid[1]) + transformed_data.shape[1])
+                        in_end_z = min(reference_shape[2], int(reference_centroid_voxel[2]) - int(transformed_data_centroid[2]) + transformed_data.shape[2])        
+
+                        out_start_x = max(0, int(transformed_data_centroid[0]) - int(reference_centroid_voxel[0]))
+                        out_start_y = max(0, int(transformed_data_centroid[1]) - int(reference_centroid_voxel[1]))
+                        out_start_z = max(0, int(transformed_data_centroid[2]) - int(reference_centroid_voxel[2]))
+
+                        out_end_x = min(transformed_data.shape[0], int(transformed_data_centroid[0]) - int(reference_centroid_voxel[0]) + reference_shape[0])
+                        out_end_y = min(transformed_data.shape[1], int(transformed_data_centroid[1]) - int(reference_centroid_voxel[1]) + reference_shape[1])
+                        out_end_z = min(transformed_data.shape[2], int(transformed_data_centroid[2]) - int(reference_centroid_voxel[2]) + reference_shape[2])
+
+
+                        # Verify that this will be a match and not cause an index error
+                        if in_end_x - in_start_x != out_end_x - out_start_x or in_end_y - in_start_y != out_end_y - out_start_y or in_end_z - in_start_z != out_end_z - out_start_z:
+                            print(f"Index error will occur, skipping {scan_name}")
+                            print("x in width: ", in_end_x - in_start_x, "out width: ", out_end_x - out_start_x)
+                            print("y in width: ", in_end_y - in_start_y, "out width: ", out_end_y - out_start_y)
+                            print("z in width: ", in_end_z - in_start_z, "out width: ", out_end_z - out_start_z)
                             continue
+
+                        # Copy the valid portion of the data
+                        transformed_data_canvas[
+                            in_start_x:in_end_x,                     
+                            in_start_y:in_end_y, 
+                            in_start_z:in_end_z] = transformed_data[
+                                                        out_start_x:out_end_x,
+                                                        out_start_y:out_end_y,
+                                                        out_start_z:out_end_z
+                                                    ]  
+
+                        transformed_data = transformed_data_canvas
+
+                        # Create an x-voxel gap around the data by setting border voxels to background_value.
+                        # This helps prevent edge artifacts in subsequent elastic registration steps.
+                    
+                        if transformed_data.shape[0] > 2 * border_width:
+                            transformed_data[:border_width, :, :] = background_value
+                            transformed_data[-border_width:, :, :] = background_value
+                        if transformed_data.shape[1] > 2 * border_width:
+                            transformed_data[:, :border_width, :] = background_value
+                            transformed_data[:, -border_width:, :] = background_value
+                        if transformed_data.shape[2] > 2 * border_width:
+                            transformed_data[:, :, :border_width] = background_value
+                            transformed_data[:, :, -border_width:] = background_value
+
+                        # Print shapes to assert that the data is correctly aligned
+                        print("reference_data shape: ", reference_data.shape)
+                        print("transformed_data shape: ", transformed_data.shape)
+
+                        # Clean up memory
+                        output_array_translated = None
+                        output_array_rotated = None
+                        cleanup_memory()
+
+                        # Store alignment embedding for landmark transformation
+                        self.store_alignment_embedding('alpaca', {
+                            'padding_bottom_val': padding_bottom_val,
+                            'padding_top_val': padding_top_val,
+                            'rotation': rotation,
+                            'offset': offset,
+                            'translation': translation,
+                            'source_centroid': source_centroid,
+                            'target_centroid': target_centroid,
+                            'padded_target_centroid': padded_target_centroid,
+                            'crop_indices': {
+                                'x': (in_start_x, in_end_x),
+                                'y': (in_start_y, in_end_y),
+                                'z': (in_start_z, in_end_z),
+                            },
+                            'reference_shape': reference_shape,
+                            'reference_voxel_size': reference_voxel_size,
+                            'original_voxel_size': original_voxel_size,
+                            'scale_match': scale_match,
+                        })
+
+                        # Match variable name used by shared metadata so alignment_rotation_center_voxel is saved correctly
+                        padded_scan_centroid = padded_target_centroid
+
+                    # -------------------------------------------------------------------------------------------------------
+                    # -------------------------- ANTs / GPU Rigid Method (voxel intensity rigid) ----------------------------
+                    # -------------------------------------------------------------------------------------------------------
+
+                    elif method.lower() in ('ants', 'gpu-rigid'):
+                        gpu_rigid_R = None
+                        gpu_rigid_t = None
+                        # === ANTs Method (new code based on commented section) ===
+                    
+                        # Send progress update for ANTs alignment
+                        channel_layer = get_channel_layer()
+                        if channel_layer is not None:
+                            progress = ((idx+(3/9)) / total_scans)
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': scan_name,
+                                    'custom_message': f'Preparing ANTs-based alignment for {scan_name}...',
+                                    'total': total_scans,
+                                    'current': idx + 1,
+                                }
+                            )     
+
+                        # === Union canvas (content-mask centroids, paste not shift) ===
+                        _ants_rigid_log(scan_name, "union canvas layout starting")
+
+                        reference_content_mask = _content_mask_from_threshold(
+                            reference_data, reference_threshold, sigma=1.0
+                        )
+                        scan_content_mask = _content_mask_from_threshold(
+                            scan_data, threshold, sigma=1.0
+                        )
+
+                        reference_centroid = _centroid_of_mask(reference_content_mask)
+                        scan_centroid = _centroid_of_mask(scan_content_mask)
+                        ref_content_low, ref_content_high = _mask_bbox(reference_content_mask)
+                        mov_content_low, mov_content_high = _mask_bbox(scan_content_mask)
+
+                        print("Reference centroid (content mask):", reference_centroid)
+                        print("Scan centroid (content mask):", scan_centroid)
+
+                        canvas_margin = int(max(32, round(max(reference_shape) * 0.06)))
+                        ref_extent = np.asarray(ref_content_high - ref_content_low, dtype=np.float64)
+                        mov_extent = np.asarray(mov_content_high - mov_content_low, dtype=np.float64)
+                        rotation_margin = int(
+                            max(64, round(max(np.linalg.norm(ref_extent), np.linalg.norm(mov_extent)) * 0.15))
+                        )
+                        # Shrink oversized moving bbox (e.g. scanner disk artifact) vs reference.
+                        # Paired .nii.mask.gz files are sub-anatomical segmentations, not head geometry.
+                        mov_cap = ref_extent * 1.35 + 2.0 * rotation_margin
+                        raw_mov_extent = mov_content_high - mov_content_low
+                        mov_content_low, mov_content_high = _cap_mask_bbox_to_extent(
+                            mov_content_low,
+                            mov_content_high,
+                            scan_centroid,
+                            mov_cap,
+                            scan_data.shape,
+                        )
+                        mov_extent = np.asarray(mov_content_high - mov_content_low, dtype=np.float64)
+                        if np.any((mov_content_high - mov_content_low) < raw_mov_extent):
+                            _ants_rigid_log(
+                                scan_name,
+                                f"capped moving content bbox to ref-scaled extent "
+                                f"(max {mov_cap.astype(int).tolist()} vox)",
+                            )
+                        max_est_voxels = int(
+                            (ants_rigid_opts if method.lower() == 'ants' else gpu_rigid_opts).get(
+                                "max_estimation_voxels", 40_000_000
+                            )
+                        )
+                        union_layout = build_union_registration_canvas(
+                            reference_centroid,
+                            scan_centroid,
+                            ref_content_low,
+                            ref_content_high,
+                            mov_content_low,
+                            mov_content_high,
+                            canvas_margin,
+                            max_estimation_voxels=max_est_voxels,
+                            rotation_margin_voxels=rotation_margin,
+                        )
+                        canvas_shape = union_layout["canvas_shape"]
+                        ref_paste = union_layout["ref_paste"]
+                        mov_paste = union_layout["mov_paste"]
+                        centroid_delta = union_layout["centroid_delta"]
+                        estimation_stride = int(union_layout["estimation_stride"])
+                        estimation_shape = union_layout["estimation_shape"]
+
+                        reference_on_canvas = paste_volume_on_canvas_clipped(
+                            reference_data,
+                            ref_paste,
+                            canvas_shape,
+                            background_value,
+                        )
+                        moving_on_canvas = paste_volume_on_canvas_clipped(
+                            scan_data,
+                            mov_paste,
+                            canvas_shape,
+                            background_value,
+                        )
+
+                        use_reg_mask = bool(
+                            (ants_rigid_opts if method.lower() == 'ants' else gpu_rigid_opts).get(
+                                "use_registration_mask", True
+                            )
+                        )
+                        reference_mask_on_canvas = None
+                        moving_mask_on_canvas = None
+                        if use_reg_mask:
+                            reference_mask_on_canvas = paste_volume_on_canvas_clipped(
+                                reference_content_mask.astype(np.uint8),
+                                ref_paste,
+                                canvas_shape,
+                                0,
+                            ).astype(bool)
+                            moving_mask_on_canvas = paste_volume_on_canvas_clipped(
+                                scan_content_mask.astype(np.uint8),
+                                mov_paste,
+                                canvas_shape,
+                                0,
+                            ).astype(bool)
 
                         _ants_rigid_log(
                             scan_name,
-                            f"scipy rigid apply starting — reference_shape={reference_shape}",
+                            f"estimation canvas: shape {canvas_shape} stride={estimation_stride} "
+                            f"est_grid={estimation_shape} rotation_margin={rotation_margin} "
+                            f"(ref paste {ref_paste.tolist()}, mov paste {mov_paste.tolist()}, "
+                            f"delta {centroid_delta.tolist()})",
                         )
-                        # scan_data is already scale-matched in-place when ``scaling`` is enabled.
-                        warp = self._apply_scipy_rigid_from_ants_mat(
+                        if estimation_stride >= 4:
+                            _ants_rigid_log(
+                                scan_name,
+                                f"estimation stride {estimation_stride} forced by canvas size "
+                                f"({int(np.prod(estimation_shape)):,} voxels); tighten canvas "
+                                f"(crop artifact) or raise max_estimation_voxels for stride 2–3",
+                            )
+
+                        moving_image_range = [float(np.min(scan_data)), float(np.max(scan_data))]
+                    
+                        method_label = "GPU Rigid" if method.lower() == "gpu-rigid" else "ANTs"
+                        if channel_layer is not None:
+                            progress = ((idx+(4/9)) / total_scans)
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': scan_name,
+                                    'custom_message': f'Performing {method_label} registration for {scan_name}...',
+                                    'total': total_scans,
+                                    'current': idx + 1,
+                                }
+                            )
+                    
+                        # Store original data type and range
+                        reference_range = [float(np.min(reference_data)), float(np.max(reference_data))]
+                    
+                        print(f"Original dtype: {original_dtype}")
+                        print(f"Moving image range: {moving_image_range}")
+                        print(f"Reference range: {reference_range}")                
+
+                        reference_base_path = self.get_reference_base_path(directory, reference)
+                        fixed_image_ants = ants.image_read(os.path.join(reference_base_path, f"{reference}.nii.gz"))
+                        fixed_image_spacing = fixed_image_ants.spacing
+                        fixed_image_origin = fixed_image_ants.origin
+                        fixed_image_direction = fixed_image_ants.direction
+
+                        fixed_image_ants = None
+                        cleanup_memory()
+
+                        half_spacing = tuple(float(s) * estimation_stride for s in fixed_image_spacing)
+                        ants_canvas_origin = ants_origin_for_canvas_paste(
+                            fixed_image_origin,
+                            fixed_image_direction,
+                            ref_paste,
+                            fixed_image_spacing,
+                        )
+                        ants_rotation_center_voxel = np.asarray(reference_centroid, dtype=np.float64)
+                        est_slices = tuple(slice(None, None, estimation_stride) for _ in range(3))
+
+                        adjusted_background_value = self.registration_tools.get_adjusted_background_value(
+                            background_value, scan_data.astype(np.float32), new_min=-1, new_max=1
+                        )
+                        print(f"Adjusted background value: {adjusted_background_value} from {background_value}")
+                    
+                        print(
+                            f"Creating normalized ANTs images for estimation "
+                            f"(stride={estimation_stride}, grid={estimation_shape})"
+                        )
+
+                        fixed_image_data = ants.from_numpy(
+                            self.registration_tools.min_max_normalize(
+                                reference_on_canvas[est_slices].astype(np.float32), new_min=-1, new_max=1
+                            ),
+                            spacing=half_spacing,
+                            origin=tuple(float(x) for x in ants_canvas_origin),
+                            direction=fixed_image_direction,
+                        )
+
+                        moving_image_data = ants.from_numpy(
+                            self.registration_tools.min_max_normalize(
+                                moving_on_canvas[est_slices].astype(np.float32), new_min=-1, new_max=1
+                            ),
+                            spacing=half_spacing,
+                            origin=tuple(float(x) for x in ants_canvas_origin),
+                            direction=fixed_image_direction,
+                        )
+
+                        fixed_image_mask = None
+                        moving_image_mask = None
+                        if use_reg_mask and reference_mask_on_canvas is not None:
+                            fixed_image_mask = _ants_binary_mask_image(
+                                reference_mask_on_canvas[est_slices],
+                                half_spacing,
+                                ants_canvas_origin,
+                                fixed_image_direction,
+                                dilate_iters=3,
+                            )
+                            moving_image_mask = _ants_binary_mask_image(
+                                moving_mask_on_canvas[est_slices],
+                                half_spacing,
+                                ants_canvas_origin,
+                                fixed_image_direction,
+                                dilate_iters=3,
+                            )
+                            _ants_rigid_log(scan_name, "content masks enabled for Rigid registration")
+                        elif use_reg_mask:
+                            _ants_rigid_log(scan_name, "content masks requested but unavailable")
+                        else:
+                            _ants_rigid_log(
+                                scan_name,
+                                "masks off — Mattes MI uses full voxel grid (texture-driven)",
+                            )
+                
+                        cleanup_memory()
+
+                        if method.lower() == 'gpu-rigid':
+                            _ants_rigid_log(scan_name, f"=== GPU Rigid (FireANTs): {scan_name} -> {reference} ===")
+                            _ants_rigid_log(scan_name, f"gpu_rigid_options: {gpu_rigid_opts}")
+                            _ants_rigid_log(
+                                scan_name,
+                                f"estimation grid shape fixed={fixed_image_data.shape} moving={moving_image_data.shape}, "
+                                f"spacing={fixed_image_data.spacing}, stride={estimation_stride}",
+                            )
+                            try:
+                                gpu_debug_dir = None
+                                if gpu_rigid_opts.get("debug_checkpoints", True):
+                                    gpu_debug_dir = resolve_gpu_rigid_debug_dir(directory, scan_name)
+                                    _ants_rigid_log(scan_name, f"GPU Rigid debug checkpoints → {gpu_debug_dir}")
+                                gpu_result = run_gpu_rigid_registration(
+                                    fixed_image_data,
+                                    moving_image_data,
+                                    gpu_rigid_opts,
+                                    scan_name=scan_name,
+                                    fixed_mask=fixed_image_mask,
+                                    moving_mask=moving_image_mask,
+                                    reference_shape=reference_shape,
+                                    canvas_shape=canvas_shape,
+                                    estimation_stride=estimation_stride,
+                                    debug_dir=gpu_debug_dir,
+                                    reference_name=reference,
+                                )
+                            except GpuRigidError as exc:
+                                print(f"GPU Rigid failed for {scan_name}: {exc}")
+                                if gpu_rigid_opts.get("debug_checkpoints", True):
+                                    print(
+                                        f"GPU Rigid debug checkpoints saved under "
+                                        f"extracted/{scan_name}/gpu-rigid-debug/"
+                                    )
+                                continue
+                            gpu_initializer_record = gpu_result.get("initializer_record")
+                            mat_path = gpu_result["mat_path"]
+                            gpu_rigid_R = gpu_result.get("R")
+                            gpu_rigid_t = gpu_result.get("t")
+                            rigid_transform = {"fwdtransforms": [mat_path]}
+                            _log_ants_rigid_transform_summary(scan_name, mat_path)
+                        else:
+                            _ants_rigid_log(scan_name, f"=== ANTs rigid: {scan_name} -> {reference} ===")
+                            _ants_rigid_log(scan_name, _format_ants_rigid_opts_for_log(ants_rigid_opts))
+                            _ants_rigid_log(
+                                scan_name,
+                                f"estimation grid shape fixed={fixed_image_data.shape} moving={moving_image_data.shape}, "
+                                f"spacing={fixed_image_data.spacing}, stride={estimation_stride}",
+                            )
+
+                            # affine_initializer → Affine registration → project to rigid (R,t only).
+                            initial_transform, ants_initializer_record = compute_ants_rigid_initial_transform(
+                                fixed_image_data, moving_image_data, ants_rigid_opts, scan_name=scan_name
+                            )
+                            if isinstance(initial_transform, str):
+                                _ants_rigid_log(scan_name, f"Affine registration initial_transform file: {initial_transform}")
+                            else:
+                                _ants_rigid_log(scan_name, f"Affine registration initial_transform: {initial_transform}")
+
+                            reg_identity_ncc, reg_identity_iou = _score_rigid_on_overlap(
+                                fixed_image_data, moving_image_data, np.eye(3), np.zeros(3)
+                            )
+                            _ants_rigid_log(
+                                scan_name,
+                                f"registration-grid identity baseline: ncc={reg_identity_ncc:.3f} "
+                                f"iou={reg_identity_iou:.3f}",
+                            )
+
+                            def _run_affine_registration(initial_tx, use_masks=True):
+                                reg_kwargs = {
+                                    "fixed": fixed_image_data,
+                                    "moving": moving_image_data,
+                                    "type_of_transform": "Affine",
+                                    "aff_metric": ants_rigid_opts["aff_metric"],
+                                    "aff_iterations": ants_rigid_opts["aff_iterations"],
+                                    "aff_shrink_factors": ants_rigid_opts["aff_shrink_factors"],
+                                    "aff_smoothing_sigmas": ants_rigid_opts["aff_smoothing_sigmas"],
+                                    "aff_sampling": ants_rigid_opts["aff_sampling"],
+                                    "aff_random_sampling_rate": ants_rigid_opts["aff_random_sampling_rate"],
+                                    "grad_step": ants_rigid_opts["grad_step"],
+                                    "use_histogram_matching": ants_rigid_opts["use_histogram_matching"],
+                                    "initial_transform": initial_tx,
+                                    "singleprecision": ants_rigid_opts["singleprecision"],
+                                    "verbose": True,
+                                }
+                                if use_masks and fixed_image_mask is not None:
+                                    reg_kwargs["mask"] = fixed_image_mask
+                                if use_masks and moving_image_mask is not None:
+                                    reg_kwargs["moving_mask"] = moving_image_mask
+                                return antsWorker.registration(**reg_kwargs)
+
+                            def _registration_quality_ok_from_mat(mat_path):
+                                if not mat_path:
+                                    return False, None, -1.0, 0.0
+                                ncc, iou = _score_ants_rigid_transform(
+                                    fixed_image_data, moving_image_data, mat_path
+                                )
+                                improved = (
+                                    iou >= reg_identity_iou - 0.01
+                                    and (ncc >= reg_identity_ncc + 0.01 or iou >= reg_identity_iou + 0.02)
+                                )
+                                return improved, mat_path, ncc, iou
+
+                            started_from_initializer = _initial_transform_from_initializer(initial_transform)
+
+                            _ants_rigid_log(
+                                scan_name,
+                                "ants.registration (Affine) starting — ITK iteration log follows below",
+                            )
+                            affine_reg = _ants_run_with_heartbeat(
+                                scan_name,
+                                "ants.registration (Affine)",
+                                lambda: _run_affine_registration(initial_transform, use_masks=True),
+                                interval_sec=45.0,
+                            )
+                            rigid_transform, mat_path = project_affine_mat_path_to_rigid_transform(
+                                affine_reg, scan_name=scan_name
+                            )
+                            ok, mat_path, reg_ncc, reg_iou = _registration_quality_ok_from_mat(mat_path)
+                            if not ok and fixed_image_mask is not None:
+                                _ants_rigid_log(
+                                    scan_name,
+                                    f"ants.registration weak with masks (ncc={reg_ncc:.3f} iou={reg_iou:.3f}); "
+                                    "retrying same initial transform without masks",
+                                )
+                                affine_reg = _ants_run_with_heartbeat(
+                                    scan_name,
+                                    "ants.registration (Affine, no masks)",
+                                    lambda: _run_affine_registration(initial_transform, use_masks=False),
+                                    interval_sec=45.0,
+                                )
+                                rigid_transform, mat_path = project_affine_mat_path_to_rigid_transform(
+                                    affine_reg, scan_name=scan_name
+                                )
+                                ok, mat_path, reg_ncc, reg_iou = _registration_quality_ok_from_mat(mat_path)
+                            if not ok and not started_from_initializer:
+                                _ants_rigid_log(
+                                    scan_name,
+                                    f"ants.registration result weak (ncc={reg_ncc:.3f} iou={reg_iou:.3f} "
+                                    f"vs identity ncc={reg_identity_ncc:.3f} iou={reg_identity_iou:.3f}); "
+                                    "retrying from Identity",
+                                )
+                                affine_reg = _ants_run_with_heartbeat(
+                                    scan_name,
+                                    "ants.registration (Affine retry Identity)",
+                                    lambda: _run_affine_registration(["Identity"], use_masks=False),
+                                    interval_sec=45.0,
+                                )
+                                rigid_transform, mat_path = project_affine_mat_path_to_rigid_transform(
+                                    affine_reg, scan_name=scan_name
+                                )
+                                ok, mat_path, reg_ncc, reg_iou = _registration_quality_ok_from_mat(mat_path)
+                                _ants_rigid_log(
+                                    scan_name,
+                                    f"Identity retry quality: ncc={reg_ncc:.3f} iou={reg_iou:.3f}",
+                                )
+                            elif not ok and started_from_initializer:
+                                _ants_rigid_log(
+                                    scan_name,
+                                    f"keeping initializer-based Affine→rigid result despite weak score vs identity "
+                                    f"(ncc={reg_ncc:.3f} iou={reg_iou:.3f} vs identity ncc={reg_identity_ncc:.3f} "
+                                    f"iou={reg_identity_iou:.3f})",
+                                )
+                            else:
+                                _ants_rigid_log(
+                                    scan_name,
+                                    f"registration quality ok: ncc={reg_ncc:.3f} iou={reg_iou:.3f}",
+                                )
+
+                            if mat_path:
+                                _log_ants_rigid_transform_summary(scan_name, mat_path)
+
+                        moving_image_data = None
+                        fixed_image_data = None
+                        fixed_image_mask = None
+                        moving_image_mask = None
+                        reference_mask_on_canvas = None
+                        moving_mask_on_canvas = None
+                        if method.lower() != "gpu-rigid":
+                            reference_on_canvas = None
+                            moving_on_canvas = None
+                        if method.lower() == "gpu-rigid":
+                            try:
+                                import torch
+
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                        cleanup_memory()
+
+                        print("Rigid transformation complete")
+
+                        if method.lower() == "gpu-rigid":
+                            if gpu_rigid_R is None or gpu_rigid_t is None:
+                                print(f"GPU Rigid missing R/t for {scan_name}, skipping")
+                                continue
+                            _ants_rigid_log(
+                                scan_name,
+                                "Applying GPU pose on union canvas (same frame as estimation/debug)",
+                            )
+                            warped_canvas = apply_rigid_rt_on_union_canvas(
+                                moving_on_canvas,
+                                gpu_rigid_R,
+                                gpu_rigid_t,
+                                spacing=fixed_image_spacing,
+                                reference_origin=fixed_image_origin,
+                                direction=fixed_image_direction,
+                                ref_paste=ref_paste,
+                                reference_canvas=reference_on_canvas,
+                                defaultvalue=background_value,
+                            )
+                            reference_on_canvas = None
+                            moving_on_canvas = None
+                            cleanup_memory()
+                            transformed_data = crop_registration_canvas_to_reference(
+                                warped_canvas, ref_paste, reference_shape
+                            )
+                            del warped_canvas
+                            rotation = np.asarray(gpu_rigid_R, dtype=np.float64).T
+                            padding_low = np.zeros(3, dtype=np.int64)
+                            padding_high = np.zeros(3, dtype=np.int64)
+                            offset = np.zeros(3, dtype=np.float64)
+                            centroid_translation = np.zeros(3, dtype=np.float64)
+                            padded_scan_centroid = np.asarray(scan_centroid, dtype=np.float64)
+                            reference_centroid_voxel = np.asarray(reference_centroid, dtype=np.float64)
+                            rs = tuple(int(s) for s in reference_shape)
+                            in_start_x, in_end_x = 0, rs[0]
+                            in_start_y, in_end_y = 0, rs[1]
+                            in_start_z, in_end_z = 0, rs[2]
+                            out_start_x, out_end_x = 0, rs[0]
+                            out_start_y, out_end_y = 0, rs[1]
+                            out_start_z, out_end_z = 0, rs[2]
+                            padding_bottom_val = padding_low
+                            padding_top_val = padding_high
+                            translation = centroid_translation
+                            print(
+                                f"After GPU canvas apply: {np.min(transformed_data)} to {np.max(transformed_data)}"
+                            )
+                            self.store_alignment_embedding(
+                                method,
+                                {
+                                    "padding_low": padding_low,
+                                    "padding_high": padding_high,
+                                    "rotation": rotation,
+                                    "offset": offset,
+                                    "centroid_translation": centroid_translation,
+                                    "padded_scan_centroid": padded_scan_centroid,
+                                    "reference_centroid_voxel": reference_centroid_voxel,
+                                    "crop_indices": {
+                                        "x": (in_start_x, in_end_x),
+                                        "y": (in_start_y, in_end_y),
+                                        "z": (in_start_z, in_end_z),
+                                    },
+                                    "reference_shape": reference_shape,
+                                    "reference_voxel_size": reference_voxel_size,
+                                    "original_voxel_size": original_voxel_size,
+                                    "scale_match": float(scale_match),
+                                },
+                            )
+                            scan_data = None
+                            cleanup_memory()
+                        else:
+                            print("Projecting ANTs pose into scipy rigid and applying on reference FOV")
+
+                            ants_mat_path = mat_path
+                            if not ants_mat_path or not os.path.isfile(ants_mat_path):
+                                for candidate in (
+                                    list(rigid_transform.get('fwdtransforms') or [])
+                                    + list(rigid_transform.get('invtransforms') or [])
+                                ):
+                                    if isinstance(candidate, str) and candidate.endswith('.mat') and os.path.isfile(candidate):
+                                        ants_mat_path = candidate
+                                        break
+                            if not ants_mat_path:
+                                print(f"No GenericAffine .mat from registration for {scan_name}, skipping")
+                                continue
+
+                            _ants_rigid_log(
+                                scan_name,
+                                f"scipy rigid apply starting — reference_shape={reference_shape}",
+                            )
+                            # scan_data is already scale-matched in-place when ``scaling`` is enabled.
+                            warp = self._apply_scipy_rigid_from_ants_mat(
+                                scan_data,
+                                reference_data,
+                                ants_mat_path,
+                                scan_centroid_voxel=scan_centroid,
+                                reference_centroid_voxel=reference_centroid,
+                                rotation_center_voxel=ants_rotation_center_voxel,
+                                fixed_spacing=fixed_image_spacing,
+                                fixed_origin=fixed_image_origin,
+                                fixed_direction=fixed_image_direction,
+                                mov_paste=mov_paste,
+                                ref_paste=ref_paste,
+                                reference_shape=reference_shape,
+                                background_value=background_value,
+                                interpolation_order=interpolation_order,
+                                border_width=border_width,
+                                original_voxel_size=original_voxel_size,
+                                reference_voxel_size=reference_voxel_size,
+                                scale_match=1.0,
+                                foreground_threshold=threshold,
+                                scan_name=scan_name,
+                            )
+                            if warp is None:
+                                print(f"Scipy rigid warp failed for {scan_name}, skipping")
+                                continue
+
+                            transformed_data = warp['transformed_data']
+                            rotation = warp['rotation']
+                            offset = warp['offset']
+                            padding_low = warp['padding_low']
+                            padding_high = warp['padding_high']
+                            centroid_translation = warp['centroid_translation']
+                            padded_scan_centroid = warp['padded_scan_centroid']
+                            reference_centroid_voxel = warp['reference_centroid_voxel']
+                            in_start_x, in_end_x = warp['in_start_x'], warp['in_end_x']
+                            in_start_y, in_end_y = warp['in_start_y'], warp['in_end_y']
+                            in_start_z, in_end_z = warp['in_start_z'], warp['in_end_z']
+                            out_start_x, out_end_x = warp['out_start_x'], warp['out_end_x']
+                            out_start_y, out_end_y = warp['out_start_y'], warp['out_end_y']
+                            out_start_z, out_end_z = warp['out_start_z'], warp['out_end_z']
+                            padding_bottom_val = padding_low
+                            padding_top_val = padding_high
+                            translation = centroid_translation
+
+                            scan_data = None
+                            cleanup_memory()
+
+                            print(f"After scipy rigid warp: {np.min(transformed_data)} to {np.max(transformed_data)}")
+
+                            # Volume was size-matched before registration, so the warp
+                            # itself did not zoom. Record that factor for landmarks.
+                            if isinstance(warp.get('embed'), dict):
+                                warp['embed']['scale_match'] = float(scale_match)
+                            self.store_alignment_embedding(method, warp['embed'])
+
+                    # -------------------------------------------------------------------------------------------------------
+                    # -------------------------------------- Manual Guidepoints Method --------------------------------------
+                    # -------------------------------------------------------------------------------------------------------
+                
+                    elif method.lower() == 'manual-guidepoints':
+                        channel_layer = get_channel_layer()
+                        if channel_layer is not None:
+                            progress = ((idx+(3/9)) / total_scans)
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': scan_name,
+                                    'custom_message': f'Preparing guidepoint-based alignment for {scan_name}...',
+                                    'total': total_scans,
+                                    'current': idx + 1,
+                                }
+                            )
+
+                        # Load subject guidepoints (from the latest edit or original if no edits)
+                        if latest_edit >= 0:
+                            subject_guidepoints_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*_guidepoints.json"))
+                        else:
+                            subject_guidepoints_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_guidepoints.json"))
+
+                        if len(subject_guidepoints_path) > 0:
+                            subject_guidepoints_path = subject_guidepoints_path[0]
+                        else:
+                            print(f"No guidepoints found for subject {scan_name}, skipping")
+                            continue
+
+                        with open(subject_guidepoints_path, 'r') as f:
+                            subject_guidepoints = np.array(json.load(f))
+
+                        if reference_guidepoints.shape != subject_guidepoints.shape:
+                            print(f"Guidepoint arrays for reference and subject {scan_name} have different shapes")
+                            print(f"Reference: {reference_guidepoints.shape}, Subject: {subject_guidepoints.shape}")
+                            continue
+
+                        if scaling:
+                            raw_scale = centroid_size_scale_factor(reference_guidepoints, subject_guidepoints)
+                            scan_data, scale_match = zoom_volume_to_scale(
+                                scan_data,
+                                raw_scale,
+                                background_value,
+                                order=interpolation_order,
+                            )
+                            subject_guidepoints = np.asarray(subject_guidepoints, dtype=np.float64) * float(scale_match)
+                            print(f"Guidepoint centroid-size scale for {scan_name}: {scale_match:.6f}")
+
+                        channel_layer = get_channel_layer()
+                        if channel_layer is not None:
+                            progress = ((idx+(4/9)) / total_scans)
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': scan_name,
+                                    'custom_message': f'Calculating guidepoint-based transformation for {scan_name}...',
+                                    'total': total_scans,
+                                    'current': idx + 1,
+                                }
+                            )
+
+                        # Points and volume are already scaled. Passing the factor
+                        # again would zoom the volume a second time.
+                        warp = self._apply_rigid_warp_from_point_pairs(
                             scan_data,
                             reference_data,
-                            ants_mat_path,
-                            scan_centroid_voxel=scan_centroid,
-                            reference_centroid_voxel=reference_centroid,
-                            rotation_center_voxel=ants_rotation_center_voxel,
-                            fixed_spacing=fixed_image_spacing,
-                            fixed_origin=fixed_image_origin,
-                            fixed_direction=fixed_image_direction,
-                            mov_paste=mov_paste,
-                            ref_paste=ref_paste,
-                            reference_shape=reference_shape,
-                            background_value=background_value,
-                            interpolation_order=interpolation_order,
-                            border_width=border_width,
-                            original_voxel_size=original_voxel_size,
-                            reference_voxel_size=reference_voxel_size,
+                            subject_guidepoints,
+                            reference_guidepoints,
+                            voxel_size,
+                            reference_voxel_size,
+                            reference_shape,
+                            background_value,
+                            interpolation_order,
+                            border_width,
+                            original_voxel_size,
                             scale_match=1.0,
-                            foreground_threshold=threshold,
                             scan_name=scan_name,
                         )
                         if warp is None:
-                            print(f"Scipy rigid warp failed for {scan_name}, skipping")
                             continue
+
+                        channel_layer = get_channel_layer()
+                        if channel_layer is not None:
+                            progress = ((idx+(5/9)) / total_scans)
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': scan_name,
+                                    'custom_message': f'Applying guidepoint-based transformation to {scan_name}...',
+                                    'total': total_scans,
+                                    'current': idx + 1,
+                                }
+                            )
 
                         transformed_data = warp['transformed_data']
                         rotation = warp['rotation']
@@ -5696,72 +5847,182 @@ class AlignToReferenceView(APIView):
                         out_start_x, out_end_x = warp['out_start_x'], warp['out_end_x']
                         out_start_y, out_end_y = warp['out_start_y'], warp['out_end_y']
                         out_start_z, out_end_z = warp['out_start_z'], warp['out_end_z']
-                        padding_bottom_val = padding_low
-                        padding_top_val = padding_high
-                        translation = centroid_translation
 
                         scan_data = None
                         cleanup_memory()
 
-                        print(f"After scipy rigid warp: {np.min(transformed_data)} to {np.max(transformed_data)}")
-
-                        # Volume was size-matched before registration, so the warp
-                        # itself did not zoom. Record that factor for landmarks.
                         if isinstance(warp.get('embed'), dict):
                             warp['embed']['scale_match'] = float(scale_match)
-                        self.store_alignment_embedding(method, warp['embed'])
+                        self.store_alignment_embedding('manual-guidepoints', warp['embed'])
 
-                # -------------------------------------------------------------------------------------------------------
-                # -------------------------------------- Manual Guidepoints Method --------------------------------------
-                # -------------------------------------------------------------------------------------------------------
-                
-                elif method.lower() == 'manual-guidepoints':
-                    channel_layer = get_channel_layer()
-                    if channel_layer is not None:
-                        progress = ((idx+(3/9)) / total_scans)
-                        async_to_sync(channel_layer.group_send)(
-                            'progress_group',
-                            {
-                                'type': 'send_progress',
-                                'progress': progress,
-                                'scan_name': scan_name,
-                                'custom_message': f'Preparing guidepoint-based alignment for {scan_name}...',
-                                'total': total_scans,
-                                'current': idx + 1,
-                            }
+                    elif method.lower() == 'dino-reg':
+                        from .dinoRegRigid import DinoRegError, find_dino_reg_rigid_pose
+
+                        channel_layer = get_channel_layer()
+                        if channel_layer is not None:
+                            progress = ((idx+(3/9)) / total_scans)
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': scan_name,
+                                    'custom_message': f'Encoding DINOv3 features for {scan_name}...',
+                                    'total': total_scans,
+                                    'current': idx + 1,
+                                }
+                            )
+
+                        def _dino_progress(message):
+                            progress_layer = get_channel_layer()
+                            if progress_layer is not None:
+                                async_to_sync(progress_layer.group_send)(
+                                    'progress_group',
+                                    {
+                                        'type': 'send_progress',
+                                        'progress': ((idx+(4/9)) / total_scans),
+                                        'scan_name': scan_name,
+                                        'custom_message': message,
+                                        'total': total_scans,
+                                        'current': idx + 1,
+                                    }
+                                )
+
+                        try:
+                            from .dinoRegDebug import resolve_dino_reg_debug_dir
+                            dino_debug_dir = resolve_dino_reg_debug_dir(directory, scan_name)
+                            pose = find_dino_reg_rigid_pose(
+                                reference_data,
+                                scan_data,
+                                reference_voxel_size,
+                                voxel_size,
+                                scan_name=scan_name,
+                                reference_name=reference,
+                                moving_threshold=threshold,
+                                fixed_threshold=reference_threshold,
+                                debug_dir=dino_debug_dir,
+                                progress_callback=_dino_progress,
+                            )
+                        except DinoRegError as exc:
+                            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+                        if pose is None:
+                            print(
+                                f"DINO-Reg could not support a rigid for {scan_name} "
+                                "(semantic landmarks / refine / pyramid); skipping"
+                            )
+                            continue
+
+                        # Pose extras → alignment_rigid_provenance.dino_reg_result for Scientific Report.
+                        dino_reg_result = {
+                            key: pose[key]
+                            for key in (
+                                "source",
+                                "probe_name",
+                                "angle_deg",
+                                "refined_cosine",
+                                "label",
+                            )
+                            if key in pose and pose[key] is not None
+                        }
+
+                        _dino_progress(f'Applying DINO-Reg rigid warp to {scan_name}...')
+                        # Content-mask centroids on the resampled reference grid (not DINO FG centroids).
+                        # Physical p_fixed = R @ p_moving + t → scipy rotate-about-scan_c + residual + canvas snap.
+                        scan_content_mask = _content_mask_from_threshold(
+                            scan_data, threshold, sigma=1.0
                         )
-
-                    # Load subject guidepoints (from the latest edit or original if no edits)
-                    if latest_edit >= 0:
-                        subject_guidepoints_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*_guidepoints.json"))
-                    else:
-                        subject_guidepoints_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_guidepoints.json"))
-
-                    if len(subject_guidepoints_path) > 0:
-                        subject_guidepoints_path = subject_guidepoints_path[0]
-                    else:
-                        print(f"No guidepoints found for subject {scan_name}, skipping")
-                        continue
-
-                    with open(subject_guidepoints_path, 'r') as f:
-                        subject_guidepoints = np.array(json.load(f))
-
-                    if reference_guidepoints.shape != subject_guidepoints.shape:
-                        print(f"Guidepoint arrays for reference and subject {scan_name} have different shapes")
-                        print(f"Reference: {reference_guidepoints.shape}, Subject: {subject_guidepoints.shape}")
-                        continue
-
-                    if scaling:
-                        raw_scale = centroid_size_scale_factor(reference_guidepoints, subject_guidepoints)
-                        scan_data, scale_match = zoom_volume_to_scale(
+                        reference_content_mask = _content_mask_from_threshold(
+                            reference_data, reference_threshold, sigma=1.0
+                        )
+                        scan_centroid_voxel = _centroid_of_mask(scan_content_mask)
+                        reference_centroid_voxel = _centroid_of_mask(reference_content_mask)
+                        scipy_rotation, scipy_scan_c, scipy_ref_c, residual_translation = (
+                            project_physical_rigid_rt_to_scipy_rigid_params(
+                                pose["R"],
+                                pose["t"],
+                                scan_centroid_voxel,
+                                reference_centroid_voxel,
+                                reference_voxel_size,
+                                scan_name=scan_name,
+                            )
+                        )
+                        print(
+                            f"DINO-Reg {scan_name} scipy apply: "
+                            f"content centroids scan={scipy_scan_c.round(1).tolist()} "
+                            f"ref={scipy_ref_c.round(1).tolist()} "
+                            f"residual_vox={residual_translation.round(2).tolist()} "
+                            f"angle≈{float(pose.get('angle_deg', 0)):.1f}°"
+                        )
+                        warp = self._apply_scipy_rigid_volume_warp(
                             scan_data,
-                            raw_scale,
+                            reference_data,
+                            scipy_rotation,
+                            scipy_scan_c,
+                            scipy_ref_c,
+                            reference_shape,
                             background_value,
-                            order=interpolation_order,
+                            interpolation_order,
+                            border_width,
+                            original_voxel_size,
+                            reference_voxel_size,
+                            scale_match=1.0,
+                            residual_translation=residual_translation,
+                            scan_name=scan_name,
                         )
-                        subject_guidepoints = np.asarray(subject_guidepoints, dtype=np.float64) * float(scale_match)
-                        print(f"Guidepoint centroid-size scale for {scan_name}: {scale_match:.6f}")
+                        if warp is None:
+                            continue
 
+                        if dino_debug_dir:
+                            try:
+                                from .dinoRegDebug import append_dino_reg_apply_forensics
+                                append_dino_reg_apply_forensics(
+                                    dino_debug_dir,
+                                    pose=pose,
+                                    reference_data=reference_data,
+                                    transformed_data=warp["transformed_data"],
+                                    scan_content_mask=scan_content_mask,
+                                    reference_content_mask=reference_content_mask,
+                                    scan_centroid_voxel=scipy_scan_c,
+                                    reference_centroid_voxel=scipy_ref_c,
+                                    scipy_rotation=scipy_rotation,
+                                    residual_translation_voxel=residual_translation,
+                                    warp=warp,
+                                    reference_voxel_size=float(reference_voxel_size),
+                                    scan_name=scan_name,
+                                )
+                            except Exception as debug_exc:
+                                print(f"DINO-Reg apply debug forensics skipped for {scan_name}: {debug_exc}")
+
+                        transformed_data = warp['transformed_data']
+                        rotation = warp['rotation']
+                        offset = warp['offset']
+                        padding_low = warp['padding_low']
+                        padding_high = warp['padding_high']
+                        centroid_translation = warp['centroid_translation']
+                        padded_scan_centroid = warp['padded_scan_centroid']
+                        reference_centroid_voxel = warp['reference_centroid_voxel']
+                        in_start_x, in_end_x = warp['in_start_x'], warp['in_end_x']
+                        in_start_y, in_end_y = warp['in_start_y'], warp['in_end_y']
+                        in_start_z, in_end_z = warp['in_start_z'], warp['in_end_z']
+                        out_start_x, out_end_x = warp['out_start_x'], warp['out_end_x']
+                        out_start_y, out_end_y = warp['out_start_y'], warp['out_end_y']
+                        out_start_z, out_end_z = warp['out_start_z'], warp['out_end_z']
+
+                        scan_data = None
+                        cleanup_memory()
+                        if isinstance(warp.get('embed'), dict):
+                            warp['embed']['scale_match'] = float(scale_match)
+                        self.store_alignment_embedding('dino-reg', warp['embed'])
+
+                    else:
+                        # Unknown method
+                        return Response({'error': f'Unknown alignment method: {method}'}, status=status.HTTP_400_BAD_REQUEST)
+
+                    # ------- Alignment complete, now some general cleanup -------
+                
+
+                    # Send progress update for cleaning aligned data
                     channel_layer = get_channel_layer()
                     if channel_layer is not None:
                         progress = ((idx+(4/9)) / total_scans)
@@ -5771,32 +6032,23 @@ class AlignToReferenceView(APIView):
                                 'type': 'send_progress',
                                 'progress': progress,
                                 'scan_name': scan_name,
-                                'custom_message': f'Calculating guidepoint-based transformation for {scan_name}...',
+                                'custom_message': f'Cleaning the aligned voxel data from {scan_name}...',
                                 'total': total_scans,
                                 'current': idx + 1,
                             }
                         )
+                        print("Cleaning the aligned voxel data from ", scan_name)
 
-                    # Points and volume are already scaled. Passing the factor
-                    # again would zoom the volume a second time.
-                    warp = self._apply_rigid_warp_from_point_pairs(
-                        scan_data,
-                        reference_data,
-                        subject_guidepoints,
-                        reference_guidepoints,
-                        voxel_size,
-                        reference_voxel_size,
-                        reference_shape,
-                        background_value,
-                        interpolation_order,
-                        border_width,
-                        original_voxel_size,
-                        scale_match=1.0,
-                        scan_name=scan_name,
-                    )
-                    if warp is None:
-                        continue
+                    # Check available memory
+                    remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
+                    print(f"Available memory: {remaining_memory:.2f} GB")
 
+                    # Clean the resulting mesh using the class CleanupMeshView and save it in the variable transformed_data
+                    # transformed_data = self.clean_mesh(transformed_data, threshold, original_dtype, background_value)
+                    gc.collect()
+
+                
+                    # Send progress update 
                     channel_layer = get_channel_layer()
                     if channel_layer is not None:
                         progress = ((idx+(5/9)) / total_scans)
@@ -5806,250 +6058,19 @@ class AlignToReferenceView(APIView):
                                 'type': 'send_progress',
                                 'progress': progress,
                                 'scan_name': scan_name,
-                                'custom_message': f'Applying guidepoint-based transformation to {scan_name}...',
+                                'custom_message': f'Performing adjustments to {scan_name}...',
                                 'total': total_scans,
                                 'current': idx + 1,
                             }
                         )
+                        print("Performing adjustments to ", scan_name)
 
-                    transformed_data = warp['transformed_data']
-                    rotation = warp['rotation']
-                    offset = warp['offset']
-                    padding_low = warp['padding_low']
-                    padding_high = warp['padding_high']
-                    centroid_translation = warp['centroid_translation']
-                    padded_scan_centroid = warp['padded_scan_centroid']
-                    reference_centroid_voxel = warp['reference_centroid_voxel']
-                    in_start_x, in_end_x = warp['in_start_x'], warp['in_end_x']
-                    in_start_y, in_end_y = warp['in_start_y'], warp['in_end_y']
-                    in_start_z, in_end_z = warp['in_start_z'], warp['in_end_z']
-                    out_start_x, out_end_x = warp['out_start_x'], warp['out_end_x']
-                    out_start_y, out_end_y = warp['out_start_y'], warp['out_end_y']
-                    out_start_z, out_end_z = warp['out_start_z'], warp['out_end_z']
-
-                    scan_data = None
-                    cleanup_memory()
-
-                    if isinstance(warp.get('embed'), dict):
-                        warp['embed']['scale_match'] = float(scale_match)
-                    self.store_alignment_embedding('manual-guidepoints', warp['embed'])
-
-                elif method.lower() == 'dino-reg':
-                    from .dinoRegRigid import DinoRegError, find_dino_reg_rigid_pose
-
-                    channel_layer = get_channel_layer()
-                    if channel_layer is not None:
-                        progress = ((idx+(3/9)) / total_scans)
-                        async_to_sync(channel_layer.group_send)(
-                            'progress_group',
-                            {
-                                'type': 'send_progress',
-                                'progress': progress,
-                                'scan_name': scan_name,
-                                'custom_message': f'Encoding DINOv3 features for {scan_name}...',
-                                'total': total_scans,
-                                'current': idx + 1,
-                            }
-                        )
-
-                    def _dino_progress(message):
-                        progress_layer = get_channel_layer()
-                        if progress_layer is not None:
-                            async_to_sync(progress_layer.group_send)(
-                                'progress_group',
-                                {
-                                    'type': 'send_progress',
-                                    'progress': ((idx+(4/9)) / total_scans),
-                                    'scan_name': scan_name,
-                                    'custom_message': message,
-                                    'total': total_scans,
-                                    'current': idx + 1,
-                                }
-                            )
-
-                    try:
-                        from .dinoRegDebug import resolve_dino_reg_debug_dir
-                        dino_debug_dir = resolve_dino_reg_debug_dir(directory, scan_name)
-                        pose = find_dino_reg_rigid_pose(
-                            reference_data,
-                            scan_data,
-                            reference_voxel_size,
-                            voxel_size,
-                            scan_name=scan_name,
-                            reference_name=reference,
-                            moving_threshold=threshold,
-                            fixed_threshold=reference_threshold,
-                            debug_dir=dino_debug_dir,
-                            progress_callback=_dino_progress,
-                        )
-                    except DinoRegError as exc:
-                        return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-
-                    if pose is None:
-                        print(
-                            f"DINO-Reg could not support a rigid for {scan_name} "
-                            "(semantic landmarks / refine / pyramid); skipping"
-                        )
-                        continue
-
-                    # Pose extras → alignment_rigid_provenance.dino_reg_result for Scientific Report.
-                    dino_reg_result = {
-                        key: pose[key]
-                        for key in (
-                            "source",
-                            "probe_name",
-                            "angle_deg",
-                            "refined_cosine",
-                            "label",
-                        )
-                        if key in pose and pose[key] is not None
-                    }
-
-                    _dino_progress(f'Applying DINO-Reg rigid warp to {scan_name}...')
-                    # Content-mask centroids on the resampled reference grid (not DINO FG centroids).
-                    # Physical p_fixed = R @ p_moving + t → scipy rotate-about-scan_c + residual + canvas snap.
-                    scan_content_mask = _content_mask_from_threshold(
-                        scan_data, threshold, sigma=1.0
-                    )
-                    reference_content_mask = _content_mask_from_threshold(
-                        reference_data, reference_threshold, sigma=1.0
-                    )
-                    scan_centroid_voxel = _centroid_of_mask(scan_content_mask)
-                    reference_centroid_voxel = _centroid_of_mask(reference_content_mask)
-                    scipy_rotation, scipy_scan_c, scipy_ref_c, residual_translation = (
-                        project_physical_rigid_rt_to_scipy_rigid_params(
-                            pose["R"],
-                            pose["t"],
-                            scan_centroid_voxel,
-                            reference_centroid_voxel,
-                            reference_voxel_size,
-                            scan_name=scan_name,
-                        )
-                    )
-                    print(
-                        f"DINO-Reg {scan_name} scipy apply: "
-                        f"content centroids scan={scipy_scan_c.round(1).tolist()} "
-                        f"ref={scipy_ref_c.round(1).tolist()} "
-                        f"residual_vox={residual_translation.round(2).tolist()} "
-                        f"angle≈{float(pose.get('angle_deg', 0)):.1f}°"
-                    )
-                    warp = self._apply_scipy_rigid_volume_warp(
-                        scan_data,
-                        reference_data,
-                        scipy_rotation,
-                        scipy_scan_c,
-                        scipy_ref_c,
-                        reference_shape,
-                        background_value,
-                        interpolation_order,
-                        border_width,
-                        original_voxel_size,
-                        reference_voxel_size,
-                        scale_match=1.0,
-                        residual_translation=residual_translation,
-                        scan_name=scan_name,
-                    )
-                    if warp is None:
-                        continue
-
-                    if dino_debug_dir:
-                        try:
-                            from .dinoRegDebug import append_dino_reg_apply_forensics
-                            append_dino_reg_apply_forensics(
-                                dino_debug_dir,
-                                pose=pose,
-                                reference_data=reference_data,
-                                transformed_data=warp["transformed_data"],
-                                scan_content_mask=scan_content_mask,
-                                reference_content_mask=reference_content_mask,
-                                scan_centroid_voxel=scipy_scan_c,
-                                reference_centroid_voxel=scipy_ref_c,
-                                scipy_rotation=scipy_rotation,
-                                residual_translation_voxel=residual_translation,
-                                warp=warp,
-                                reference_voxel_size=float(reference_voxel_size),
-                                scan_name=scan_name,
-                            )
-                        except Exception as debug_exc:
-                            print(f"DINO-Reg apply debug forensics skipped for {scan_name}: {debug_exc}")
-
-                    transformed_data = warp['transformed_data']
-                    rotation = warp['rotation']
-                    offset = warp['offset']
-                    padding_low = warp['padding_low']
-                    padding_high = warp['padding_high']
-                    centroid_translation = warp['centroid_translation']
-                    padded_scan_centroid = warp['padded_scan_centroid']
-                    reference_centroid_voxel = warp['reference_centroid_voxel']
-                    in_start_x, in_end_x = warp['in_start_x'], warp['in_end_x']
-                    in_start_y, in_end_y = warp['in_start_y'], warp['in_end_y']
-                    in_start_z, in_end_z = warp['in_start_z'], warp['in_end_z']
-                    out_start_x, out_end_x = warp['out_start_x'], warp['out_end_x']
-                    out_start_y, out_end_y = warp['out_start_y'], warp['out_end_y']
-                    out_start_z, out_end_z = warp['out_start_z'], warp['out_end_z']
-
-                    scan_data = None
-                    cleanup_memory()
-                    if isinstance(warp.get('embed'), dict):
-                        warp['embed']['scale_match'] = float(scale_match)
-                    self.store_alignment_embedding('dino-reg', warp['embed'])
-
-                else:
-                    # Unknown method
-                    return Response({'error': f'Unknown alignment method: {method}'}, status=status.HTTP_400_BAD_REQUEST)
-
-                # ------- Alignment complete, now some general cleanup -------
+                    # Check available memory
+                    remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
+                    print(f"Available memory: {remaining_memory:.2f} GB")
                 
 
-                # Send progress update for cleaning aligned data
-                channel_layer = get_channel_layer()
-                if channel_layer is not None:
-                    progress = ((idx+(4/9)) / total_scans)
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Cleaning the aligned voxel data from {scan_name}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
-                    print("Cleaning the aligned voxel data from ", scan_name)
-
-                # Check available memory
-                remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
-                print(f"Available memory: {remaining_memory:.2f} GB")
-
-                # Clean the resulting mesh using the class CleanupMeshView and save it in the variable transformed_data
-                # transformed_data = self.clean_mesh(transformed_data, threshold, original_dtype, background_value)
-                gc.collect()
-
-                
-                # Send progress update 
-                channel_layer = get_channel_layer()
-                if channel_layer is not None:
-                    progress = ((idx+(5/9)) / total_scans)
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Performing adjustments to {scan_name}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
-                    print("Performing adjustments to ", scan_name)
-
-                # Check available memory
-                remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
-                print(f"Available memory: {remaining_memory:.2f} GB")
-                
-
-                """
+                    """
                 # Send progress update 
                 channel_layer = get_channel_layer()
                 if channel_layer is not None:
@@ -6126,165 +6147,162 @@ class AlignToReferenceView(APIView):
                 print(f"min and max from transformed data: {np.min(transformed_data)} {np.max(transformed_data)}")
                 print(f"min and max from reference scan data: {np.min(reference_data)} {np.max(reference_data)}")
                 """
-                alignment_shift = 0
+                    alignment_shift = 0
 
 
-                # Send progress update 
-                channel_layer = get_channel_layer()
-                if channel_layer is not None:
-                    progress = ((idx+(7/9)) / total_scans)
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Saving and compressing the aligned version of {scan_name}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
+                    # Send progress update 
+                    channel_layer = get_channel_layer()
+                    if channel_layer is not None:
+                        progress = ((idx+(7/9)) / total_scans)
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Saving and compressing the aligned version of {scan_name}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
+                        print("Saving and compressing the aligned version of ", scan_name)
+
+                    # Check available memory
+                    remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
+                    print(f"Available memory: {remaining_memory:.2f} GB")
+
+                    # Update metadata with alignment info
+                    previous_threshold = scan_metadata.get('threshold')
+                    previous_stem = (
+                        normalize_threshold_edit_stem(os.path.basename(scan_path), scan_name)
+                        if latest_edit >= 0
+                        else scan_name
                     )
-                    print("Saving and compressing the aligned version of ", scan_name)
-
-                # Check available memory
-                remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
-                print(f"Available memory: {remaining_memory:.2f} GB")
-
-                # Update metadata with alignment info
-                previous_threshold = scan_metadata.get('threshold')
-                previous_stem = (
-                    normalize_threshold_edit_stem(os.path.basename(scan_path), scan_name)
-                    if latest_edit >= 0
-                    else scan_name
-                )
-                snapshot_previous_edit_threshold(scan_metadata, previous_stem, previous_threshold)
-                scan_metadata['threshold'] = int(scan_metadata['threshold']) + int(alignment_shift)
-                scan_metadata['alignment_to'] = reference
-                scan_metadata['alignment_shift'] = float(alignment_shift)
-                scan_metadata['alignment_method'] = method  # Add method information to metadata
-                scan_metadata['alignment_rigid_provenance'] = build_alignment_rigid_provenance(
-                    method,
-                    scaling,
-                    outer_surface,
-                    interpolation,
-                    ants_rigid_opts,
-                    ants_initializer_record,
-                    gpu_rigid_opts if method.lower() == 'gpu-rigid' else None,
-                    gpu_initializer_record if method.lower() == 'gpu-rigid' else None,
-                    dino_reg_result if method.lower() == 'dino-reg' else None,
-                    scale_factor=scale_match,
-                )
-                # Use original_voxel_size: voxel_size may have been overwritten when resampling to reference spacing
-                scan_metadata['alignment_previous_voxel_size'] = original_voxel_size
-                scan_metadata['voxel_size'] = reference_voxel_size
-                if scale_match != 1:
-                    scan_metadata['alignment_scale'] = float(scale_match)
-                else:
-                    scan_metadata.pop('alignment_scale', None)
+                    snapshot_previous_edit_threshold(scan_metadata, previous_stem, previous_threshold)
+                    scan_metadata['threshold'] = int(scan_metadata['threshold']) + int(alignment_shift)
+                    scan_metadata['alignment_to'] = reference
+                    scan_metadata['alignment_shift'] = float(alignment_shift)
+                    scan_metadata['alignment_method'] = method  # Add method information to metadata
+                    scan_metadata['alignment_rigid_provenance'] = build_alignment_rigid_provenance(
+                        method,
+                        scaling,
+                        outer_surface,
+                        interpolation,
+                        ants_rigid_opts,
+                        ants_initializer_record,
+                        gpu_rigid_opts if method.lower() == 'gpu-rigid' else None,
+                        gpu_initializer_record if method.lower() == 'gpu-rigid' else None,
+                        dino_reg_result if method.lower() == 'dino-reg' else None,
+                        scale_factor=scale_match,
+                    )
+                    # Use original_voxel_size: voxel_size may have been overwritten when resampling to reference spacing
+                    scan_metadata['alignment_previous_voxel_size'] = original_voxel_size
+                    scan_metadata['voxel_size'] = reference_voxel_size
+                    if scale_match != 1:
+                        scan_metadata['alignment_scale'] = float(scale_match)
+                    else:
+                        scan_metadata.pop('alignment_scale', None)
                 
-                # Store calculated alignment parameters for future landmark inversion
-                # Determine padding variable based on method
-                alignment_padding = None
-                # ALPACA: residual translation after rotate-about-centroid (matrix t with
-                # centroid terms intentionally omitted by ALPACA). Guidepoints: no residual
-                # in-array shift — centroid snap is canvas_centroid vs rotation_center only.
-                if method.lower() == 'alpaca':
-                    alignment_padding = padding_bottom_val.tolist() if isinstance(padding_bottom_val, np.ndarray) else padding_bottom_val
-                    alignment_translation = translation
-                elif uses_scipy_centroid_embed_rigid(method):
-                    alignment_padding = padding_low.tolist() if isinstance(padding_low, np.ndarray) else padding_low
-                    alignment_translation = centroid_translation
-                else:
-                    alignment_translation = np.zeros(3)
+                    # Store calculated alignment parameters for future landmark inversion
+                    # Determine padding variable based on method
+                    alignment_padding = None
+                    # ALPACA: residual translation after rotate-about-centroid (matrix t with
+                    # centroid terms intentionally omitted by ALPACA). Guidepoints: no residual
+                    # in-array shift — centroid snap is canvas_centroid vs rotation_center only.
+                    if method.lower() == 'alpaca':
+                        alignment_padding = padding_bottom_val.tolist() if isinstance(padding_bottom_val, np.ndarray) else padding_bottom_val
+                        alignment_translation = translation
+                    elif uses_scipy_centroid_embed_rigid(method):
+                        alignment_padding = padding_low.tolist() if isinstance(padding_low, np.ndarray) else padding_low
+                        alignment_translation = centroid_translation
+                    else:
+                        alignment_translation = np.zeros(3)
 
-                if isinstance(alignment_translation, np.ndarray):
-                    alignment_translation = alignment_translation.tolist()
+                    if isinstance(alignment_translation, np.ndarray):
+                        alignment_translation = alignment_translation.tolist()
 
-                scan_metadata['alignment_calculated_parameters'] = {
-                    'alignment_rotation_matrix': rotation.tolist() if isinstance(rotation, np.ndarray) else rotation,
-                    'alignment_rotation_center_voxel': padded_scan_centroid.tolist() if isinstance(padded_scan_centroid, np.ndarray) else padded_scan_centroid,
-                    'alignment_canvas_centroid_voxel': reference_centroid_voxel.tolist() if isinstance(reference_centroid_voxel, np.ndarray) else reference_centroid_voxel,
-                    'alignment_padding_low': alignment_padding,
-                    'alignment_padding_high': (
-                        padding_top_val.tolist() if method.lower() == 'alpaca' and isinstance(padding_top_val, np.ndarray)
-                        else (padding_high.tolist() if uses_scipy_centroid_embed_rigid(method) and isinstance(padding_high, np.ndarray)
-                              else (padding_top_val if method.lower() == 'alpaca' else None))
-                    ),
-                    'alignment_translation_voxel': alignment_translation,
-                    'alignment_crop_indices': {
-                        'in': {
-                            'x': [int(in_start_x), int(in_end_x)],
-                            'y': [int(in_start_y), int(in_end_y)],
-                            'z': [int(in_start_z), int(in_end_z)],
-                        },
-                        'out': {
-                            'x': [int(out_start_x), int(out_end_x)],
-                            'y': [int(out_start_y), int(out_end_y)],
-                            'z': [int(out_start_z), int(out_end_z)],
-                        },
-                    } if method.lower() == 'alpaca' or uses_scipy_centroid_embed_rigid(method) else None,
-                }
+                    scan_metadata['alignment_calculated_parameters'] = {
+                        'alignment_rotation_matrix': rotation.tolist() if isinstance(rotation, np.ndarray) else rotation,
+                        'alignment_rotation_center_voxel': padded_scan_centroid.tolist() if isinstance(padded_scan_centroid, np.ndarray) else padded_scan_centroid,
+                        'alignment_canvas_centroid_voxel': reference_centroid_voxel.tolist() if isinstance(reference_centroid_voxel, np.ndarray) else reference_centroid_voxel,
+                        'alignment_padding_low': alignment_padding,
+                        'alignment_padding_high': (
+                            padding_top_val.tolist() if method.lower() == 'alpaca' and isinstance(padding_top_val, np.ndarray)
+                            else (padding_high.tolist() if uses_scipy_centroid_embed_rigid(method) and isinstance(padding_high, np.ndarray)
+                                  else (padding_top_val if method.lower() == 'alpaca' else None))
+                        ),
+                        'alignment_translation_voxel': alignment_translation,
+                        'alignment_crop_indices': {
+                            'in': {
+                                'x': [int(in_start_x), int(in_end_x)],
+                                'y': [int(in_start_y), int(in_end_y)],
+                                'z': [int(in_start_z), int(in_end_z)],
+                            },
+                            'out': {
+                                'x': [int(out_start_x), int(out_end_x)],
+                                'y': [int(out_start_y), int(out_end_y)],
+                                'z': [int(out_start_z), int(out_end_z)],
+                            },
+                        } if method.lower() == 'alpaca' or uses_scipy_centroid_embed_rigid(method) else None,
+                    }
                 
-                with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'w') as jf:
-                    json.dump(scan_metadata, jf, indent=4)
+                    atomic_write_json(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), scan_metadata, indent=4)
 
-                # Save the transformed scan
-                new_edit_number = latest_edit + 1
-                output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit_number}_aligned.nii.gz")
-                volume_to_save = self._volume_for_mesh_reference_save(
-                    transformed_data, reference_is_preserved_mesh
-                )
-                new_nifti = nib.Nifti1Image(volume_to_save, reference_affine_data)
-                nib.save(new_nifti, output_path)
+                    # Save the transformed scan
+                    new_edit_number = latest_edit + 1
+                    output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit_number}_aligned.nii.gz")
+                    volume_to_save = self._volume_for_mesh_reference_save(
+                        transformed_data, reference_is_preserved_mesh
+                    )
+                    new_nifti = nib.Nifti1Image(volume_to_save, reference_affine_data)
+                    atomic_nib_save(new_nifti, output_path)
 
-                # Transform landmarks if they exist (before creating lossy version)
-                self.transform_landmarks_after_alignment(
-                    directory, scan_name, latest_edit, new_edit_number,
-                    voxel_size, scan_metadata, method
-                )
+                    # Transform landmarks if they exist (before creating lossy version)
+                    self.transform_landmarks_after_alignment(
+                        directory, scan_name, latest_edit, new_edit_number,
+                        voxel_size, scan_metadata, method
+                    )
 
 
-                # Create lossy version using the proper method from registrationTools
-                if 'lossy_compression' in scan_metadata:
-                    lossy_path = output_path.replace("_edit", "_lossy_edit")
-                    json_file = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
+                    # Create lossy version using the proper method from registrationTools
+                    if 'lossy_compression' in scan_metadata:
+                        lossy_path = output_path.replace("_edit", "_lossy_edit")
+                        json_file = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
                     
-                    # Use the existing save_as_lossy_nifti method which handles the new list format
-                    self.registration_tools.save_as_lossy_nifti(
-                        image_data=volume_to_save,
-                        voxel_size=reference_affine_data[0,0],  # Extract voxel size from affine matrix
-                        json_file=json_file,
-                        output_file=lossy_path
-                    )
+                        # Use the existing save_as_lossy_nifti method which handles the new list format
+                        self.registration_tools.save_as_lossy_nifti(
+                            image_data=volume_to_save,
+                            voxel_size=reference_affine_data[0,0],  # Extract voxel size from affine matrix
+                            json_file=json_file,
+                            output_file=lossy_path
+                        )
 
-                transformed_data = None
-                cleanup_memory()
+                    transformed_data = None
+                    cleanup_memory()
 
-                # ---------------------------------------------------------------
-                # Paired mask: apply same transformations (padding, rotation, translation, cropping)
-                # using nearest neighbor interpolation for binary mask data
-                # ---------------------------------------------------------------
-                try:
-                    # Determine source mask base from the latest edit
-                    if latest_edit >= 0:
-                        latest_files = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))
-                        if latest_files:
-                            source_mask_edit_base = os.path.basename(latest_files[0]).replace('.nii.gz', '').replace('_lossy', '')
+                    # ---------------------------------------------------------------
+                    # Paired mask: apply same transformations (padding, rotation, translation, cropping)
+                    # using nearest neighbor interpolation for binary mask data
+                    # ---------------------------------------------------------------
+                    try:
+                        # Determine source mask base from the latest edit
+                        if latest_edit >= 0:
+                            latest_files = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))
+                            if latest_files:
+                                source_mask_edit_base = os.path.basename(latest_files[0]).replace('.nii.gz', '').replace('_lossy', '')
+                            else:
+                                source_mask_edit_base = scan_name
                         else:
                             source_mask_edit_base = scan_name
-                    else:
-                        source_mask_edit_base = scan_name
 
-                    mask_src_path = os.path.join(directory, "extracted", scan_name, f"{source_mask_edit_base}.nii.mask.gz")
+                        mask_src_path = os.path.join(directory, "extracted", scan_name, f"{source_mask_edit_base}.nii.mask.gz")
                     
-                    if os.path.isfile(mask_src_path):
-                        print(f"Found paired mask for alignment: {mask_src_path}")
+                        if os.path.isfile(mask_src_path):
+                            print(f"Found paired mask for alignment: {mask_src_path}")
                         
-                        # Load mask data
-                        mask_src_temp = os.path.join(directory, "extracted", scan_name, f"{source_mask_edit_base}_mask.nii.gz")
-                        os.replace(mask_src_path, mask_src_temp)
-                        try:
-                            mask_img = nib.load(mask_src_temp)
+                            # Load mask data
+                            mask_src_temp = os.path.join(directory, "extracted", scan_name, f"{source_mask_edit_base}_mask.nii.gz")
+                            mask_img = load_nifti_readonly(mask_src_path)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
                             mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
@@ -6292,11 +6310,11 @@ class AlignToReferenceView(APIView):
                             # Apply the same transformations as the scan data, but with nearest neighbor
                             if uses_scipy_centroid_embed_rigid(method):
                                 # scipy centroid-embed methods: scaling -> padding -> rotation -> residual -> canvas
-                                
+                            
                                 # 1. Apply scaling if it was applied to scan data
                                 if scaling and scale_match != 1:
                                     mask_data = ndimage.zoom(mask_data, scale_match, order=0, mode='constant', cval=0)
-                                
+                            
                                 # 2. Apply same padding as scan data
                                 mask_padded = np.pad(
                                     mask_data,
@@ -6306,7 +6324,7 @@ class AlignToReferenceView(APIView):
                                     mode='constant',
                                     constant_values=0  # Use 0 for mask background
                                 )
-                                
+                            
                                 # 3. Apply rotation with nearest neighbor (same matrix as volume)
                                 mask_rotated = ndimage.affine_transform(
                                     mask_padded,
@@ -6331,10 +6349,10 @@ class AlignToReferenceView(APIView):
                                         mode='constant',
                                         cval=0,
                                     )
-                                
+                            
                                 # 5. Create canvas and crop same as scan data
                                 mask_transformed_canvas = np.zeros_like(reference_data, dtype=mask_dtype)
-                                
+                            
                                 # Use same crop indices as calculated for scan data
                                 mask_transformed_canvas[
                                     in_start_x:in_end_x,                     
@@ -6344,16 +6362,16 @@ class AlignToReferenceView(APIView):
                                                                 out_start_y:out_end_y,
                                                                 out_start_z:out_end_z
                                                             ]
-                                
+                            
                                 mask_transformed = mask_transformed_canvas
 
                             elif method.lower() == 'alpaca':
                                 # For ALPACA method: scaling -> padding -> rotation -> translation -> cropping
-                                
+                            
                                 # 1. Apply scaling if it was applied to scan data
                                 if scale_match != 1:
                                     mask_data = ndimage.zoom(mask_data, scale_match, order=0, mode='constant', cval=0)
-                                
+                            
                                 # 2. Apply same padding as scan data (using same padding values)
                                 mask_padded = np.pad(
                                     mask_data.astype(mask_dtype), 
@@ -6363,7 +6381,7 @@ class AlignToReferenceView(APIView):
                                     mode='constant',
                                     constant_values=0
                                 ).astype(mask_dtype)
-                                
+                            
                                 # 3. Apply rotation with nearest neighbor (same as ALPACA scan data)
                                 mask_rotated = np.zeros_like(mask_padded, dtype=mask_dtype)
                                 ndimage.affine_transform(
@@ -6377,7 +6395,7 @@ class AlignToReferenceView(APIView):
                                     prefilter=False,
                                     cval=0
                                 )
-                                
+                            
                                 # 4. Apply translation (same as ALPACA scan data)
                                 mask_translated = np.zeros_like(mask_rotated, dtype=mask_dtype)
                                 ndimage.shift(
@@ -6388,10 +6406,10 @@ class AlignToReferenceView(APIView):
                                     mode='constant',
                                     cval=0
                                 )
-                                
+                            
                                 # 5. Create canvas and crop same as scan data
                                 mask_transformed_canvas = np.zeros_like(reference_data, dtype=mask_dtype)
-                                
+                            
                                 # Use same crop indices as calculated for scan data (ALPACA uses different variable names)
                                 mask_transformed_canvas[
                                     in_start_x:in_end_x,                     
@@ -6401,13 +6419,13 @@ class AlignToReferenceView(APIView):
                                                                 out_start_y:out_end_y,
                                                                 out_start_z:out_end_z
                                                             ]
-                                
+                            
                                 mask_transformed = mask_transformed_canvas
 
                             else:
                                 print(f"Mask transformation not implemented for method: {method}")
                                 mask_transformed = None
-                                                        
+                                                    
                             if mask_transformed is not None:
                                 # Save full-res aligned mask
                                 new_mask_edit_base = f"{scan_name}_edit_{new_edit_number}_aligned"
@@ -6416,11 +6434,7 @@ class AlignToReferenceView(APIView):
                                 mask_volume_to_save = self._volume_for_mesh_reference_save(
                                     mask_transformed, reference_is_preserved_mesh
                                 )
-                                nib.save(
-                                    nib.Nifti1Image(mask_volume_to_save.astype(mask_dtype), reference_affine_data),
-                                    mask_dest_temp,
-                                )
-                                os.replace(mask_dest_temp, mask_dest_path)
+                                atomic_nib_save(nib.Nifti1Image(mask_volume_to_save.astype(mask_dtype), reference_affine_data), mask_dest_path)
                                 print(f"Saved aligned mask: {mask_dest_path}")
 
                                 # Create lossy mask by downsampling if lossy compression is enabled
@@ -6446,250 +6460,243 @@ class AlignToReferenceView(APIView):
                                     lossy_mask_edit_base = f"{scan_name}_lossy_edit_{new_edit_number}_aligned"
                                     lossy_mask_dest_path = os.path.join(directory, "extracted", scan_name, f"{lossy_mask_edit_base}.nii.mask.gz")
                                     lossy_mask_temp = os.path.join(directory, "extracted", scan_name, f"{lossy_mask_edit_base}_mask.nii.gz")
-                                    nib.save(nib.Nifti1Image(lossy_mask, reference_affine_data), lossy_mask_temp)
-                                    os.replace(lossy_mask_temp, lossy_mask_dest_path)
+                                    atomic_nib_save(nib.Nifti1Image(lossy_mask, reference_affine_data), lossy_mask_dest_path)
                                     print(f"Saved lossy aligned mask: {lossy_mask_dest_path}")
-                                
+                            
                                 # Clean up mask data
                                 mask_transformed = None
                                 cleanup_memory()
                                 
-                        finally:
-                            # Restore original mask filename
-                            os.replace(mask_src_temp, mask_src_path)
-                    else:
-                        print("No paired mask found for alignment; skipping mask propagation.")
+                        else:
+                            print("No paired mask found for alignment; skipping mask propagation.")
                         
-                except Exception as me:
-                    print(f"Error handling paired mask during alignment: {me}")
+                    except Exception as me:
+                        print(f"Error handling paired mask during alignment: {me}")
 
-                # ------------------------------------------------------------------
-                # Propagate alignment to same-shape linked siblings
-                # ------------------------------------------------------------------
-                if propagate_linked:
-                    try:
-                        siblings, sib_err = get_same_shape_siblings(directory, scan_name)
-                        if sib_err:
-                            print(f"Could not resolve siblings for {scan_name}: {sib_err}")
-                        elif siblings:
-                            print(f"Propagating alignment from {scan_name} to {len(siblings)} siblings: {siblings}")
-                            for sibling_name in siblings:
-                                try:
-                                    # Skip if sibling is already aligned
-                                    sib_latest_edit, sib_latest_stem = self._latest_any_edit_stem(directory, sibling_name)
-                                    if sib_latest_edit >= 0:
-                                        sib_edit_files = glob.glob(os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_latest_edit}_*.nii.gz"))
-                                        if sib_edit_files and 'aligned' in os.path.basename(sib_edit_files[0]):
-                                            linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'already aligned'})
-                                            print(f"  Sibling {sibling_name} already aligned, skipping")
+                    # ------------------------------------------------------------------
+                    # Propagate alignment to same-shape linked siblings
+                    # ------------------------------------------------------------------
+                    if propagate_linked:
+                        try:
+                            siblings, sib_err = get_same_shape_siblings(directory, scan_name)
+                            if sib_err:
+                                print(f"Could not resolve siblings for {scan_name}: {sib_err}")
+                            elif siblings:
+                                print(f"Propagating alignment from {scan_name} to {len(siblings)} siblings: {siblings}")
+                                for sibling_name in siblings:
+                                    try:
+                                        # Skip if sibling is already aligned
+                                        sib_latest_edit, sib_latest_stem = self._latest_any_edit_stem(directory, sibling_name)
+                                        if sib_latest_edit >= 0:
+                                            sib_edit_files = glob.glob(os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_latest_edit}_*.nii.gz"))
+                                            if sib_edit_files and 'aligned' in os.path.basename(sib_edit_files[0]):
+                                                linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'already aligned'})
+                                                print(f"  Sibling {sibling_name} already aligned, skipping")
+                                                continue
+                                    
+                                        # Skip if sibling has elastic registration
+                                        if has_elastic_registration(sibling_name, directory):
+                                            linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'elastic registration present'})
+                                            print(f"  Sibling {sibling_name} has elastic registration, skipping")
                                             continue
                                     
-                                    # Skip if sibling has elastic registration
-                                    if has_elastic_registration(sibling_name, directory):
-                                        linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'elastic registration present'})
-                                        print(f"  Sibling {sibling_name} has elastic registration, skipping")
-                                        continue
+                                        # Skip if sibling is preserved mesh
+                                        sib_metadata = self._load_subject_metadata(directory, sibling_name)
+                                        if self._is_preserved_mesh_metadata(sib_metadata):
+                                            linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'preserved mesh'})
+                                            print(f"  Sibling {sibling_name} is preserved mesh, skipping")
+                                            continue
                                     
-                                    # Skip if sibling is preserved mesh
-                                    sib_metadata = self._load_subject_metadata(directory, sibling_name)
-                                    if self._is_preserved_mesh_metadata(sib_metadata):
-                                        linked_propagation_results.append({'scan_name': sibling_name, 'status': 'skipped', 'reason': 'preserved mesh'})
-                                        print(f"  Sibling {sibling_name} is preserved mesh, skipping")
-                                        continue
-                                    
-                                    # Load sibling's latest volume
-                                    if sib_latest_edit >= 0:
-                                        sib_edit_files = glob.glob(os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_latest_edit}_*.nii.gz"))
-                                        if sib_edit_files:
-                                            sib_nifti_path = sib_edit_files[0]
+                                        # Load sibling's latest volume
+                                        if sib_latest_edit >= 0:
+                                            sib_edit_files = glob.glob(os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_latest_edit}_*.nii.gz"))
+                                            if sib_edit_files:
+                                                sib_nifti_path = sib_edit_files[0]
+                                            else:
+                                                sib_nifti_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
                                         else:
                                             sib_nifti_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
-                                    else:
-                                        sib_nifti_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
                                     
-                                    sib_img = nib.load(sib_nifti_path)
-                                    sib_dtype = sib_img.get_data_dtype()
-                                    sib_data = sib_img.get_fdata().astype(sib_dtype)
+                                        sib_img = nib.load(sib_nifti_path)
+                                        sib_dtype = sib_img.get_data_dtype()
+                                        sib_data = sib_img.get_fdata().astype(sib_dtype)
                                     
-                                    # Apply the same transform based on method
-                                    if method.lower() == 'alpaca':
-                                        # For ALPACA: reuse geometric parameters
-                                        # Apply scaling
-                                        if scale_match != 1:
-                                            sib_data = ndimage.zoom(sib_data, scale_match, order=interpolation_order, mode='constant', cval=0)
+                                        # Apply the same transform based on method
+                                        if method.lower() == 'alpaca':
+                                            # For ALPACA: reuse geometric parameters
+                                            # Apply scaling
+                                            if scale_match != 1:
+                                                sib_data = ndimage.zoom(sib_data, scale_match, order=interpolation_order, mode='constant', cval=0)
                                         
-                                        # Pad
-                                        sib_padded = np.pad(
-                                            sib_data.astype(sib_dtype),
-                                            ((padding_bottom_val[0], padding_top_val[0]),
-                                             (padding_bottom_val[1], padding_top_val[1]),
-                                             (padding_bottom_val[2], padding_top_val[2])),
-                                            mode='constant',
-                                            constant_values=0
-                                        ).astype(sib_dtype)
+                                            # Pad
+                                            sib_padded = np.pad(
+                                                sib_data.astype(sib_dtype),
+                                                ((padding_bottom_val[0], padding_top_val[0]),
+                                                 (padding_bottom_val[1], padding_top_val[1]),
+                                                 (padding_bottom_val[2], padding_top_val[2])),
+                                                mode='constant',
+                                                constant_values=0
+                                            ).astype(sib_dtype)
                                         
-                                        # Rotate
-                                        sib_rotated = np.zeros_like(sib_padded, dtype=sib_dtype)
-                                        ndimage.affine_transform(
-                                            sib_padded,
-                                            rotation.T,
-                                            offset=offset,
-                                            output=sib_rotated,
-                                            output_shape=sib_padded.shape,
-                                            order=interpolation_order,
-                                            mode='constant',
-                                            prefilter=False,
-                                            cval=0
-                                        )
-                                        
-                                        # Translate
-                                        sib_translated = np.zeros_like(sib_rotated, dtype=sib_dtype)
-                                        ndimage.shift(
-                                            sib_rotated,
-                                            shift=translation,
-                                            output=sib_translated,
-                                            order=interpolation_order,
-                                            mode='constant',
-                                            cval=0
-                                        )
-                                        
-                                        # Create canvas and crop
-                                        sib_canvas = np.zeros_like(reference_data, dtype=sib_dtype)
-                                        sib_canvas[
-                                            in_start_x:in_end_x,
-                                            in_start_y:in_end_y,
-                                            in_start_z:in_end_z
-                                        ] = sib_translated[
-                                            out_start_x:out_end_x,
-                                            out_start_y:out_end_y,
-                                            out_start_z:out_end_z
-                                        ]
-                                        sib_transformed = sib_canvas
-                                        
-                                    elif uses_scipy_centroid_embed_rigid(method):
-                                        # Reuse main geometric parameters (rotation + residual + canvas).
-                                        if scaling and scale_match != 1:
-                                            sib_data = ndimage.zoom(sib_data, scale_match, order=interpolation_order, mode='constant', cval=0)
-                                        
-                                        # Pad
-                                        sib_padded = np.pad(
-                                            sib_data,
-                                            ((padding_low[0], padding_high[0]),
-                                             (padding_low[1], padding_high[1]),
-                                             (padding_low[2], padding_high[2])),
-                                            mode='constant',
-                                            constant_values=0
-                                        )
-                                        
-                                        # Rotate (same matrix convention as main volume warp)
-                                        sib_rotated = ndimage.affine_transform(
-                                            sib_padded,
-                                            rotation,
-                                            offset=offset,
-                                            output_shape=sib_padded.shape,
-                                            order=interpolation_order,
-                                            mode='constant',
-                                            cval=0
-                                        )
-
-                                        residual = np.asarray(
-                                            centroid_translation if centroid_translation is not None else [0, 0, 0],
-                                            dtype=np.float64,
-                                        ).reshape(3)
-                                        if np.any(residual):
-                                            sib_rotated = ndimage.shift(
-                                                sib_rotated,
-                                                shift=residual,
+                                            # Rotate
+                                            sib_rotated = np.zeros_like(sib_padded, dtype=sib_dtype)
+                                            ndimage.affine_transform(
+                                                sib_padded,
+                                                rotation.T,
+                                                offset=offset,
+                                                output=sib_rotated,
+                                                output_shape=sib_padded.shape,
                                                 order=interpolation_order,
                                                 mode='constant',
-                                                cval=0,
+                                                prefilter=False,
+                                                cval=0
                                             )
                                         
-                                        # Create canvas and crop
-                                        sib_canvas = np.zeros_like(reference_data, dtype=sib_dtype)
-                                        sib_canvas[
-                                            in_start_x:in_end_x,
-                                            in_start_y:in_end_y,
-                                            in_start_z:in_end_z
-                                        ] = sib_rotated[
-                                            out_start_x:out_end_x,
-                                            out_start_y:out_end_y,
-                                            out_start_z:out_end_z
-                                        ]
-                                        sib_transformed = sib_canvas
-                                    else:
-                                        linked_propagation_results.append({'scan_name': sibling_name, 'status': 'failed', 'reason': f'unknown method {method}'})
-                                        continue
-                                    
-                                    # Same border gap the main gets after warping, so the group
-                                    # keeps identical voxel coverage going into elastic steps.
-                                    sib_background_value = np.array(0, dtype=sib_transformed.dtype)
-                                    if sib_transformed.shape[0] > 2 * border_width:
-                                        sib_transformed[:border_width, :, :] = sib_background_value
-                                        sib_transformed[-border_width:, :, :] = sib_background_value
-                                    if sib_transformed.shape[1] > 2 * border_width:
-                                        sib_transformed[:, :border_width, :] = sib_background_value
-                                        sib_transformed[:, -border_width:, :] = sib_background_value
-                                    if sib_transformed.shape[2] > 2 * border_width:
-                                        sib_transformed[:, :, :border_width] = sib_background_value
-                                        sib_transformed[:, :, -border_width:] = sib_background_value
+                                            # Translate
+                                            sib_translated = np.zeros_like(sib_rotated, dtype=sib_dtype)
+                                            ndimage.shift(
+                                                sib_rotated,
+                                                shift=translation,
+                                                output=sib_translated,
+                                                order=interpolation_order,
+                                                mode='constant',
+                                                cval=0
+                                            )
+                                        
+                                            # Create canvas and crop
+                                            sib_canvas = np.zeros_like(reference_data, dtype=sib_dtype)
+                                            sib_canvas[
+                                                in_start_x:in_end_x,
+                                                in_start_y:in_end_y,
+                                                in_start_z:in_end_z
+                                            ] = sib_translated[
+                                                out_start_x:out_end_x,
+                                                out_start_y:out_end_y,
+                                                out_start_z:out_end_z
+                                            ]
+                                            sib_transformed = sib_canvas
+                                        
+                                        elif uses_scipy_centroid_embed_rigid(method):
+                                            # Reuse main geometric parameters (rotation + residual + canvas).
+                                            if scaling and scale_match != 1:
+                                                sib_data = ndimage.zoom(sib_data, scale_match, order=interpolation_order, mode='constant', cval=0)
+                                        
+                                            # Pad
+                                            sib_padded = np.pad(
+                                                sib_data,
+                                                ((padding_low[0], padding_high[0]),
+                                                 (padding_low[1], padding_high[1]),
+                                                 (padding_low[2], padding_high[2])),
+                                                mode='constant',
+                                                constant_values=0
+                                            )
+                                        
+                                            # Rotate (same matrix convention as main volume warp)
+                                            sib_rotated = ndimage.affine_transform(
+                                                sib_padded,
+                                                rotation,
+                                                offset=offset,
+                                                output_shape=sib_padded.shape,
+                                                order=interpolation_order,
+                                                mode='constant',
+                                                cval=0
+                                            )
 
-                                    # Save sibling aligned volume
-                                    sib_new_edit = sib_latest_edit + 1
-                                    sib_output_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_new_edit}_aligned.nii.gz")
-                                    sib_volume_to_save = self._volume_for_mesh_reference_save(sib_transformed, reference_is_preserved_mesh)
-                                    sib_nifti = nib.Nifti1Image(sib_volume_to_save, reference_affine_data)
-                                    nib.save(sib_nifti, sib_output_path)
+                                            residual = np.asarray(
+                                                centroid_translation if centroid_translation is not None else [0, 0, 0],
+                                                dtype=np.float64,
+                                            ).reshape(3)
+                                            if np.any(residual):
+                                                sib_rotated = ndimage.shift(
+                                                    sib_rotated,
+                                                    shift=residual,
+                                                    order=interpolation_order,
+                                                    mode='constant',
+                                                    cval=0,
+                                                )
+                                        
+                                            # Create canvas and crop
+                                            sib_canvas = np.zeros_like(reference_data, dtype=sib_dtype)
+                                            sib_canvas[
+                                                in_start_x:in_end_x,
+                                                in_start_y:in_end_y,
+                                                in_start_z:in_end_z
+                                            ] = sib_rotated[
+                                                out_start_x:out_end_x,
+                                                out_start_y:out_end_y,
+                                                out_start_z:out_end_z
+                                            ]
+                                            sib_transformed = sib_canvas
+                                        else:
+                                            linked_propagation_results.append({'scan_name': sibling_name, 'status': 'failed', 'reason': f'unknown method {method}'})
+                                            continue
                                     
-                                    # Update sibling metadata: copy alignment fields from main
-                                    sib_metadata['alignment_to'] = reference
-                                    sib_metadata['alignment_shift'] = 0
-                                    sib_metadata['alignment_method'] = method
-                                    if sib_metadata.get('voxel_size') is not None:
-                                        sib_metadata['alignment_previous_voxel_size'] = sib_metadata['voxel_size']
-                                    sib_metadata['voxel_size'] = reference_voxel_size
-                                    if scale_match != 1:
-                                        sib_metadata['alignment_scale'] = float(scale_match)
-                                    else:
-                                        sib_metadata.pop('alignment_scale', None)
-                                    if 'alignment_calculated_parameters' in scan_metadata:
-                                        sib_metadata['alignment_calculated_parameters'] = scan_metadata['alignment_calculated_parameters']
-                                    if 'alignment_rigid_provenance' in scan_metadata:
-                                        sib_metadata['alignment_rigid_provenance'] = scan_metadata['alignment_rigid_provenance']
-                                    strip_ephemeral_scan_metadata(sib_metadata)
-                                    sib_json_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.json")
-                                    with open(sib_json_path, 'w') as jf:
-                                        json.dump(sib_metadata, jf, indent=4)
+                                        # Same border gap the main gets after warping, so the group
+                                        # keeps identical voxel coverage going into elastic steps.
+                                        sib_background_value = np.array(0, dtype=sib_transformed.dtype)
+                                        if sib_transformed.shape[0] > 2 * border_width:
+                                            sib_transformed[:border_width, :, :] = sib_background_value
+                                            sib_transformed[-border_width:, :, :] = sib_background_value
+                                        if sib_transformed.shape[1] > 2 * border_width:
+                                            sib_transformed[:, :border_width, :] = sib_background_value
+                                            sib_transformed[:, -border_width:, :] = sib_background_value
+                                        if sib_transformed.shape[2] > 2 * border_width:
+                                            sib_transformed[:, :, :border_width] = sib_background_value
+                                            sib_transformed[:, :, -border_width:] = sib_background_value
+
+                                        # Save sibling aligned volume
+                                        sib_new_edit = sib_latest_edit + 1
+                                        sib_output_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_new_edit}_aligned.nii.gz")
+                                        sib_volume_to_save = self._volume_for_mesh_reference_save(sib_transformed, reference_is_preserved_mesh)
+                                        sib_nifti = nib.Nifti1Image(sib_volume_to_save, reference_affine_data)
+                                        atomic_nib_save(sib_nifti, sib_output_path)
                                     
-                                    # Create lossy version if needed
-                                    if 'lossy_compression' in sib_metadata:
-                                        sib_lossy_path = sib_output_path.replace("_edit", "_lossy_edit")
-                                        self.registration_tools.save_as_lossy_nifti(
-                                            image_data=sib_volume_to_save,
-                                            voxel_size=reference_affine_data[0, 0],
-                                            json_file=sib_json_path,
-                                            output_file=sib_lossy_path
-                                        )
+                                        # Update sibling metadata: copy alignment fields from main
+                                        sib_metadata['alignment_to'] = reference
+                                        sib_metadata['alignment_shift'] = 0
+                                        sib_metadata['alignment_method'] = method
+                                        if sib_metadata.get('voxel_size') is not None:
+                                            sib_metadata['alignment_previous_voxel_size'] = sib_metadata['voxel_size']
+                                        sib_metadata['voxel_size'] = reference_voxel_size
+                                        if scale_match != 1:
+                                            sib_metadata['alignment_scale'] = float(scale_match)
+                                        else:
+                                            sib_metadata.pop('alignment_scale', None)
+                                        if 'alignment_calculated_parameters' in scan_metadata:
+                                            sib_metadata['alignment_calculated_parameters'] = scan_metadata['alignment_calculated_parameters']
+                                        if 'alignment_rigid_provenance' in scan_metadata:
+                                            sib_metadata['alignment_rigid_provenance'] = scan_metadata['alignment_rigid_provenance']
+                                        strip_ephemeral_scan_metadata(sib_metadata)
+                                        sib_json_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.json")
+                                        atomic_write_json(sib_json_path, sib_metadata, indent=4)
                                     
-                                    # Propagate paired mask if present
-                                    if sib_latest_edit >= 0:
-                                        sib_edit_base_files = glob.glob(os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_latest_edit}_*.nii.gz"))
-                                        if sib_edit_base_files:
-                                            sib_edit_base = os.path.basename(sib_edit_base_files[0]).replace('.nii.gz', '').replace('_lossy', '')
+                                        # Create lossy version if needed
+                                        if 'lossy_compression' in sib_metadata:
+                                            sib_lossy_path = sib_output_path.replace("_edit", "_lossy_edit")
+                                            self.registration_tools.save_as_lossy_nifti(
+                                                image_data=sib_volume_to_save,
+                                                voxel_size=reference_affine_data[0, 0],
+                                                json_file=sib_json_path,
+                                                output_file=sib_lossy_path
+                                            )
+                                    
+                                        # Propagate paired mask if present
+                                        if sib_latest_edit >= 0:
+                                            sib_edit_base_files = glob.glob(os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{sib_latest_edit}_*.nii.gz"))
+                                            if sib_edit_base_files:
+                                                sib_edit_base = os.path.basename(sib_edit_base_files[0]).replace('.nii.gz', '').replace('_lossy', '')
+                                            else:
+                                                sib_edit_base = sibling_name
                                         else:
                                             sib_edit_base = sibling_name
-                                    else:
-                                        sib_edit_base = sibling_name
                                     
-                                    sib_mask_src = os.path.join(directory, "extracted", sibling_name, f"{sib_edit_base}.nii.mask.gz")
-                                    if os.path.isfile(sib_mask_src):
-                                        sib_mask_temp = sib_mask_src.replace('.nii.mask.gz', '_mask.nii.gz')
-                                        os.replace(sib_mask_src, sib_mask_temp)
-                                        try:
-                                            sib_mask_img = nib.load(sib_mask_temp)
+                                        sib_mask_src = os.path.join(directory, "extracted", sibling_name, f"{sib_edit_base}.nii.mask.gz")
+                                        if os.path.isfile(sib_mask_src):
+                                            sib_mask_temp = sib_mask_src.replace('.nii.mask.gz', '_mask.nii.gz')
+                                            sib_mask_img = load_nifti_readonly(sib_mask_src)
                                             sib_mask_dtype = sib_mask_img.get_data_dtype()
                                             sib_mask_data = np.round(sib_mask_img.get_fdata()).astype(sib_mask_dtype)
-                                            
+                                        
                                             # Apply same transform to mask with nearest neighbor
                                             if method.lower() == 'alpaca':
                                                 if scale_match != 1:
@@ -6777,18 +6784,14 @@ class AlignToReferenceView(APIView):
                                                     out_start_z:out_end_z
                                                 ]
                                                 sib_mask_transformed = sib_mask_canvas
-                                            
+                                        
                                             # Save sibling aligned mask
                                             sib_mask_edit_base = f"{sibling_name}_edit_{sib_new_edit}_aligned"
                                             sib_mask_dest_path = os.path.join(directory, "extracted", sibling_name, f"{sib_mask_edit_base}.nii.mask.gz")
                                             sib_mask_dest_temp = os.path.join(directory, "extracted", sibling_name, f"{sib_mask_edit_base}_mask.nii.gz")
                                             sib_mask_vol_to_save = self._volume_for_mesh_reference_save(sib_mask_transformed, reference_is_preserved_mesh)
-                                            nib.save(
-                                                nib.Nifti1Image(sib_mask_vol_to_save.astype(sib_mask_dtype), reference_affine_data),
-                                                sib_mask_dest_temp
-                                            )
-                                            os.replace(sib_mask_dest_temp, sib_mask_dest_path)
-                                            
+                                            atomic_nib_save(nib.Nifti1Image(sib_mask_vol_to_save.astype(sib_mask_dtype), reference_affine_data), sib_mask_dest_path)
+                                        
                                             # Create lossy mask if needed
                                             if 'lossy_compression' in sib_metadata:
                                                 resolution_factor = 2
@@ -6808,49 +6811,46 @@ class AlignToReferenceView(APIView):
                                                 sib_lossy_mask_edit_base = f"{sibling_name}_lossy_edit_{sib_new_edit}_aligned"
                                                 sib_lossy_mask_dest = os.path.join(directory, "extracted", sibling_name, f"{sib_lossy_mask_edit_base}.nii.mask.gz")
                                                 sib_lossy_mask_temp = os.path.join(directory, "extracted", sibling_name, f"{sib_lossy_mask_edit_base}_mask.nii.gz")
-                                                nib.save(nib.Nifti1Image(sib_lossy_mask, reference_affine_data), sib_lossy_mask_temp)
-                                                os.replace(sib_lossy_mask_temp, sib_lossy_mask_dest)
-                                        finally:
-                                            os.replace(sib_mask_temp, sib_mask_src)
+                                                atomic_nib_save(nib.Nifti1Image(sib_lossy_mask, reference_affine_data), sib_lossy_mask_dest)
                                     
-                                    linked_propagation_results.append({
-                                        'scan_name': sibling_name,
-                                        'status': 'success',
-                                        'edit': sib_new_edit
-                                    })
-                                    print(f"  Successfully propagated alignment to {sibling_name} (edit {sib_new_edit})")
-                                    cleanup_memory()
+                                        linked_propagation_results.append({
+                                            'scan_name': sibling_name,
+                                            'status': 'success',
+                                            'edit': sib_new_edit
+                                        })
+                                        print(f"  Successfully propagated alignment to {sibling_name} (edit {sib_new_edit})")
+                                        cleanup_memory()
                                     
-                                except Exception as sib_e:
-                                    linked_propagation_results.append({
-                                        'scan_name': sibling_name,
-                                        'status': 'failed',
-                                        'reason': str(sib_e)
-                                    })
-                                    print(f"  Error propagating to sibling {sibling_name}: {sib_e}")
-                    except Exception as prop_e:
-                        print(f"Error in linked propagation for {scan_name}: {prop_e}")
+                                    except Exception as sib_e:
+                                        linked_propagation_results.append({
+                                            'scan_name': sibling_name,
+                                            'status': 'failed',
+                                            'reason': str(sib_e)
+                                        })
+                                        print(f"  Error propagating to sibling {sibling_name}: {sib_e}")
+                        except Exception as prop_e:
+                            print(f"Error in linked propagation for {scan_name}: {prop_e}")
 
-                # Send progress update after each scan is processed
-                channel_layer = get_channel_layer()
-                if channel_layer is not None:
-                    progress = ((idx+(7/9)) / total_scans)
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Alignment complete for {scan_name}.',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
-                    print("Alignment complete for ", scan_name)
+                    # Send progress update after each scan is processed
+                    channel_layer = get_channel_layer()
+                    if channel_layer is not None:
+                        progress = ((idx+(7/9)) / total_scans)
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Alignment complete for {scan_name}.',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
+                        print("Alignment complete for ", scan_name)
                 
-                # Check available memory
-                remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
-                print(f"Available memory: {remaining_memory:.2f} GB")
+                    # Check available memory
+                    remaining_memory = psutil.virtual_memory().available / 1024 / 1024 / 1024
+                    print(f"Available memory: {remaining_memory:.2f} GB")
 
             except Exception as e:
                 print(f"Error processing scan {scan_name}: {str(e)}")
@@ -6901,6 +6901,14 @@ class InvertAlignmentLandmarksView(APIView):
     Subjects with faulty=true in metadata are skipped (explicit scan_names receive status skipped).
     """
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('invert_alignment_landmarks', lambda request: request_subjects(request, 'scan_names'))
     def post(self, request):
         directory     = request.data['directory']
         scan_names    = request.data.get('scan_names', None)
@@ -7006,6 +7014,10 @@ class InvertAlignmentLandmarksView(APIView):
 
         return Response({'results': results}, status=status.HTTP_200_OK)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _write_pre_alignment_landmarks(
         self, scan_dir, scan_name, landmarks_mm, overwrite_existing,
     ):
@@ -7030,8 +7042,7 @@ class InvertAlignmentLandmarksView(APIView):
                 'attach_skipped': True,
             }
 
-        with open(attach_path, 'w') as f:
-            json.dump(landmarks_mm, f, indent=4)
+        atomic_write_json(attach_path, landmarks_mm, indent=4)
         print(
             f"[InvertAlignment] {scan_name}: wrote {len(landmarks_mm)} landmarks "
             f"→ {os.path.basename(attach_path)}"
@@ -7050,8 +7061,7 @@ class InvertAlignmentLandmarksView(APIView):
             with open(json_path, 'r') as jf:
                 metadata = json.load(jf)
             ensure_old_thresholds(metadata, scan_dir, scan_name)
-            with open(json_path, 'w') as jf:
-                json.dump(metadata, jf, indent=4)
+            atomic_write_json(json_path, metadata, indent=4)
 
             distance_info = compute_and_save_landmark_distances(
                 scan_dir,
@@ -7369,6 +7379,10 @@ class InvertAlignmentLandmarksView(APIView):
             )
         return best_T
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _invert_landmarks(
         self, landmarks_mm, params, metadata,
         scan_dir=None, scan_name=None, alignment_method=None,
@@ -7443,8 +7457,7 @@ class InvertAlignmentLandmarksView(APIView):
                 acp['alignment_translation_voxel'] = translation.tolist()
                 acp['alignment_translation_recovered'] = True
                 meta_out['alignment_calculated_parameters'] = acp
-                with open(json_path, 'w') as jf:
-                    json.dump(meta_out, jf, indent=4)
+                atomic_write_json(json_path, meta_out, indent=4)
                 print(
                     f"[InvertAlignment] {scan_name}: persisted recovered "
                     f"alignment_translation_voxel to metadata"

@@ -57,10 +57,37 @@ from PIL import Image, ImageDraw, ImageFont
 from pydicom import dcmread
 
 from .ALPACA import ALPACA, LandmarkUploadAlignment
+from . import networkFolders
+from . import antsWorker  # ANTs registrations run in a worker process (engine stays responsive)
+from . import gridPreviewWorker  # Regular grid previews, built in parallel worker processes
+# Crash-safe protocol: atomic writes, read-only mask loads, per-subject transactions and
+# project-open recovery. Read the crashSafety module docstring before adding a writer.
+from . import crashSafety
+from .crashSafety import (
+    SubjectTransaction,
+    crash_safe_view,
+    request_subjects,
+    subject_folders,
+    subject_transaction,
+    transaction_over,
+    tracked_rename,
+    tracked_remove,
+    remove_subject_folder,
+    atomic_nib_save,
+    atomic_write_json,
+    atomic_np_savez,
+    atomic_copy,
+    atomic_ants_write,
+    load_nifti_readonly,
+    atomic_output,
+    atomic_write_bytes,
+    atomic_write_text,
+)
 from .registrationTools import RegistrationTools, generate_lossy_isometric_projection_png
 from .coordinateFrames import (
     is_preserved_mesh_metadata,
     load_extracted_scan_metadata,
+    list_extracted_scan_names,
     load_project_label_names,
     load_project_settings,
     save_project_label_name,
@@ -99,6 +126,8 @@ from .meshGridTools import (
     QUADRANT_RENDER_SIZE,
 )
 from .smartLandmarking import SmartLandmarkingView
+from .stepProgress import send_step_progress as _send_step_progress, StepProgress
+from .engineAuth import engine_identity
 from .overwriteVoxelSize import OverwriteVoxelSizeView
 from .preprocessingTools import *
 from .builtinTextureTools import (
@@ -136,6 +165,7 @@ from .rigidAlignment import (
     snapshot_previous_edit_threshold,
     upsert_old_threshold,
     voxel_size_for_edit_stem,
+    first_aligned_edit_number,
 )
 from .resampleAnisotropicVoxels import DeformationBasedMRIInterpolator
 from .averagePooling import apply_extract_scaling, normalize_scaling_factor
@@ -319,20 +349,40 @@ def extract_folder_paths(file_paths):
     return folder_paths
 
 
-def cleanup_memory():
-    """More aggressively clean up memory to prevent out-of-memory errors."""
+def _glibc_malloc_trim():
+    """
+    Ask glibc to hand freed heap pages back to the OS (Linux only, best effort).
+
+    Python's ``os`` module has no ``malloc_trim``, so the previous
+    ``hasattr(os, 'malloc_trim')`` guard was always False and the trim never ran.
+    """
+    if not sys.platform.startswith('linux'):
+        return
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def cleanup_memory(stage=None):
+    """More aggressively clean up memory to prevent out-of-memory errors.
+
+    ``stage`` (optional) labels the printed memory line so long batch runs
+    (e.g. elastic registration) show where in each subject the RSS peaks.
+    """
     # First, collect obvious garbage
     gc.collect()
-    
-    # Force Python to return memory to OS
-    if hasattr(os, 'malloc_trim'):  # On Linux
-        os.malloc_trim(0)
-    
+
+    # Force the C allocator to return freed memory to the OS
+    _glibc_malloc_trim()
+
     # Print memory usage for debugging
     mem = psutil.virtual_memory()
     process = psutil.Process(os.getpid())
     process_memory = process.memory_info().rss / 1024 / 1024 / 1024
-    print(f"Process memory: {process_memory:.2f} GB, Available system memory: {mem.available/1024/1024/1024:.2f} GB")
+    stage_label = f"[{stage}] " if stage else ""
+    print(f"{stage_label}Process memory: {process_memory:.2f} GB, Available system memory: {mem.available/1024/1024/1024:.2f} GB")
     # --- end of memory cleanup ---
 
 
@@ -356,9 +406,7 @@ def has_elastic_registration(scan_name, directory):
             metadata = json.load(jf)
             if metadata.get('reference', False):
                 # Check if there are any elastic_to in the json metadata on any of the subjects on the project matching the scan_name
-                for subject in os.listdir(os.path.join(directory, "extracted")):
-                    if subject == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", subject)):
-                        continue
+                for subject in list_extracted_scan_names(directory):
                     json_path = os.path.join(directory, "extracted", subject, f"{subject}.json")
                     with open(json_path, 'r') as jf:
                         metadata = json.load(jf)
@@ -434,6 +482,10 @@ class FileCopyView(APIView):
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class ReportBadFileView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def post(self, request, *args, **kwargs):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -445,8 +497,7 @@ class ReportBadFileView(APIView):
             metadata_data = json.load(json_file)
             # Ensure faulty is stored as a boolean, not a string
             metadata_data['faulty'] = bool(faulty) if faulty is not None else False
-        with open(metadata_json_path, 'w') as json_file:
-            json.dump(metadata_data, json_file, indent=4)  # Add indent for readability
+        atomic_write_json(metadata_json_path, metadata_data, indent=4)
 
         return Response({'message': 'File reported successfully'})
 
@@ -457,6 +508,10 @@ class FlagSubjectsView(APIView):
     Expects: directory (project root), filenames (list of subject folder names), flag (bool, default True).
     """
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def post(self, request, *args, **kwargs):
         directory = request.data.get('directory')
         filenames = request.data.get('filenames')
@@ -488,8 +543,7 @@ class FlagSubjectsView(APIView):
                 with open(metadata_json_path, 'r') as json_file:
                     metadata_data = json.load(json_file)
                 metadata_data['flag'] = flag_bool
-                with open(metadata_json_path, 'w') as json_file:
-                    json.dump(metadata_data, json_file, indent=4)
+                atomic_write_json(metadata_json_path, metadata_data, indent=4)
                 # Re-read to confirm the persisted value
                 with open(metadata_json_path, 'r') as json_file:
                     confirmed_data = json.load(json_file)
@@ -557,10 +611,25 @@ class LinkScansView(APIView):
         except (json.JSONDecodeError, OSError) as e:
             return None, metadata_path, str(e)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _write_metadata(self, metadata_path, metadata_data):
-        with open(metadata_path, 'w') as json_file:
-            json.dump(metadata_data, json_file, indent=4)
+        atomic_write_json(metadata_path, metadata_data, indent=4)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('link_scans', lambda request: request_subjects(request, 'unlink', linked=True) + subject_folders(
+        request.data.get('directory'),
+        [member for group in (request.data.get('groups') or []) if isinstance(group, dict)
+         for member in (group.get('members') or [])],
+    ))
     def post(self, request, *args, **kwargs):
         directory = request.data.get('directory')
         groups = request.data.get('groups') or []
@@ -697,6 +766,10 @@ class LinkScansView(APIView):
 class ListDirectoriesView(APIView):
     def get(self, request, *args, **kwargs):
         path = unquote(request.query_params.get('path', '~'))
+        if networkFolders.is_remote_request(request) or networkFolders.running_as_service():
+            # Network session, or the background service (which can only reach the shared
+            # folders anyway): start in and stay within the shared folders.
+            path = networkFolders.listing_start(path)
         try:
             if path == "root":
                 path = "/"
@@ -1270,7 +1343,19 @@ class QuickAccessPathsView(APIView):
         from pathlib import Path
         
         os_type = platform.system()
-        
+
+        # Shared computers (1.9.4): people on other computers, and everyone using the
+        # background service (its own home folder is empty), get the shared folders as
+        # their shortcuts instead of this account's Home/Desktop/Documents/Downloads.
+        if networkFolders.is_remote_request(request) or networkFolders.running_as_service():
+            shared = [str(folder).replace('\\', '/') for folder in networkFolders.shared_folders()]
+            return Response({
+                'shared': [{'label': os.path.basename(folder.rstrip('/')) or folder, 'path': folder}
+                           for folder in shared],
+                'drives': [],
+                'os_type': os_type,
+            })
+
         quick_paths = {
             'home': str(Path.home()).replace('\\', '/'),
             'desktop': str(Path.home() / 'Desktop').replace('\\', '/'),
@@ -1297,6 +1382,10 @@ class QuickAccessPathsView(APIView):
         
         return Response(quick_paths)
 
+
+# Hand the render constants shared with the mesh previews (meshGridTools.py) to the grid
+# preview module; it passes them on to its worker processes.
+gridPreviewWorker.configure(QUADRANT_RENDER_SIZE, GRID_PREVIEW_JPEG_QUALITY)
 
 class GetGridView(APIView):
     def _scan_metadata_path(self, scan_name, directory):
@@ -1355,6 +1444,10 @@ class GetGridView(APIView):
             and preview_timestamp == latest_edit_timestamp
         )
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def create_mesh_preview_image(self, scan_name, directory, ignoreElastic=False):
         start_time = time.time()
         print(f"[{scan_name}] Starting preserved mesh preview generation...")
@@ -1377,18 +1470,16 @@ class GetGridView(APIView):
         except OSError:
             latest_edit_timestamp = time.time()
 
-        with open(preview_json_path, 'w') as json_file:
-            json.dump({
+        atomic_write_json(preview_json_path, {
                 'last_edit': latest_edit_file,
                 'threshold': threshold,
                 'last_edit_timestamp': latest_edit_timestamp,
                 'histogram_data': None,
-            }, json_file)
+            }, indent=None)
 
         image_data_bytes = generate_mesh_grid_preview_jpeg(latest_edit_file_path)
         preview_path = os.path.join(scan_dir, f"{scan_name}_preview.jpg")
-        with open(preview_path, 'wb') as preview_file:
-            preview_file.write(image_data_bytes)
+        atomic_write_bytes(preview_path, image_data_bytes)
 
         print(f"[{scan_name}] Preserved mesh preview saved to {preview_path} in {time.time() - start_time:.2f} seconds.")
         return image_data_bytes
@@ -1500,506 +1591,16 @@ class GetGridView(APIView):
         else:
             return False
 
-    # Helper function to resize images while preserving aspect ratio
+    # The preview rendering lives in gridPreviewWorker.py so the batch endpoint can run it
+    # in worker processes; these wrappers keep GetGridView's interface unchanged.
     def resize_with_aspect_ratio(self, img, target_size, bg_color="black"):
-        """
-        Resizes a PIL Image to fit within a target size, preserving aspect ratio.
-        This handles both scaling down and scaling up smaller images.
-        Pads with a background color if necessary.
-        """
-        # Calculate aspect ratios
-        img_aspect = img.width / img.height
-        target_aspect = target_size[0] / target_size[1]
-        
-        if img_aspect > target_aspect:
-            # Image is wider than target area: fit to target width
-            new_width = target_size[0]
-            new_height = int(new_width / img_aspect)
-        else:
-            # Image is taller than target area: fit to target height
-            new_height = target_size[1]
-            new_width = int(new_height * img_aspect)
-            
-        # Resize image (this scales up or down as needed)
-        img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
-        new_img = Image.new("RGB", target_size, bg_color)
-        # Calculate position to paste the scaled image (centered)
-        paste_x = (target_size[0] - new_width) // 2
-        paste_y = (target_size[1] - new_height) // 2
-        new_img.paste(img_resized, (paste_x, paste_y))
-        return new_img
+        return gridPreviewWorker.resize_with_aspect_ratio(img, target_size, bg_color)
 
     def create_preview_image(self, scan_name, directory, ignoreElastic=False):
-        start_time = time.time() # Start timing
-        # Per-step timings are collected here and printed as ONE summary line at the end
-        # (instead of ~15 lines per scan, which flooded the terminal for large grids).
-        step_times = {}
-        preview_3d_detail = ''
-        # Shared with the caller so a failure can report which steps completed before it broke.
-        self._preview_step_times = step_times
-
-        # 1. Load Data
-        latest_edit = 0
-        # Find the latest edit number for lossy files specifically
-        if scan_name == "atlas":
-            lossy_edit_files = glob.glob(os.path.join(resolve_atlas_dir(directory), "atlas_lossy_edit_*_*.nii.gz"))
-            lossy_original_file = os.path.join(resolve_atlas_dir(directory), "atlas_lossy.nii.gz")
-        else:
-            lossy_edit_files = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_*_*.nii.gz"))
-            lossy_original_file = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy.nii.gz")
-
-        latest_lossy_edit_file_path = lossy_original_file # Default to original lossy file
-        latest_edit_file_identifier = os.path.basename(lossy_original_file).replace("_lossy", "") # Identifier for preview.json (points to non-lossy version)
-
-        if lossy_edit_files:
-            # Helper function to check if a file is an elastic edit
-            def is_elastic_file(filename):
-                return 'elastic' in filename.lower()
-            
-            edit_numbers = []
-            for f in lossy_edit_files:
-                try:
-                    # Skip elastic files if ignoreElastic is True
-                    if ignoreElastic and is_elastic_file(f):
-                        continue
-                    num_str = f.split('_lossy_edit_')[1].split('_')[0]
-                    edit_numbers.append((int(num_str), f))
-                except (IndexError, ValueError):
-                    continue
-
-            if edit_numbers:
-                # Find the latest edit number from tuples
-                latest_edit = max(edit_numbers, key=lambda x: x[0])[0]
-                # Find the specific lossy file corresponding to the latest edit number
-                if scan_name == "atlas":
-                    latest_lossy_edit_file_pattern = os.path.join(resolve_atlas_dir(directory), f"atlas_lossy_edit_{latest_edit}_*.nii.gz")
-                else:
-                    latest_lossy_edit_file_pattern = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{latest_edit}_*.nii.gz")
-                    
-                matching_files = glob.glob(latest_lossy_edit_file_pattern)
-                if matching_files:
-                    # Filter out displacement fields (inv and fwd) to get the actual image
-                    image_files = [f for f in matching_files if not (f.endswith('_lossy_inv.nii.gz') or f.endswith('_lossy_fwd.nii.gz'))]
-                    if image_files:
-                        latest_lossy_edit_file_path = sorted(image_files)[-1]
-                    else:
-                        # Fallback to original logic if no filtered files found
-                        latest_lossy_edit_file_path = sorted(matching_files)[-1]
-                    # Get the corresponding non-lossy filename for the preview.json identifier
-                    latest_edit_file_identifier = os.path.basename(latest_lossy_edit_file_path).replace("_lossy", "")
-
-        load_start_time = time.time()
-        # Load the latest lossy NIfTI file
-        try:
-            latest_edit_image_nii = nib.load(latest_lossy_edit_file_path)
-            latest_edit_image_data = latest_edit_image_nii.get_fdata()
-        except FileNotFoundError:
-             print(f"Error: Could not find NIfTI file: {latest_lossy_edit_file_path}")
-             # Return placeholder/error data
-             img = Image.new('RGB', (QUADRANT_RENDER_SIZE * 2, QUADRANT_RENDER_SIZE * 2), color = 'black')
-             draw = ImageDraw.Draw(img)
-             draw.text((10, 10), f"Error: NIfTI file not found\n{os.path.basename(latest_lossy_edit_file_path)}", fill="red")
-             buf = io.BytesIO()
-             img.save(buf, format='JPEG')
-             buf.seek(0)
-             return buf.read()
-
-        step_times['load'] = time.time() - load_start_time
-
-        metadata_start_time = time.time()
-        # Load metadata
-        if scan_name == "atlas":
-            metadata_json_path = os.path.join(resolve_atlas_dir(directory), "atlas.json")
-        else:
-            metadata_json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
-            
-        try:
-            with open(metadata_json_path, 'r') as json_file:
-                metadata_data = json.load(json_file)
-        except (FileNotFoundError, json.JSONDecodeError):
-             print(f"Error: Could not load metadata JSON for {scan_name}")
-             # Return placeholder/error data (similar to above)
-             img = Image.new('RGB', (QUADRANT_RENDER_SIZE * 2, QUADRANT_RENDER_SIZE * 2), color = 'black')
-             draw = ImageDraw.Draw(img)
-             draw.text((10, 10), f"Error: Metadata JSON missing/corrupt\n{scan_name}.json", fill="red")
-             buf = io.BytesIO()
-             img.save(buf, format='JPEG')
-             buf.seek(0)
-             return buf.read()
-
-        step_times['metadata'] = time.time() - metadata_start_time
-
-        threshold_orig = metadata_data.get('threshold')
-
-        # Get lossy parameters
-        lossy_params = metadata_data.get('lossy_compression', [])
-        # If lossy_params is a dict then turn into a list (recover legacy format)
-        if isinstance(lossy_params, dict):
-            lossy_params = [lossy_params]
-            # if the dict has no filename, add it
-            if 'filename' not in lossy_params[0]:
-                lossy_params[0]['filename'] = os.path.basename(latest_lossy_edit_file_path)
-            # save the updated metadata
-            with open(metadata_json_path, 'w') as json_file:
-                json.dump(metadata_data, json_file, indent=4)
-        # Get the lossy parameters for the current lossy file
-        lossy_filename = os.path.basename(latest_lossy_edit_file_path)
-        matching_lossy_params = [p for p in lossy_params if p['filename'] == lossy_filename]
-        if not matching_lossy_params: # if no lossy parameters found, use the last one
-            print(f"Warning: No lossy parameters found for {scan_name}. Using default values.")
-            lossy_params = lossy_params[-1] if lossy_params else {}
-        else:
-            lossy_params = matching_lossy_params[0]
-        # Get the scale factor, zero point shift, voxel size, and resolution factor
-        scale_factor = lossy_params.get('scale_factor', 1.0)
-        zero_point_shift = lossy_params.get('zero_point_shift', 0.0)
-        voxel_size = metadata_data.get('voxel_size', 1.0)
-        resolution_factor = lossy_params.get('resolution_factor', 1.0)
-
-        # Generate a histogram of the lossy image
-        hist, bin_edges = np.histogram(latest_edit_image_data, bins=65, range=(0, 255))  
-        histogram_data = {
-            'bins': bin_edges.tolist(),
-            'frequency': hist.tolist()
-        }
-        # Update preview JSON file *before* generating image
-        if scan_name == "atlas":
-            preview_json_path = os.path.join(resolve_atlas_dir(directory), "atlas_preview.json")
-        else:
-            preview_json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_preview.json")
-        
-        # Get the timestamp of the latest edit file for tracking changes
-        try:
-            latest_edit_timestamp = os.path.getctime(latest_lossy_edit_file_path.replace("_lossy", ""))
-        except OSError:
-            print(f"Warning: Could not get timestamp for {latest_lossy_edit_file_path.replace('_lossy', '')}")
-            latest_edit_timestamp = time.time()  # Use current time as fallback
-        
-        with open(preview_json_path, 'w') as json_file:
-            json.dump({
-                'last_edit': latest_edit_file_identifier, 
-                'threshold': threshold_orig, 
-                'last_edit_timestamp': latest_edit_timestamp, # Add timestamp tracking
-                'histogram_data': histogram_data,
-            }, json_file)
-
-        threshold_adjust_start_time = time.time()
-        # 2. Adjust Threshold for lossy image
-        if scale_factor != 0:
-            adjusted_threshold = (threshold_orig - zero_point_shift) / scale_factor
-        else:
-            adjusted_threshold = threshold_orig if zero_point_shift == 0 else (threshold_orig - zero_point_shift)
-            print(f"Warning: scale_factor is zero or missing for {scan_name}. Using threshold {adjusted_threshold}")
-
-        # Ensure threshold is within the range of the lossy data (often 0-255 for uint8)
-        data_min, data_max = np.min(latest_edit_image_data), np.max(latest_edit_image_data)
-        adjusted_threshold = np.clip(adjusted_threshold, data_min, data_max)
-        step_times['threshold'] = time.time() - threshold_adjust_start_time
-
-        centroid_start_time = time.time()
-        # 3. Calculate Centroid (using center_of_mass on thresholded data)
-        binary_image = latest_edit_image_data > adjusted_threshold
-        if np.any(binary_image):
-             # Use scipy.ndimage.center_of_mass on the binary mask for geometric center
-             centroid_voxel = ndimage.center_of_mass(binary_image)
-             # Ensure centroid coordinates are integers for slicing
-             centroid_voxel = tuple(int(round(c)) for c in centroid_voxel)
-             # Clamp centroid coordinates to be within image bounds
-             centroid_voxel = tuple(np.clip(c, 0, s - 1) for c, s in zip(centroid_voxel, latest_edit_image_data.shape))
-        else:
-             # Fallback if no voxels are above threshold: use image center
-             centroid_voxel = tuple(s // 2 for s in latest_edit_image_data.shape)
-             print(f"Warning: No voxels above threshold {adjusted_threshold} for {scan_name}. Using image center {centroid_voxel} for centroid.")
-
-        # Assuming Nifti shape is (X, Y, Z)
-        centroid_x, centroid_y, centroid_z = centroid_voxel
-        step_times['centroid'] = time.time() - centroid_start_time
-
-        quad1_start_time = time.time()
-        # 4. Generate Quadrant 1 (Z-Sum Projection)
-        z_sum_projection = np.sum(latest_edit_image_data, axis=2)
-        # Normalize for display
-        z_sum_norm = exposure.rescale_intensity(z_sum_projection, out_range=(0, 255)).astype(np.uint8)
-        step_times['z-sum'] = time.time() - quad1_start_time
-
-        quad2_start_time = time.time()
-        # 5. Generate Quadrant 2 (Marching Cubes 3D View)
-        quadrant2_img_array = None # Initialize
-        try:
-            # Calculate spacing for the lossy image
-            lossy_spacing = float(voxel_size) * float(resolution_factor) # Ensure float
-            spacing_tuple = (lossy_spacing, lossy_spacing, lossy_spacing)
-
-            # Calculate dynamic step size based on active voxel count to keep mesh size reasonable
-            # Marching cubes complexity scales with N / (step_size^3).
-            # These cutoffs aim for roughly 50k-80k "effective" voxels processed to keep time consistent.
-            active_voxels = np.count_nonzero(binary_image)
-            if active_voxels > 50_000_000:
-                dynamic_step = 9
-            elif active_voxels > 30_000_000:
-                dynamic_step = 8
-            elif active_voxels > 20_000_000:
-                dynamic_step = 7
-            elif active_voxels > 12_000_000:
-                dynamic_step = 6
-            elif active_voxels > 7_000_000:
-                dynamic_step = 5
-            elif active_voxels > 3_500_000:
-                dynamic_step = 4
-            elif active_voxels > 1_500_000:
-                dynamic_step = 3
-            elif active_voxels > 500_000:
-                dynamic_step = 2
-            else:
-                dynamic_step = 1
-
-            preview_3d_detail = f"; 3D {active_voxels:,} voxels, step {dynamic_step}"
-
-            # Use Max Pooling (block_reduce) to downsample strategically.
-            # Max pooling ensures that thin, high-intensity structures (like edges or small muscles/bones)
-            # are preserved and not "eaten away" or blurred below the threshold.
-            if dynamic_step > 1:
-                reduced_image_data = measure.block_reduce(
-                    latest_edit_image_data, 
-                    block_size=(dynamic_step, dynamic_step, dynamic_step), 
-                    func=np.max
-                )
-                
-                # Apply a mild Gaussian blur to the downsampled volume to smooth blocky edges
-                smoothed_image_data = gaussian_filter(reduced_image_data, sigma=1.0)
-                
-                # Since we actually shrunk the array, we tell marching cubes to use step_size=1
-                # and compensate by multiplying the physical spacing.
-                effective_spacing = (spacing_tuple[0] * dynamic_step, 
-                                     spacing_tuple[1] * dynamic_step, 
-                                     spacing_tuple[2] * dynamic_step)
-                effective_step = 1
-            else:
-                smoothed_image_data = latest_edit_image_data
-                effective_spacing = spacing_tuple
-                effective_step = 1
-
-            # Run marching cubes
-            verts, faces, _, _ = measure.marching_cubes(smoothed_image_data, level=adjusted_threshold, spacing=effective_spacing, step_size=effective_step)
-
-            if len(faces) > 0:
-                faces = faces[:, ::-1]
-
-            # Create a 3D plot using matplotlib
-            fig_3d = plt.figure(figsize=(8, 8), frameon=False) # Control figure size
-            fig_3d.subplots_adjust(0, 0, 1, 1)  # Remove all padding
-            ax_3d = fig_3d.add_subplot(111, projection='3d')
-            if len(verts) > 0 and len(faces) > 0:
-                 # Plot the mesh
-                 ax_3d.plot_trisurf(verts[:, 0], verts[:, 1], faces, verts[:, 2], color='lightgray', shade=True, edgecolor=None, alpha=1.0) 
-            else:
-                 # Handle empty mesh case
-                 ax_3d.text(0.5, 0.5, 0.5, "No Mesh", horizontalalignment='center', verticalalignment='center', transform=ax_3d.transAxes, color='black')
-
-            shape_mm = np.array(latest_edit_image_data.shape) * lossy_spacing
-            ax_3d.set_xlim(0, shape_mm[0])
-            ax_3d.set_ylim(0, shape_mm[1])
-            ax_3d.set_zlim(0, shape_mm[2])
-
-            # Set equal aspect ratio to prevent distortion
-            ax_3d.set_box_aspect([shape_mm[0], shape_mm[1], shape_mm[2]])
-
-            # Improve appearance
-            ax_3d.xaxis.pane.fill = False # Remove planes
-            ax_3d.yaxis.pane.fill = False
-            ax_3d.zaxis.pane.fill = False
-            ax_3d.grid(False) # No grid
-            ax_3d.set_xticks([]) # No ticks
-            ax_3d.set_yticks([])
-            ax_3d.set_zticks([])
-            # Make the axes invisible to remove boundary box
-            ax_3d.set_axis_off()
-            
-            # Set background color
-            ax_3d.set_facecolor('black')
-            fig_3d.patch.set_facecolor('black')
-            
-            # Remove top title to maximize 3D space
-            ax_3d.set_title("", pad=0)
-            ax_3d.view_init(elev=-30, azim=25, roll=90) # Adjust viewing angle, elev is left-right (negative is right), azim is up-down (negative is down), roll is roll
-
-            # Remove margin padding completely
-            plt.margins(0, 0, 0)
-            plt.tight_layout(pad=0, h_pad=0, w_pad=0)
-
-            # Render the 3D plot to a buffer
-            buf_3d = io.BytesIO()
-            fig_3d.savefig(buf_3d, format='png', facecolor="black", bbox_inches='tight', pad_inches=0, dpi=200)
-            buf_3d.seek(0)
-            img_3d = Image.open(buf_3d)
-            plt.close(fig_3d) # Close the figure to free memory
-            quadrant2_img_array = np.array(img_3d)
-            buf_3d.close()
-
-        except Exception as e:
-            print(f"Error generating 3D preview for {scan_name}: {e}")
-            # Create a placeholder image indicating error
-            img_placeholder = Image.new('RGB', (QUADRANT_RENDER_SIZE, QUADRANT_RENDER_SIZE), color = 'darkred')
-            draw = ImageDraw.Draw(img_placeholder)
-            draw.text((10, 10), "3D Preview Error", fill="white")
-            quadrant2_img_array = np.array(img_placeholder)
-
-        step_times['3D'] = time.time() - quad2_start_time
-
-        quad3_start_time = time.time()
-        # 6. Generate Quadrant 3 (X, Z Slice at Centroid Y)
-        # Slice along Y axis (axis=1) at centroid_y
-        xz_slice = latest_edit_image_data[:, centroid_y, :]
-        # Normalize and ensure correct orientation (transpose if needed)
-        xz_slice_norm = np.rot90(xz_slice).astype(np.uint8) # Rotate for better view
-        step_times['xz'] = time.time() - quad3_start_time
-
-        quad4_start_time = time.time()
-        # 7. Generate Quadrant 4 (Y, Z Slice at Centroid X)
-        # Slice along X axis (axis=0) at centroid_x
-        yz_slice = latest_edit_image_data[centroid_x, :, :]
-        # Normalize and ensure correct orientation
-        yz_slice_norm = np.rot90(yz_slice).astype(np.uint8) # Rotate for better view
-        step_times['yz'] = time.time() - quad4_start_time
-
-        combine_start_time = time.time()
-        # 8. Combine Quadrants
-        # Ensure all images are RGB for consistent stacking
-        if len(quadrant2_img_array.shape) == 3 and quadrant2_img_array.shape[2] == 4: # RGBA from PNG
-            # Blend with black background if alpha exists
-            alpha = quadrant2_img_array[:, :, 3] / 255.0
-            bg = Image.new('RGB', (QUADRANT_RENDER_SIZE, QUADRANT_RENDER_SIZE), color='black') # PIL size is (width, height)
-            fg = Image.fromarray(quadrant2_img_array[:, :, :3])
-            # Resize fg before pasting onto bg to handle potential size mismatch from fig_3d
-            fg_resized = self.resize_with_aspect_ratio(fg, (QUADRANT_RENDER_SIZE, QUADRANT_RENDER_SIZE), bg_color='black')
-            # Don't use the original mask with the resized image - they won't match dimensions
-            bg.paste(fg_resized, (0,0))
-            quadrant2_img_array = np.array(bg)
-        elif len(quadrant2_img_array.shape) == 2: # Grayscale
-            quadrant2_img_array = np.stack([quadrant2_img_array]*3, axis=-1)
-        elif quadrant2_img_array is None:
-            # Create a placeholder if it failed earlier and wasn't caught
-            img_placeholder = Image.new('RGB', (QUADRANT_RENDER_SIZE, QUADRANT_RENDER_SIZE), color = 'darkred')
-            draw = ImageDraw.Draw(img_placeholder)
-            draw.text((10, 10), "3D Preview Error", fill="white")
-            quadrant2_img_array = np.array(img_placeholder)
-
-        # Convert grayscale slices to RGB
-        z_sum_rgb = np.stack([z_sum_norm]*3, axis=-1)
-        xz_slice_rgb = np.stack([xz_slice_norm]*3, axis=-1)
-        yz_slice_rgb = np.stack([yz_slice_norm]*3, axis=-1)
-
-        # Resize images to a common size (e.g., 512x512)
-        target_size = (QUADRANT_RENDER_SIZE, QUADRANT_RENDER_SIZE)
-        
-        # Convert all arrays to PIL images safely
-        try:
-            img_q1_pil = Image.fromarray(z_sum_rgb.astype(np.uint8))
-            img_q2_pil = Image.fromarray(quadrant2_img_array.astype(np.uint8))
-            img_q3_pil = Image.fromarray(xz_slice_rgb.astype(np.uint8))
-            img_q4_pil = Image.fromarray(yz_slice_rgb.astype(np.uint8))
-        except Exception as e:
-            print(f"Error converting arrays to PIL images: {e}")
-            # Create fallback images if conversion fails
-            img_q1_pil = Image.new('RGB', target_size, color='black')
-            img_q2_pil = Image.new('RGB', target_size, color='black')
-            img_q3_pil = Image.new('RGB', target_size, color='black')
-            img_q4_pil = Image.new('RGB', target_size, color='black')
-
-        # Safely resize images with error handling
-        try:
-            img_q1 = self.resize_with_aspect_ratio(img_q1_pil, target_size)
-            img_q2 = self.resize_with_aspect_ratio(img_q2_pil, target_size)
-            img_q3 = self.resize_with_aspect_ratio(img_q3_pil, target_size)
-            img_q4 = self.resize_with_aspect_ratio(img_q4_pil, target_size)
-        except Exception as e:
-            print(f"Error resizing images: {e}")
-            img_q1 = Image.new('RGB', target_size, color='black')
-            img_q2 = Image.new('RGB', target_size, color='black')
-            img_q3 = Image.new('RGB', target_size, color='black')
-            img_q4 = Image.new('RGB', target_size, color='black')
-
-        # Create the grid image
-        grid_img = Image.new('RGB', (target_size[0]*2, target_size[1]*2))
-        
-        # Paste images with error handling
-        try:
-            grid_img.paste(img_q1, (0, 0))
-            grid_img.paste(img_q2, (target_size[0], 0))
-            grid_img.paste(img_q3, (0, target_size[1]))
-            grid_img.paste(img_q4, (target_size[0], target_size[1]))
-        except Exception as e:
-            print(f"Error pasting images onto grid: {e}")
-            # If pasting fails, create a simple error image
-            grid_img = Image.new('RGB', (target_size[0]*2, target_size[1]*2), color='black')
-            draw = ImageDraw.Draw(grid_img)
-            draw.text((10, 10), f"Error creating preview: {e}", fill="white")
-            
-        # Add titles
-        draw = ImageDraw.Draw(grid_img)
-        try:
-            # Try loading a simple font
-            font = ImageFont.truetype("DejaVuSans.ttf", 20) # Use a common sans-serif font if available
-        except IOError:
-            font = ImageFont.load_default() # Fallback
-
-        # Add titles with background box for better visibility
-        def draw_text_with_bg(draw, pos, text, font, text_color="white", bg_color="black"):
-             bbox = draw.textbbox(pos, text, font=font)
-             # Add small padding
-             bg_bbox = (bbox[0]-2, bbox[1]-1, bbox[2]+2, bbox[3]+1)
-             try: # Handle potential RGBA color for background
-                 draw.rectangle(bg_bbox, fill=bg_color)
-             except TypeError: # Fallback to RGB if RGBA fails
-                 draw.rectangle(bg_bbox, fill=bg_color[:3])
-             draw.text(pos, text, fill=text_color, font=font)
-
-        draw_text_with_bg(draw, (5, 5), "Z Sum Projection", font=font)
-        draw_text_with_bg(draw, (target_size[0] + 5, 5), "3D Marching Cubes", font=font)
-        draw_text_with_bg(draw, (5, target_size[1] + 5), f"XZ Slice (Y={centroid_y})", font=font)
-        draw_text_with_bg(draw, (target_size[0] + 5, target_size[1] + 5), f"YZ Slice (X={centroid_x})", font=font)
-
-        step_times['compose'] = time.time() - combine_start_time
-
-        save_start_time = time.time()
-        # 9. Save/Return Image
-        buf_final = io.BytesIO()
-        grid_img.save(buf_final, format='JPEG', quality=GRID_PREVIEW_JPEG_QUALITY)
-        buf_final.seek(0)
-        image_data_bytes = buf_final.read()
-        buf_final.close()
-
-        # Save the image to disk as well
-        if scan_name == "atlas":
-            preview_path = os.path.join(resolve_atlas_dir(directory), "atlas_preview.jpg")
-        else:
-            preview_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_preview.jpg")
-            
-        try:
-            with open(preview_path, 'wb') as f:
-                f.write(image_data_bytes)
-        except IOError as e:
-            print(f"Error saving preview image {preview_path}: {e}")
-
-        step_times['save'] = time.time() - save_start_time
-
-        # Clean up large data structures
-        cleanup_start_time = time.time()
-        latest_edit_image_data = None
-        binary_image = None
-        verts = faces = None
-        gc.collect()
-        step_times['cleanup'] = time.time() - cleanup_start_time
-
-        total_time = time.time() - start_time
-        step_summary = ' · '.join(f"{step} {seconds:.2f}" for step, seconds in step_times.items())
-        print(
-            f"[GridView] {scan_name}: preview generated in {total_time:.2f} s "
-            f"(thr {threshold_orig} → {float(adjusted_threshold):.1f} lossy, range [{data_min}, {data_max}]"
-            f"{preview_3d_detail}; {step_summary})"
-        )
-        return image_data_bytes # Return bytes for the response
+        # Shared with post() so a failure can report which steps completed before it broke.
+        self._preview_step_times = {}
+        return gridPreviewWorker.create_preview_image(
+            scan_name, directory, ignoreElastic, step_times=self._preview_step_times)
 
     def get_histogram_data(self, scan_name, directory):
         # Check the preview.json file for the histogram data
@@ -2082,6 +1683,129 @@ class GetGridView(APIView):
              # For now, return a server error
              return Response({'error': f'Failed to generate preview: {e}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+
+
+class GetGridViewBatch(GetGridView):
+    """Regular Grid View previews for several scans per request (Aurora 1.9.4+).
+
+    The grid used to call /get-grid-view/ once per scan, and since Daphne runs these
+    synchronous views on one thread, a page of new scans was built strictly one after
+    another. This endpoint takes the scans of the visible page in page order, answers every
+    cached preview immediately, and builds up to one round of missing previews in parallel
+    worker processes (gridPreviewWorker.generate_previews: cores - 1 workers, within a free
+    RAM budget). Names it did not get to are returned as `pending`; the UI sends them again
+    right away, so tiles fill round by round and a page change (aborted request) leaves at
+    most one round running. Preserved-mesh scans are built in the engine as before (their
+    renderer uses VTK, kept out of the worker processes).
+
+    Body:     {directory, scan_name: [names in page order], ignoreElastic, force}
+              (`force`: optional list of names among scan_name whose preview is rebuilt
+              even if the cached one is current; the grid's "Refresh previews" button.)
+              (`scan_name` is a list here so the network-mode path check in
+              networkFolders.NetworkPathPermission validates every name, as for
+              /get-grid-view/.)
+    Response: {results: [{scan_name, image_data, histogram_data} | {scan_name, error}],
+               pending: [names], workers}
+    """
+
+    def _cached_preview_payload(self, scan_name, directory, ignoreElastic, is_preserved_mesh):
+        """Same up-to-date test and cache read as GetGridView.post; None when the preview
+        has to be (re)built."""
+        if scan_name == "atlas":
+            preview_path = os.path.join(resolve_atlas_dir(directory), "atlas_preview.jpg")
+            preview_json_path = os.path.join(resolve_atlas_dir(directory), "atlas_preview.json")
+        else:
+            preview_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_preview.jpg")
+            preview_json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_preview.json")
+        if not (os.path.exists(preview_path) and os.path.exists(preview_json_path)):
+            return None
+        preview_is_current = (
+            self.mesh_preview_up_to_date(scan_name, directory, ignoreElastic)
+            if is_preserved_mesh
+            else self.preview_up_to_date(scan_name, directory, ignoreElastic)
+        )
+        if not preview_is_current:
+            return None
+        try:
+            with open(preview_path, 'rb') as image_file:
+                image_data = image_file.read()
+            return {
+                'scan_name': scan_name,
+                'image_data': base64.b64encode(image_data).decode('utf-8'),
+                'histogram_data': self.get_histogram_data(scan_name, directory),
+            }
+        except (IOError, json.JSONDecodeError) as e:
+            print(f"Error reading existing preview file {preview_path}: {e}")
+            return None
+
+    def _built_preview_payload(self, scan_name, directory, image_bytes):
+        return {
+            'scan_name': scan_name,
+            'image_data': base64.b64encode(image_bytes).decode('utf-8'),
+            'histogram_data': self.get_histogram_data(scan_name, directory),
+        }
+
+    def post(self, request, *args, **kwargs):
+        directory = request.data.get('directory')
+        scan_names = request.data.get('scan_name')
+        force_names = request.data.get('force') or []
+        force_names = {name for name in force_names if isinstance(name, str)} if isinstance(force_names, list) else set()
+        ignoreElastic = request.data.get('ignoreElastic', False)
+        if (not directory or not isinstance(scan_names, list)
+                or not all(isinstance(name, str) and name for name in scan_names)):
+            return Response({'error': 'Missing directory or scan_name list'}, status=status.HTTP_400_BAD_REQUEST)
+
+        workers = gridPreviewWorker.plan_workers()
+        payloads = {}
+        volume_names = []   # built in worker processes this round
+        mesh_names = []     # built in the engine this round
+        pending = []        # left for the UI's next request
+        for scan_name in scan_names:
+            is_preserved_mesh = False
+            if scan_name != "atlas":
+                try:
+                    is_preserved_mesh = _is_preserved_mesh_metadata(self._load_scan_metadata(scan_name, directory))
+                except (FileNotFoundError, json.JSONDecodeError):
+                    is_preserved_mesh = False
+            cached = (None if scan_name in force_names
+                      else self._cached_preview_payload(scan_name, directory, ignoreElastic, is_preserved_mesh))
+            if cached is not None:
+                payloads[scan_name] = cached
+            elif len(volume_names) + len(mesh_names) >= workers:
+                pending.append(scan_name)
+            elif is_preserved_mesh:
+                mesh_names.append(scan_name)
+            else:
+                volume_names.append(scan_name)
+
+        if volume_names:
+            outcomes = gridPreviewWorker.generate_previews(
+                [(scan_name, directory, ignoreElastic) for scan_name in volume_names],
+                workers=workers,
+            )
+            for outcome in outcomes:
+                scan_name = outcome['scan_name']
+                if 'image_bytes' in outcome:
+                    payloads[scan_name] = self._built_preview_payload(scan_name, directory, outcome['image_bytes'])
+                else:
+                    # Same report as GetGridView.post: the steps that completed, then the traceback.
+                    print(f"Error occurred during preview generation for {scan_name}: {outcome['error']}")
+                    print(f"[GridView] {scan_name}: steps completed before the error: {outcome['steps']}")
+                    print(outcome['traceback'])
+                    payloads[scan_name] = {'scan_name': scan_name, 'error': f"Failed to generate preview: {outcome['error']}"}
+
+        for scan_name in mesh_names:
+            try:
+                image_bytes = self.create_mesh_preview_image(scan_name, directory, ignoreElastic)
+                payloads[scan_name] = self._built_preview_payload(scan_name, directory, image_bytes)
+            except Exception as e:  # noqa: BLE001 - reported per scan, the page goes on
+                import traceback
+                print(f"Error occurred during preview generation for {scan_name}: {e}")
+                traceback.print_exc()
+                payloads[scan_name] = {'scan_name': scan_name, 'error': f'Failed to generate preview: {e}'}
+
+        results = [payloads[name] for name in scan_names if name in payloads]
+        return Response({'results': results, 'pending': pending, 'workers': workers})
 
 class CreateFolderView(APIView):
     def post(self, request, *args, **kwargs):
@@ -2621,6 +2345,10 @@ class ExtractScansView(APIView):
             return result
         return scaled
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _save_segmentation_masks(self, scan_out_folder, scan_name, seg_mask):
         """
         Save segmentation masks aligned to both full and lossy images if they exist.
@@ -2636,8 +2364,7 @@ class ExtractScansView(APIView):
                 full_mask_img = nib.Nifti1Image(full_mask.astype(np.uint8), full_img.affine, header=full_img.header)
                 full_temp = os.path.join(scan_out_folder, f"{scan_name}_mask.nii.gz")
                 full_final = os.path.join(scan_out_folder, f"{scan_name}.nii.mask.gz")
-                nib.save(full_mask_img, full_temp)
-                os.rename(full_temp, full_final)
+                atomic_nib_save(full_mask_img, full_final)
 
             # Lossy
             lossy_img_path = os.path.join(scan_out_folder, f"{scan_name}_lossy.nii.gz")
@@ -2648,8 +2375,7 @@ class ExtractScansView(APIView):
                 lossy_mask_img = nib.Nifti1Image(lossy_mask.astype(np.uint8), lossy_img.affine, header=lossy_img.header)
                 lossy_temp = os.path.join(scan_out_folder, f"{scan_name}_lossy_mask.nii.gz")
                 lossy_final = os.path.join(scan_out_folder, f"{scan_name}_lossy.nii.mask.gz")
-                nib.save(lossy_mask_img, lossy_temp)
-                os.rename(lossy_temp, lossy_final)
+                atomic_nib_save(lossy_mask_img, lossy_final)
         except Exception as e:
             print(f"Warning: Failed to save segmentation masks for {scan_name}: {e}")
 
@@ -3724,417 +3450,421 @@ class ExtractScansView(APIView):
                 if not os.path.exists(scan_out_folder):
                     os.makedirs(scan_out_folder)
 
-                scanner_metadata = None 
-                image_data = None
-                voxel_sizes = None  # Change to store 3D voxel sizes
-                is_binary = False
-                extra_json_metadata = {}
-                intensity_value_mapping = None
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything extracted for this
+                # scan is one transaction over its new folder. A crash halfway rolls back every file
+                # written here and removes the folder again, so no half-extracted subject is left for
+                # the other tools to read. New extraction outputs go inside this block, written with
+                # the atomic_* helpers.
+                with transaction_over([scan_out_folder], 'extract'):
+                    scanner_metadata = None 
+                    image_data = None
+                    voxel_sizes = None  # Change to store 3D voxel sizes
+                    is_binary = False
+                    extra_json_metadata = {}
+                    intensity_value_mapping = None
 
-                if scan_subtype == "SCANCO vivaCT":
-                    aim_file = os.path.join(directory, f"{scan_name}.aim")
-                    if not os.path.exists(aim_file):
-                        aim_file = os.path.join(directory, f"{scan_name}.AIM")
+                    if scan_subtype == "SCANCO vivaCT":
+                        aim_file = os.path.join(directory, f"{scan_name}.aim")
+                        if not os.path.exists(aim_file):
+                            aim_file = os.path.join(directory, f"{scan_name}.AIM")
                     
-                    image_data = aim2numpy.extract(aim_file)
-                    header_data = aim2numpy.get_header_info(aim_file)
+                        image_data = aim2numpy.extract(aim_file)
+                        header_data = aim2numpy.get_header_info(aim_file)
                     
-                    # Extract 3D voxel sizes
-                    voxel_sizes = self._extract_3d_voxel_sizes(
-                        scan_subtype, scan_name, directory, 
-                        aim_file=aim_file, header_data=header_data
-                    )
-                    
-                    # Standardize data type
-                    image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                        image_data, intensity_options=intensity_options, scan_name=scan_name
-                    )
-                    
-                elif scan_subtype == "TIFF Folder":
-                    scan_folder = os.path.join(directory, scan_name)
-                    image_data, voxel_size = self.load_zeiss_image(scan_folder)
-                    
-                    # For now, assume isotropic for TIFF (can be enhanced)
-                    voxel_sizes = (voxel_size, voxel_size, voxel_size)
-                    
-                    # Standardize data type
-                    image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                        image_data, intensity_options=intensity_options, scan_name=scan_name
-                    )
-                    
-                elif scan_subtype == "DICOM":
-                    scan_folder = os.path.join(directory, scan_name)
-                    if os.path.exists(os.path.join(scan_folder, "DICOMDIR")) or any(f.endswith('.dcm') for f in os.listdir(scan_folder)):
-                        voxel_size_single, image_data, scanner_metadata = self.load_dicom_image(scan_folder)
-                        
-                        # Extract 3D voxel sizes from DICOM metadata
-                        voxel_sizes = self._extract_3d_voxel_sizes(
-                            scan_subtype, scan_name, directory,
-                            scanner_metadata=scanner_metadata
-                        )
-                        
-                        # Standardize data type
-                        image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                            image_data, intensity_options=intensity_options, scan_name=scan_name
-                        )
-                        
-                elif scan_subtype == "Multi-page TIFF":
-                    scan_folder_tiff = os.path.join(directory, scan_name + ".tiff")
-                    scan_folder_tif = os.path.join(directory, scan_name + ".tif")
-                    
-                    if os.path.exists(scan_folder_tiff):
-                        scan_folder = scan_folder_tiff
-                    elif os.path.exists(scan_folder_tif):
-                        scan_folder = scan_folder_tif
-                    else:
-                        print(f"Warning: Neither {scan_name}.tiff nor {scan_name}.tif found, skipping...")
-                        continue
-                        
-                    image_data, voxel_size, scanner_metadata = self.load_multi_page_tiff(scan_folder)
-                    
-                    # For now, assume isotropic for TIFF (can be enhanced)
-                    voxel_sizes = (voxel_size, voxel_size, voxel_size)
-                    
-                    # Standardize data type
-                    image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                        image_data, intensity_options=intensity_options, scan_name=scan_name
-                    )
-                    
-                elif scan_subtype == "NIfTI (.nii.gz)":
-                    nii_gz_file = os.path.join(directory, f"{scan_name}.nii.gz")
-                    if os.path.exists(nii_gz_file):
-                        # Load the NIfTI file to extract metadata and voxel sizes
-                        nii_img = nib.load(nii_gz_file)
-                        image_data = np.asanyarray(nii_img.dataobj)
-                        
                         # Extract 3D voxel sizes
                         voxel_sizes = self._extract_3d_voxel_sizes(
-                            scan_subtype, scan_name, directory,
-                            nii_img=nii_img
+                            scan_subtype, scan_name, directory, 
+                            aim_file=aim_file, header_data=header_data
                         )
-                        
+                    
                         # Standardize data type
                         image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
                             image_data, intensity_options=intensity_options, scan_name=scan_name
                         )
-                        
-                        # Extract scanner metadata from NIfTI header
-                        scanner_metadata = self._extract_nifti_metadata(nii_img)
-                    else:
-                        continue
-                        
-                elif scan_subtype == "NIfTI (.nii)":
-                    nii_file = os.path.join(directory, f"{scan_name}.nii")
-                    if os.path.exists(nii_file):
-                        # Load the NIfTI file
-                        nii_img = nib.load(nii_file)
-                        image_data = np.asanyarray(nii_img.dataobj)
-                        
-                        # Extract 3D voxel sizes
-                        voxel_sizes = self._extract_3d_voxel_sizes(
-                            scan_subtype, scan_name, directory,
-                            nii_img=nii_img
-                        )
-                        
+                    
+                    elif scan_subtype == "TIFF Folder":
+                        scan_folder = os.path.join(directory, scan_name)
+                        image_data, voxel_size = self.load_zeiss_image(scan_folder)
+                    
+                        # For now, assume isotropic for TIFF (can be enhanced)
+                        voxel_sizes = (voxel_size, voxel_size, voxel_size)
+                    
                         # Standardize data type
                         image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
                             image_data, intensity_options=intensity_options, scan_name=scan_name
                         )
+                    
+                    elif scan_subtype == "DICOM":
+                        scan_folder = os.path.join(directory, scan_name)
+                        if os.path.exists(os.path.join(scan_folder, "DICOMDIR")) or any(f.endswith('.dcm') for f in os.listdir(scan_folder)):
+                            voxel_size_single, image_data, scanner_metadata = self.load_dicom_image(scan_folder)
                         
-                        # Extract scanner metadata from NIfTI header
-                        scanner_metadata = self._extract_nifti_metadata(nii_img)
-                    else:
-                        continue
-
-                elif scan_subtype == "MINC":
-                    # Probe both lowercase and uppercase extensions
-                    mnc_file = os.path.join(directory, f"{scan_name}.mnc")
-                    if not os.path.exists(mnc_file):
-                        mnc_file = os.path.join(directory, f"{scan_name}.MNC")
-                    if os.path.exists(mnc_file):
-                        image_data, voxel_sizes, scanner_metadata = self.load_minc_image(mnc_file)
-                        if image_data is None:
+                            # Extract 3D voxel sizes from DICOM metadata
+                            voxel_sizes = self._extract_3d_voxel_sizes(
+                                scan_subtype, scan_name, directory,
+                                scanner_metadata=scanner_metadata
+                            )
+                        
+                            # Standardize data type
+                            image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
+                                image_data, intensity_options=intensity_options, scan_name=scan_name
+                            )
+                        
+                    elif scan_subtype == "Multi-page TIFF":
+                        scan_folder_tiff = os.path.join(directory, scan_name + ".tiff")
+                        scan_folder_tif = os.path.join(directory, scan_name + ".tif")
+                    
+                        if os.path.exists(scan_folder_tiff):
+                            scan_folder = scan_folder_tiff
+                        elif os.path.exists(scan_folder_tif):
+                            scan_folder = scan_folder_tif
+                        else:
+                            print(f"Warning: Neither {scan_name}.tiff nor {scan_name}.tif found, skipping...")
                             continue
+                        
+                        image_data, voxel_size, scanner_metadata = self.load_multi_page_tiff(scan_folder)
+                    
+                        # For now, assume isotropic for TIFF (can be enhanced)
+                        voxel_sizes = (voxel_size, voxel_size, voxel_size)
+                    
                         # Standardize data type
                         image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
                             image_data, intensity_options=intensity_options, scan_name=scan_name
                         )
-                    else:
-                        continue
+                    
+                    elif scan_subtype == "NIfTI (.nii.gz)":
+                        nii_gz_file = os.path.join(directory, f"{scan_name}.nii.gz")
+                        if os.path.exists(nii_gz_file):
+                            # Load the NIfTI file to extract metadata and voxel sizes
+                            nii_img = nib.load(nii_gz_file)
+                            image_data = np.asanyarray(nii_img.dataobj)
+                        
+                            # Extract 3D voxel sizes
+                            voxel_sizes = self._extract_3d_voxel_sizes(
+                                scan_subtype, scan_name, directory,
+                                nii_img=nii_img
+                            )
+                        
+                            # Standardize data type
+                            image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
+                                image_data, intensity_options=intensity_options, scan_name=scan_name
+                            )
+                        
+                            # Extract scanner metadata from NIfTI header
+                            scanner_metadata = self._extract_nifti_metadata(nii_img)
+                        else:
+                            continue
+                        
+                    elif scan_subtype == "NIfTI (.nii)":
+                        nii_file = os.path.join(directory, f"{scan_name}.nii")
+                        if os.path.exists(nii_file):
+                            # Load the NIfTI file
+                            nii_img = nib.load(nii_file)
+                            image_data = np.asanyarray(nii_img.dataobj)
+                        
+                            # Extract 3D voxel sizes
+                            voxel_sizes = self._extract_3d_voxel_sizes(
+                                scan_subtype, scan_name, directory,
+                                nii_img=nii_img
+                            )
+                        
+                            # Standardize data type
+                            image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
+                                image_data, intensity_options=intensity_options, scan_name=scan_name
+                            )
+                        
+                            # Extract scanner metadata from NIfTI header
+                            scanner_metadata = self._extract_nifti_metadata(nii_img)
+                        else:
+                            continue
 
-                elif self._is_mesh_subtype(scan_subtype):
-                    if scan_name in skipped_mesh_subjects:
-                        print(f"Skipping mesh {scan_name} by user request")
-                        continue
+                    elif scan_subtype == "MINC":
+                        # Probe both lowercase and uppercase extensions
+                        mnc_file = os.path.join(directory, f"{scan_name}.mnc")
+                        if not os.path.exists(mnc_file):
+                            mnc_file = os.path.join(directory, f"{scan_name}.MNC")
+                        if os.path.exists(mnc_file):
+                            image_data, voxel_sizes, scanner_metadata = self.load_minc_image(mnc_file)
+                            if image_data is None:
+                                continue
+                            # Standardize data type
+                            image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
+                                image_data, intensity_options=intensity_options, scan_name=scan_name
+                            )
+                        else:
+                            continue
 
-                    mesh_path = self._mesh_source_path(directory, scan_name, scan_subtype)
-                    if not mesh_path:
-                        print(f"Warning: mesh file for {scan_name} not found, skipping...")
-                        continue
+                    elif self._is_mesh_subtype(scan_subtype):
+                        if scan_name in skipped_mesh_subjects:
+                            print(f"Skipping mesh {scan_name} by user request")
+                            continue
 
-                    scale_factor = self._mesh_scale_factor_for_scan(scan_name, mesh_options)
-                    group_label = (mesh_options.get('subject_scale_groups') or {}).get(scan_name)
-                    builtin_texture_meta = None
-                    extracted_face_uvs = None
-                    if mesh_mode != 'voxelize':
-                        builtin_texture_meta = detect_and_extract_builtin_texture(
-                            mesh_path, scan_out_folder, scan_name
-                        )
-                        if builtin_texture_meta:
-                            from .openUsdMeshTools import is_openusd_mesh_source, load_openusd_face_corner_uvs
-                            from .builtinTextureTools import _load_single_trimesh
+                        mesh_path = self._mesh_source_path(directory, scan_name, scan_subtype)
+                        if not mesh_path:
+                            print(f"Warning: mesh file for {scan_name} not found, skipping...")
+                            continue
 
-                            raw_vertices = raw_faces = None
-                            if is_openusd_mesh_source(mesh_path):
-                                raw_vertices, raw_faces, extracted_face_uvs = load_openusd_face_corner_uvs(
-                                    mesh_path, scale_factor=scale_factor
-                                )
-                            else:
-                                raw_mesh = _load_single_trimesh(mesh_path)
-                                if raw_mesh is not None and scale_factor != 1.0:
-                                    raw_mesh.vertices = (
-                                        np.asarray(raw_mesh.vertices, dtype=np.float64) * float(scale_factor)
+                        scale_factor = self._mesh_scale_factor_for_scan(scan_name, mesh_options)
+                        group_label = (mesh_options.get('subject_scale_groups') or {}).get(scan_name)
+                        builtin_texture_meta = None
+                        extracted_face_uvs = None
+                        if mesh_mode != 'voxelize':
+                            builtin_texture_meta = detect_and_extract_builtin_texture(
+                                mesh_path, scan_out_folder, scan_name
+                            )
+                            if builtin_texture_meta:
+                                from .openUsdMeshTools import is_openusd_mesh_source, load_openusd_face_corner_uvs
+                                from .builtinTextureTools import _load_single_trimesh
+
+                                raw_vertices = raw_faces = None
+                                if is_openusd_mesh_source(mesh_path):
+                                    raw_vertices, raw_faces, extracted_face_uvs = load_openusd_face_corner_uvs(
+                                        mesh_path, scale_factor=scale_factor
                                     )
-                                if raw_mesh is not None:
-                                    raw_vertices = np.asarray(raw_mesh.vertices, dtype=np.float64)
-                                    raw_faces = np.asarray(raw_mesh.faces, dtype=np.int64)
-                                extracted_face_uvs = extract_face_corner_uvs(raw_mesh)
-                            if extracted_face_uvs is None:
-                                print(
-                                    f"Built-in texture metadata found for {scan_name} but UV "
-                                    "extraction failed; disabling built-in texture."
-                                )
-                                builtin_texture_meta = None
-                            else:
-                                mesh_for_uv_align = self._load_mesh_for_extraction(
-                                    mesh_path, scale_factor=scale_factor
-                                )
-                                aligned_faces = np.asarray(mesh_for_uv_align.faces, dtype=np.int64)
-                                if (
-                                    raw_vertices is not None
-                                    and raw_faces is not None
-                                    and (
-                                        aligned_faces.shape != raw_faces.shape
-                                        or not np.array_equal(aligned_faces, raw_faces)
-                                    )
-                                ):
-                                    extracted_face_uvs = remap_face_uvs_for_decimated_mesh(
-                                        raw_vertices,
-                                        raw_faces,
-                                        extracted_face_uvs,
-                                        np.asarray(mesh_for_uv_align.vertices, dtype=np.float64),
-                                        aligned_faces,
-                                    )
+                                else:
+                                    raw_mesh = _load_single_trimesh(mesh_path)
+                                    if raw_mesh is not None and scale_factor != 1.0:
+                                        raw_mesh.vertices = (
+                                            np.asarray(raw_mesh.vertices, dtype=np.float64) * float(scale_factor)
+                                        )
+                                    if raw_mesh is not None:
+                                        raw_vertices = np.asarray(raw_mesh.vertices, dtype=np.float64)
+                                        raw_faces = np.asarray(raw_mesh.faces, dtype=np.int64)
+                                    extracted_face_uvs = extract_face_corner_uvs(raw_mesh)
                                 if extracted_face_uvs is None:
                                     print(
                                         f"Built-in texture metadata found for {scan_name} but UV "
-                                        "alignment after mesh welding failed; disabling built-in texture."
+                                        "extraction failed; disabling built-in texture."
                                     )
                                     builtin_texture_meta = None
-                    mesh = self._load_mesh_for_extraction(mesh_path, scale_factor=scale_factor)
-                    extract_centroid = _center_trimesh_at_surface_centroid(mesh)
-                    mesh_summary = self._mesh_summary(mesh, scan_name, scale_factor=scale_factor, group_label=group_label)
-                    mesh_summary.update({
-                        'source_file': os.path.basename(mesh_path),
-                        'extract_centroid': extract_centroid.tolist(),
-                        'coordinate_origin': 'surface_centroid',
-                    })
+                                else:
+                                    mesh_for_uv_align = self._load_mesh_for_extraction(
+                                        mesh_path, scale_factor=scale_factor
+                                    )
+                                    aligned_faces = np.asarray(mesh_for_uv_align.faces, dtype=np.int64)
+                                    if (
+                                        raw_vertices is not None
+                                        and raw_faces is not None
+                                        and (
+                                            aligned_faces.shape != raw_faces.shape
+                                            or not np.array_equal(aligned_faces, raw_faces)
+                                        )
+                                    ):
+                                        extracted_face_uvs = remap_face_uvs_for_decimated_mesh(
+                                            raw_vertices,
+                                            raw_faces,
+                                            extracted_face_uvs,
+                                            np.asarray(mesh_for_uv_align.vertices, dtype=np.float64),
+                                            aligned_faces,
+                                        )
+                                    if extracted_face_uvs is None:
+                                        print(
+                                            f"Built-in texture metadata found for {scan_name} but UV "
+                                            "alignment after mesh welding failed; disabling built-in texture."
+                                        )
+                                        builtin_texture_meta = None
+                        mesh = self._load_mesh_for_extraction(mesh_path, scale_factor=scale_factor)
+                        extract_centroid = _center_trimesh_at_surface_centroid(mesh)
+                        mesh_summary = self._mesh_summary(mesh, scan_name, scale_factor=scale_factor, group_label=group_label)
+                        mesh_summary.update({
+                            'source_file': os.path.basename(mesh_path),
+                            'extract_centroid': extract_centroid.tolist(),
+                            'coordinate_origin': 'surface_centroid',
+                        })
 
-                    if mesh_mode == 'voxelize':
-                        final_mesh_voxel_size = mesh_voxel_size or self._derive_mesh_voxel_size(directory, [scan], mesh_options)
-                        image_data, voxelization_warning = self._voxelize_mesh_to_volume(mesh, final_mesh_voxel_size)
-                        voxel_sizes = (final_mesh_voxel_size, final_mesh_voxel_size, final_mesh_voxel_size)
-                        is_binary = True
-                        scanner_metadata = {
-                            'mesh_extraction': {
-                                'assumed_units': 'mm',
+                        if mesh_mode == 'voxelize':
+                            final_mesh_voxel_size = mesh_voxel_size or self._derive_mesh_voxel_size(directory, [scan], mesh_options)
+                            image_data, voxelization_warning = self._voxelize_mesh_to_volume(mesh, final_mesh_voxel_size)
+                            voxel_sizes = (final_mesh_voxel_size, final_mesh_voxel_size, final_mesh_voxel_size)
+                            is_binary = True
+                            scanner_metadata = {
+                                'mesh_extraction': {
+                                    'assumed_units': 'mm',
+                                    'voxelized': True,
+                                    'voxelization_warning': voxelization_warning,
+                                }
+                            }
+                            extra_json_metadata = {
+                                'is_mesh': True,
                                 'voxelized': True,
+                                'mesh_metadata': mesh_summary,
+                                'mesh_scale': {
+                                    'assumed_units_after_scaling': 'mm',
+                                    'scale_factor': float(scale_factor),
+                                    'scale_group': group_label,
+                                },
                                 'voxelization_warning': voxelization_warning,
                             }
-                        }
-                        extra_json_metadata = {
-                            'is_mesh': True,
-                            'voxelized': True,
-                            'mesh_metadata': mesh_summary,
-                            'mesh_scale': {
-                                'assumed_units_after_scaling': 'mm',
-                                'scale_factor': float(scale_factor),
-                                'scale_group': group_label,
-                            },
-                            'voxelization_warning': voxelization_warning,
-                        }
+                        else:
+                            ply_file = os.path.join(scan_out_folder, f"{scan_name}.ply")
+                            self._save_mesh_as_ply(mesh, ply_file)
+                            json_file = os.path.join(scan_out_folder, f"{scan_name}.json")
+                            json_metadata = {
+                                'name': scan_name,
+                                'original_format': scan_subtype,
+                                'is_mesh': True,
+                                'voxelized': False,
+                                'coordinate_origin': 'surface_centroid',
+                                'source_file': os.path.basename(mesh_path),
+                                'mesh_file': f"{scan_name}.ply",
+                                'mesh_metadata': mesh_summary,
+                                'mesh_scale': {
+                                    'assumed_units_after_scaling': 'mm',
+                                    'scale_factor': float(scale_factor),
+                                    'scale_group': group_label,
+                                },
+                            }
+                            if builtin_texture_meta:
+                                json_metadata['builtin_texture'] = builtin_texture_meta
+                                if extracted_face_uvs is not None:
+                                    save_uv_sidecar(ply_file, extracted_face_uvs)
+                            atomic_write_json(json_file, json_metadata, indent=4)
+                            print(scan_name+" mesh saved")
+                            continue
+
                     else:
-                        ply_file = os.path.join(scan_out_folder, f"{scan_name}.ply")
-                        self._save_mesh_as_ply(mesh, ply_file)
-                        json_file = os.path.join(scan_out_folder, f"{scan_name}.json")
-                        json_metadata = {
-                            'name': scan_name,
-                            'original_format': scan_subtype,
-                            'is_mesh': True,
-                            'voxelized': False,
-                            'coordinate_origin': 'surface_centroid',
-                            'source_file': os.path.basename(mesh_path),
-                            'mesh_file': f"{scan_name}.ply",
-                            'mesh_metadata': mesh_summary,
-                            'mesh_scale': {
-                                'assumed_units_after_scaling': 'mm',
-                                'scale_factor': float(scale_factor),
-                                'scale_group': group_label,
-                            },
-                        }
-                        if builtin_texture_meta:
-                            json_metadata['builtin_texture'] = builtin_texture_meta
-                            if extracted_face_uvs is not None:
-                                save_uv_sidecar(ply_file, extracted_face_uvs)
-                        with open(json_file, 'w') as jf:
-                            json.dump(json_metadata, jf, indent=4)
-                        print(scan_name+" mesh saved")
                         continue
 
-                else:
-                    continue
-
-                if image_data is not None and image_data.ndim > 3:
-                    channel_axis = int(np.argmin(image_data.shape))
-                    print(
-                        f"4D+ volume (shape {image_data.shape}), "
-                        f"reducing to 3D via channel axis {channel_axis}"
-                    )
-                    image_data = self._reduce_extra_dims_to_3d(image_data)
-
-                # 🔄 NEW: Check for anisotropic voxels and resample if needed
-                if image_data is not None and voxel_sizes is not None:
-                    print(f"Processing {scan_name}: shape {image_data.shape}, voxel sizes {voxel_sizes}")
-                    
-                    # Check and resample if anisotropic
-                    image_data, final_voxel_size, was_resampled = self._check_and_resample_if_anisotropic(
-                        image_data, voxel_sizes, verbose=True
-                    )
-                    
-                    if was_resampled:
-                        print(f"✅ {scan_name} resampled from {voxel_sizes} to isotropic {final_voxel_size:.3f} mm")
-                        
-                        # Update scanner metadata to indicate resampling was performed
-                        if scanner_metadata is None:
-                            scanner_metadata = {}
-                        scanner_metadata['anisotropic_resampling'] = {
-                            'performed': True,
-                            'original_voxel_sizes': voxel_sizes,
-                            'final_isotropic_voxel_size': final_voxel_size,
-                            'resampling_method': 'deformation_based_interpolation'
-                        }
-                    else:
-                        if scanner_metadata is None:
-                            scanner_metadata = {}
-                        scanner_metadata['anisotropic_resampling'] = {
-                            'performed': False,
-                            'voxel_sizes': voxel_sizes,
-                            'reason': 'already_isotropic' if max(voxel_sizes) / min(voxel_sizes) <= 1.1 else 'resampling_failed'
-                        }
-                else:
-                    # Fallback for when we couldn't extract proper voxel sizes
-                    final_voxel_size = 1.0
-                    print(f"⚠️ Warning: Could not extract voxel sizes for {scan_name}, using default")
-
-                if image_data is not None:
-                    image_data, final_voxel_size, applied_scaling = apply_extract_scaling(
-                        image_data, final_voxel_size, scaling_factor
-                    )
-                    if applied_scaling > 1:
+                    if image_data is not None and image_data.ndim > 3:
+                        channel_axis = int(np.argmin(image_data.shape))
                         print(
-                            f"Average-pooled {scan_name} by {applied_scaling}; "
-                            f"voxel size {final_voxel_size}"
+                            f"4D+ volume (shape {image_data.shape}), "
+                            f"reducing to 3D via channel axis {channel_axis}"
                         )
-                else:
-                    applied_scaling = scaling_factor
+                        image_data = self._reduce_extra_dims_to_3d(image_data)
 
-                # Save as NIfTI using the final voxel size
-                if image_data is not None:
-                    nifti_file = os.path.join(scan_out_folder, scan_name)
-                    self.save_as_nifti(image_data, final_voxel_size, nifti_file)
-                    self.save_as_lossy_nifti(image_data, final_voxel_size, nifti_file)                    
-                            
-                print(scan_name+" saved")
-
-                # Update the JSON metadata
-                json_file = os.path.join(scan_out_folder, f"{scan_name}.json")
-                if os.path.exists(json_file):
-                    with open(json_file, 'r') as jf:
-                        json_metadata = json.load(jf)
-                else:
-                    json_metadata = {}
-
-                # Add scanner metadata if available
-                if scanner_metadata:
-                    json_metadata['scanner_metadata'] = scanner_metadata
-
-                def find_major_peaks(histogram, bin_edges, min_distance=10):
-                    # Find all peaks
-                    peaks, _ = signal.find_peaks(histogram, distance=min_distance)
+                    # 🔄 NEW: Check for anisotropic voxels and resample if needed
+                    if image_data is not None and voxel_sizes is not None:
+                        print(f"Processing {scan_name}: shape {image_data.shape}, voxel sizes {voxel_sizes}")
                     
-                    if len(peaks) == 0:
-                        return []
+                        # Check and resample if anisotropic
+                        image_data, final_voxel_size, was_resampled = self._check_and_resample_if_anisotropic(
+                            image_data, voxel_sizes, verbose=True
+                        )
                     
-                    # Sort peaks by their height (prominence)
-                    peak_heights = histogram[peaks]
-                    sorted_indices = np.argsort(peak_heights)[::-1]  # Sort in descending order
-                    sorted_peaks = peaks[sorted_indices]
-                    
-                    # Return the bin values (intensity levels) for the peaks
-                    peak_intensities = bin_edges[sorted_peaks]
-                    return peak_intensities
-
-                if is_binary:
-                    threshold = self.BINARY_UINT16_THRESHOLD
-                    print("Binary image — using fixed uint16 midpoint threshold: "+str(threshold))
-                    image_data = None
-                    gc.collect()
-                else:
-                    # Calculate histogram on a downsampled version if image is very large
-                    if image_data.size > 100000000:  # Arbitrary threshold, adjust as needed
-                        image_data = gaussian_filter(image_data, sigma=2.0)
-                        blurred_image_data = block_reduce(image_data, block_size=(4, 4, 4), func=np.mean)
+                        if was_resampled:
+                            print(f"✅ {scan_name} resampled from {voxel_sizes} to isotropic {final_voxel_size:.3f} mm")
+                        
+                            # Update scanner metadata to indicate resampling was performed
+                            if scanner_metadata is None:
+                                scanner_metadata = {}
+                            scanner_metadata['anisotropic_resampling'] = {
+                                'performed': True,
+                                'original_voxel_sizes': voxel_sizes,
+                                'final_isotropic_voxel_size': final_voxel_size,
+                                'resampling_method': 'deformation_based_interpolation'
+                            }
+                        else:
+                            if scanner_metadata is None:
+                                scanner_metadata = {}
+                            scanner_metadata['anisotropic_resampling'] = {
+                                'performed': False,
+                                'voxel_sizes': voxel_sizes,
+                                'reason': 'already_isotropic' if max(voxel_sizes) / min(voxel_sizes) <= 1.1 else 'resampling_failed'
+                            }
                     else:
-                        blurred_image_data = gaussian_filter(image_data, sigma=2.0)
+                        # Fallback for when we couldn't extract proper voxel sizes
+                        final_voxel_size = 1.0
+                        print(f"⚠️ Warning: Could not extract voxel sizes for {scan_name}, using default")
 
-                    # Free image data as we no longer need it
-                    image_data = None
-                    gc.collect()  # Encourage garbage collection
+                    if image_data is not None:
+                        image_data, final_voxel_size, applied_scaling = apply_extract_scaling(
+                            image_data, final_voxel_size, scaling_factor
+                        )
+                        if applied_scaling > 1:
+                            print(
+                                f"Average-pooled {scan_name} by {applied_scaling}; "
+                                f"voxel size {final_voxel_size}"
+                            )
+                    else:
+                        applied_scaling = scaling_factor
 
-                    threshold = self._compute_extraction_threshold(blurred_image_data, find_major_peaks)
+                    # Save as NIfTI using the final voxel size
+                    if image_data is not None:
+                        nifti_file = os.path.join(scan_out_folder, scan_name)
+                        self.save_as_nifti(image_data, final_voxel_size, nifti_file)
+                        self.save_as_lossy_nifti(image_data, final_voxel_size, nifti_file)                    
+                            
+                    print(scan_name+" saved")
 
-                # Update JSON metadata
-                json_metadata.update({
-                    'name': scan_name,
-                    'voxel_size': final_voxel_size,
-                    'original_voxel_sizes': voxel_sizes,
-                    'scaling_factor': applied_scaling,
-                    'threshold': threshold,
-                    'original_format': scan_subtype,
-                })
-                if extra_json_metadata:
-                    json_metadata.update(extra_json_metadata)
-                if intensity_value_mapping:
-                    raw_mapping = dict(intensity_value_mapping)
-                    raw_mapping['filename'] = f"{scan_name}_lossy.nii.gz"
-                    json_metadata['intensity_value_mapping'] = [raw_mapping]
-                elif 'intensity_value_mapping' in json_metadata:
-                    # Passthrough / individual stretch must not retain a stale factor pair
-                    del json_metadata['intensity_value_mapping']
+                    # Update the JSON metadata
+                    json_file = os.path.join(scan_out_folder, f"{scan_name}.json")
+                    if os.path.exists(json_file):
+                        with open(json_file, 'r') as jf:
+                            json_metadata = json.load(jf)
+                    else:
+                        json_metadata = {}
+
+                    # Add scanner metadata if available
+                    if scanner_metadata:
+                        json_metadata['scanner_metadata'] = scanner_metadata
+
+                    def find_major_peaks(histogram, bin_edges, min_distance=10):
+                        # Find all peaks
+                        peaks, _ = signal.find_peaks(histogram, distance=min_distance)
                     
-                with open(json_file, 'w') as jf:
-                    json.dump(json_metadata, jf, indent=4)
+                        if len(peaks) == 0:
+                            return []
+                    
+                        # Sort peaks by their height (prominence)
+                        peak_heights = histogram[peaks]
+                        sorted_indices = np.argsort(peak_heights)[::-1]  # Sort in descending order
+                        sorted_peaks = peaks[sorted_indices]
+                    
+                        # Return the bin values (intensity levels) for the peaks
+                        peak_intensities = bin_edges[sorted_peaks]
+                        return peak_intensities
 
-                # If a segmentation exists for this scan, load and save masks (full and lossy)
-                try:
-                    if scan_name in segmentation_map:
-                        seg_path = segmentation_map[scan_name]
-                        seg_mask = self._load_segmentation_mask(seg_path)
-                        if seg_mask is not None:
-                            self._save_segmentation_masks(scan_out_folder, scan_name, seg_mask)
-                            print(f"Segmentation processed for {scan_name}: {os.path.basename(seg_path)}")
-                except Exception as e:
-                    print(f"Warning: Could not process segmentation for {scan_name}: {e}")
+                    if is_binary:
+                        threshold = self.BINARY_UINT16_THRESHOLD
+                        print("Binary image — using fixed uint16 midpoint threshold: "+str(threshold))
+                        image_data = None
+                        gc.collect()
+                    else:
+                        # Calculate histogram on a downsampled version if image is very large
+                        if image_data.size > 100000000:  # Arbitrary threshold, adjust as needed
+                            image_data = gaussian_filter(image_data, sigma=2.0)
+                            blurred_image_data = block_reduce(image_data, block_size=(4, 4, 4), func=np.mean)
+                        else:
+                            blurred_image_data = gaussian_filter(image_data, sigma=2.0)
+
+                        # Free image data as we no longer need it
+                        image_data = None
+                        gc.collect()  # Encourage garbage collection
+
+                        threshold = self._compute_extraction_threshold(blurred_image_data, find_major_peaks)
+
+                    # Update JSON metadata
+                    json_metadata.update({
+                        'name': scan_name,
+                        'voxel_size': final_voxel_size,
+                        'original_voxel_sizes': voxel_sizes,
+                        'scaling_factor': applied_scaling,
+                        'threshold': threshold,
+                        'original_format': scan_subtype,
+                    })
+                    if extra_json_metadata:
+                        json_metadata.update(extra_json_metadata)
+                    if intensity_value_mapping:
+                        raw_mapping = dict(intensity_value_mapping)
+                        raw_mapping['filename'] = f"{scan_name}_lossy.nii.gz"
+                        json_metadata['intensity_value_mapping'] = [raw_mapping]
+                    elif 'intensity_value_mapping' in json_metadata:
+                        # Passthrough / individual stretch must not retain a stale factor pair
+                        del json_metadata['intensity_value_mapping']
+                    
+                    atomic_write_json(json_file, json_metadata, indent=4)
+
+                    # If a segmentation exists for this scan, load and save masks (full and lossy)
+                    try:
+                        if scan_name in segmentation_map:
+                            seg_path = segmentation_map[scan_name]
+                            seg_mask = self._load_segmentation_mask(seg_path)
+                            if seg_mask is not None:
+                                self._save_segmentation_masks(scan_out_folder, scan_name, seg_mask)
+                                print(f"Segmentation processed for {scan_name}: {os.path.basename(seg_path)}")
+                    except Exception as e:
+                        print(f"Warning: Could not process segmentation for {scan_name}: {e}")
 
             # Send progress update via WebSocket
             progress = 1
@@ -4308,6 +4038,10 @@ class ExtractScansView(APIView):
         return extracted_image, voxel_size  # Return both image and voxel size
     
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def save_as_nifti(self, image_data, voxel_size, nifti_file):
         """
         Saves image data as a NIfTI file.
@@ -4327,9 +4061,13 @@ class ExtractScansView(APIView):
             )
             image_data = self._reduce_extra_dims_to_3d(image_data)
         nifti_img = nib.Nifti1Image(image_data, affine)
-        nib.save(nifti_img, f"{nifti_file}.nii.gz")
+        atomic_nib_save(nifti_img, f"{nifti_file}.nii.gz")
 
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def save_as_lossy_nifti(self, image_data, voxel_size, nifti_file):
         """
         Extract-time lossy preview. Delegates to RegistrationTools.save_as_lossy_nifti
@@ -4352,8 +4090,7 @@ class ExtractScansView(APIView):
         # old replace semantics) instead of stacking duplicates on re-extract.
         json_metadata['lossy_compression'] = []
         json_metadata.setdefault('voxel_size', float(voxel_size))
-        with open(json_file, 'w') as jf:
-            json.dump(json_metadata, jf, indent=4)
+        atomic_write_json(json_file, json_metadata, indent=4)
 
         RegistrationTools().save_as_lossy_nifti(
             image_data,
@@ -5163,6 +4900,10 @@ def compute_union_mask_ncc(fixed_volume, moving_volume, reference_threshold, mov
 
 
 class ExtractJsonView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def post(self, request, *args, **kwargs):
         json_path = request.data.get('path')
 
@@ -5201,8 +4942,7 @@ class ExtractJsonView(APIView):
             ]
 
             if should_persist_metadata:
-                with open(json_path, 'w') as jf:
-                    json.dump(json_data, jf, indent=4)
+                atomic_write_json(json_path, json_data, indent=4)
 
             json_data['edits'] = sort_edit_filenames(edits)
             json_data['edits_masks'] = sort_edit_filenames(edits_masks)
@@ -5602,6 +5342,10 @@ class NiftiHeaderInfoView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _serve_full_resolution_compressed(self, directory, name, filename):
         """Load lossless version and apply compression without resolution shrinkage"""
 
@@ -5693,7 +5437,7 @@ class NiftiHeaderInfoView(APIView):
             with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as temp_file:
                 temp_path = temp_file.name
             
-            nib.save(full_res_nifti, temp_path)
+            atomic_nib_save(full_res_nifti, temp_path)
             
             # Clean up image data
             image_data_8bit = None
@@ -6166,6 +5910,10 @@ class MarchingCubesView(APIView):
         print(f"[backend timing] TOTAL _load_preserved_mesh_response: {time.perf_counter() - __backend_t0:.3f}s")
         return Response(response_payload)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def post(self, request, *args, **kwargs):
         __backend_post_t0 = time.perf_counter()
         # Get the files
@@ -6333,8 +6081,7 @@ class MarchingCubesView(APIView):
                 if 'filename' not in lossy_params[0]:
                     lossy_params[0]['filename'] = os.path.basename(nifti_file)
                     # save the updated metadata
-                    with open(json_path, 'w') as json_file:
-                        json.dump(json_metadata, json_file, indent=4)
+                    atomic_write_json(json_path, json_metadata, indent=4)
             # Get the lossy parameters for the current lossy file
             lossy_filename = os.path.basename(nifti_file)
             matching_lossy_params = [p for p in lossy_params if p['filename'] == lossy_filename]
@@ -6358,8 +6105,7 @@ class MarchingCubesView(APIView):
                 if 'filename' not in lossy_params[0]:
                     lossy_params[0]['filename'] = os.path.basename(nifti_file)
                     # save the updated metadata
-                    with open(json_path, 'w') as json_file:
-                        json.dump(json_metadata, json_file, indent=4)
+                    atomic_write_json(json_path, json_metadata, indent=4)
             # Get the lossy parameters for the current lossy file
             lossy_filename = os.path.basename(nifti_file)
             matching_lossy_params = [p for p in lossy_params if p['filename'] == lossy_filename]
@@ -6433,17 +6179,12 @@ class MarchingCubesView(APIView):
                     status=status.HTTP_404_NOT_FOUND
                 )
 
-            # Temporarily rename to standard extension for nibabel (same as single-label path)
-            os.replace(mask_path, mask_temp_path)
-            try:
-                mask_img = nib.load(mask_temp_path)
-                # Round before astype to avoid truncating floats
-                mask_volume = np.round(mask_img.get_fdata()).astype(np.uint8)
-                # Swap axes to match volume orientation
-                mask_volume = np.swapaxes(mask_volume, 0, 2)
-            finally:
-                if os.path.exists(mask_temp_path):
-                    os.replace(mask_temp_path, mask_path)
+            # Read in place (crash-safe rule 2): the file is never renamed to be read.
+            mask_img = load_nifti_readonly(mask_path)
+            # Round before astype to avoid truncating floats
+            mask_volume = np.round(mask_img.get_fdata()).astype(np.uint8)
+            # Swap axes to match volume orientation
+            mask_volume = np.swapaxes(mask_volume, 0, 2)
 
             labels = np.unique(mask_volume[mask_volume > 0])
             if len(labels) == 0:
@@ -6587,49 +6328,43 @@ class MarchingCubesView(APIView):
             
             if os.path.exists(mask_path):
                 try:
-                    # Temporarily rename to standard extension for nibabel
-                    os.replace(mask_path, mask_temp_path)
+                    # Read in place (crash-safe rule 2): the file is never renamed to be read.
+                    # Load and process the mask
+                    mask_img = load_nifti_readonly(mask_path)
+                    # Round before astype to avoid truncating floats
+                    mask_volume = np.round(mask_img.get_fdata()).astype(np.uint8)
+                    
+                    # Swap axes to match volume orientation
+                    mask_volume = np.swapaxes(mask_volume, 0, 2)
+                    
+                    # Convert mask_label to int
                     try:
-                        # Load and process the mask
-                        mask_img = nib.load(mask_temp_path)
-                        # Round before astype to avoid truncating floats
-                        mask_volume = np.round(mask_img.get_fdata()).astype(np.uint8)
+                        mask_label_int = int(mask_label)
+                    except (ValueError, TypeError):
+                        print(f"Warning: Could not convert mask_label '{mask_label}' to int. Falling back to threshold mode.")
+                        use_mask = False
+                        mask_label = "threshold"
+                    
+                    if use_mask:
+                        # Create binary mask where selected label = 1, rest = 0
+                        binary_mask = (mask_volume == mask_label_int).astype(np.float32)
+                        foreground_mask_for_center = (mask_volume == mask_label_int)
                         
-                        # Swap axes to match volume orientation
-                        mask_volume = np.swapaxes(mask_volume, 0, 2)
-                        
-                        # Convert mask_label to int
-                        try:
-                            mask_label_int = int(mask_label)
-                        except (ValueError, TypeError):
-                            print(f"Warning: Could not convert mask_label '{mask_label}' to int. Falling back to threshold mode.")
-                            use_mask = False
-                            mask_label = "threshold"
-                        
-                        if use_mask:
-                            # Create binary mask where selected label = 1, rest = 0
-                            binary_mask = (mask_volume == mask_label_int).astype(np.float32)
-                            foreground_mask_for_center = (mask_volume == mask_label_int)
-                            
-                            print(f"Using mask label {mask_label_int}: found {np.sum(binary_mask)} voxels")
+                        print(f"Using mask label {mask_label_int}: found {np.sum(binary_mask)} voxels")
 
-                            if use_label_mask:
-                                # Smooth the binary mask surface when a blur is requested, so the
-                                # slider behaves the same as in "All" mode (sigma 0 = crisp voxels).
-                                mask_surface = binary_mask
-                                if gaussian_blur:
-                                    mask_surface = gaussian_filter(binary_mask, sigma=gaussian_blur)
-                                # Apply marching cubes to the (optionally smoothed) binary mask
-                                vertices, faces, _, _ = measure.marching_cubes(mask_surface, level=0.5, spacing=(spacing_per_voxel, spacing_per_voxel, spacing_per_voxel))
-                            else:
-                                masked_volume = volume * binary_mask   
-                                if gaussian_blur is not None:
-                                    masked_volume = gaussian_filter(masked_volume, sigma=gaussian_blur)
-                                vertices, faces, _, _ = measure.marching_cubes(masked_volume, level=threshold, spacing=(spacing_per_voxel, spacing_per_voxel, spacing_per_voxel))
-                    finally:
-                        # Always restore the original filename
-                        if os.path.exists(mask_temp_path):
-                            os.replace(mask_temp_path, mask_path)
+                        if use_label_mask:
+                            # Smooth the binary mask surface when a blur is requested, so the
+                            # slider behaves the same as in "All" mode (sigma 0 = crisp voxels).
+                            mask_surface = binary_mask
+                            if gaussian_blur:
+                                mask_surface = gaussian_filter(binary_mask, sigma=gaussian_blur)
+                            # Apply marching cubes to the (optionally smoothed) binary mask
+                            vertices, faces, _, _ = measure.marching_cubes(mask_surface, level=0.5, spacing=(spacing_per_voxel, spacing_per_voxel, spacing_per_voxel))
+                        else:
+                            masked_volume = volume * binary_mask   
+                            if gaussian_blur is not None:
+                                masked_volume = gaussian_filter(masked_volume, sigma=gaussian_blur)
+                            vertices, faces, _, _ = measure.marching_cubes(masked_volume, level=threshold, spacing=(spacing_per_voxel, spacing_per_voxel, spacing_per_voxel))
                 except Exception as e:
                     print(f"Error loading mask: {e}. Falling back to threshold mode.")
                     use_mask = False
@@ -6720,11 +6455,11 @@ class MarchingCubesView(APIView):
         # Save vertices and faces as numpy objects to the subject's folder as npz files
         if persist_display_mesh:
             if is_population_atlas_subject:
-                np.savez(os.path.join(resolve_atlas_dir(directory), f"{filename}_vertices.npz"), vertices=vertices)
-                np.savez(os.path.join(resolve_atlas_dir(directory), f"{filename}_faces.npz"), faces=faces)
+                atomic_np_savez(os.path.join(resolve_atlas_dir(directory), f"{filename}_vertices.npz"), vertices=vertices)
+                atomic_np_savez(os.path.join(resolve_atlas_dir(directory), f"{filename}_faces.npz"), faces=faces)
             else:
-                np.savez(os.path.join(directory, "extracted", filename, f"{filename}_vertices.npz"), vertices=vertices)
-                np.savez(os.path.join(directory, "extracted", filename, f"{filename}_faces.npz"), faces=faces)
+                atomic_np_savez(os.path.join(directory, "extracted", filename, f"{filename}_vertices.npz"), vertices=vertices)
+                atomic_np_savez(os.path.join(directory, "extracted", filename, f"{filename}_faces.npz"), faces=faces)
         
         edit_vertices = vertices.copy()
 
@@ -6981,8 +6716,7 @@ class MarchingCubesView(APIView):
                             ref_lossy_params = [ref_lossy_params]
                             if 'filename' not in ref_lossy_params[0]:
                                 ref_lossy_params[0]['filename'] = f"{elastic_to}_lossy.nii.gz"
-                            with open(ref_json_path, 'w') as jf:
-                                json.dump(ref_metadata, jf, indent=4)
+                            atomic_write_json(ref_json_path, ref_metadata, indent=4)
 
                         ref_lossy_filename = os.path.basename(latest_edit_path)
                         if "_lossy" not in ref_lossy_filename:
@@ -7113,17 +6847,122 @@ def _list_voxel_elastic_artifact_paths(scan_dir, scan_name):
     return sorted(set(paths))
 
 
+# All-or-nothing elastic outputs: every file a subject's elastic registration produces
+# (warps, warped volume, masks, lossy volume, projections and the subject JSON) is first
+# written into this hidden folder inside the subject folder, under its final file name.
+# Only once all of them are saved are they moved into the subject folder, with the
+# subject JSON (which carries `elastic_to`, the completion marker) moved last.
+# If the server dies mid-subject, nothing outside this folder has changed, and
+# `glob('*')` skips dot-folders, so other tools never see half-written outputs.
+_ELASTIC_STAGING_DIRNAME = '.elastic_partial'
+
+# Projects with an elastic registration running in this server process. Their staging
+# folders are live and must not be scrubbed (e.g. when the UI reloads the project).
+# After a crash the process is gone, so the set is empty and scrubbing is safe.
+_ACTIVE_ELASTIC_RUN_DIRECTORIES = set()
+_ACTIVE_ELASTIC_RUN_LOCK = threading.Lock()
+
+
+def _elastic_run_key(directory):
+    return os.path.normcase(os.path.abspath(directory))
+
+
+def _elastic_staging_dir(scan_dir):
+    return os.path.join(scan_dir, _ELASTIC_STAGING_DIRNAME)
+
+
+def _remove_elastic_staging_dir(scan_dir):
+    """Delete an uncommitted staging folder; True when one was removed."""
+    staging_dir = _elastic_staging_dir(scan_dir)
+    if not os.path.isdir(staging_dir):
+        return False
+    try:
+        shutil.rmtree(staging_dir)
+        print(f"  removed uncommitted elastic outputs: {staging_dir}")
+        return True
+    except OSError as exc:
+        print(f"  warning: could not remove {staging_dir}: {exc}")
+        return False
+
+
+def _create_elastic_staging_dir(scan_dir):
+    """Fresh, empty staging folder for one subject's elastic outputs."""
+    _remove_elastic_staging_dir(scan_dir)
+    staging_dir = _elastic_staging_dir(scan_dir)
+    os.makedirs(staging_dir)
+    return staging_dir
+
+
+def _commit_elastic_staging_dir(scan_dir, json_basename):
+    """
+    Move every staged file into the subject folder, subject JSON last.
+
+    `os.replace` within one filesystem is atomic per file, so each output appears
+    complete; the JSON goes last so `elastic_to` is only committed once every
+    other output is in place.
+
+    CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): the moves run inside one
+    SubjectTransaction, so a crash halfway through them rolls the subject back to
+    its pre-elastic state instead of leaving some elastic outputs without the JSON
+    entry that describes them. A new elastic output only needs to be staged.
+    """
+    staging_dir = _elastic_staging_dir(scan_dir)
+    staged_names = sorted(os.listdir(staging_dir))
+    with SubjectTransaction(scan_dir, 'elastic_commit'):
+        for name in staged_names:
+            if name == json_basename:
+                continue
+            if name.endswith('_mask.nii.gz'):
+                # `.nii.mask.gz` conversion leftover from a failed mask save; no elastic
+                # output uses this suffix, so it is dropped rather than committed.
+                os.remove(os.path.join(staging_dir, name))
+                continue
+            os.replace(os.path.join(staging_dir, name), os.path.join(scan_dir, name))
+        if json_basename in staged_names:
+            os.replace(os.path.join(staging_dir, json_basename), os.path.join(scan_dir, json_basename))
+    os.rmdir(staging_dir)
+
+
+def scrub_elastic_staging_dirs(directory):
+    """
+    Remove staging folders left by an interrupted elastic run (project open / redo).
+
+    Skipped while this process is running elastic registration on the project.
+    Returns the number of subjects cleaned.
+    """
+    with _ACTIVE_ELASTIC_RUN_LOCK:
+        if _elastic_run_key(directory) in _ACTIVE_ELASTIC_RUN_DIRECTORIES:
+            return 0
+    removed = 0
+    for scan_name in list_extracted_scan_names(directory):
+        if _remove_elastic_staging_dir(os.path.join(directory, "extracted", scan_name)):
+            removed += 1
+    return removed
+
+
+def _remove_ants_temp_outputs(paths):
+    """Delete ANTs temp outputs once they are copied (antsWorker.remove_temp_outputs)."""
+    antsWorker.remove_temp_outputs(paths)
+
+
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def scrub_incomplete_voxel_elastic_registration(directory, scan_name):
     """
     Remove half-formed elastic outputs from interrupted runs so registration can redo.
 
     Complete = primary `*_edit_*_elastic.nii.gz` volume + committed `elastic_to`.
     Warp-only leftovers (`*_elastic_fwd/inv`) without the volume/metadata count as incomplete.
+    An uncommitted staging folder (see `_ELASTIC_STAGING_DIRNAME`) is always removed.
     """
+    scan_dir = os.path.join(directory, "extracted", scan_name)
+    _remove_elastic_staging_dir(scan_dir)
+
     if _has_complete_voxel_elastic_registration(directory, scan_name):
         return False
 
-    scan_dir = os.path.join(directory, "extracted", scan_name)
     if not os.path.isdir(scan_dir):
         return False
 
@@ -7165,8 +7004,7 @@ def scrub_incomplete_voxel_elastic_registration(directory, scan_name):
             if key in metadata:
                 metadata[key] = None
         try:
-            with open(json_path, 'w') as jf:
-                json.dump(metadata, jf, indent=4)
+            atomic_write_json(json_path, metadata, indent=4)
         except OSError as exc:
             print(f"  warning: could not clear elastic metadata for {scan_name}: {exc}")
 
@@ -8541,6 +8379,14 @@ class GetAllSubjectsMeshView(APIView):
 
 
 class OverwriteThresholdView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('overwrite_threshold', lambda request: request_subjects(request, 'filename'))
     def post(self, request, *args, **kwargs):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -8577,8 +8423,7 @@ class OverwriteThresholdView(APIView):
             # Historical / elastic edits persist into old_thresholds for that stem.
             upsert_old_threshold(json_metadata, edit_stem, threshold_int)
 
-        with open(json_path, 'w') as jf:
-            json.dump(json_metadata, jf, indent=4)
+        atomic_write_json(json_path, json_metadata, indent=4)
 
         return Response({
             'threshold': json_metadata.get('threshold'),
@@ -8642,6 +8487,10 @@ def get_landmark_indices_inside_crop(landmarks_list, voxel_size, z_min, z_max, y
     return kept_indices
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def copy_landmark_distances_for_kept_indices(source_path, destination_path, kept_indices):
     if not os.path.isfile(source_path):
         return False
@@ -8667,8 +8516,7 @@ def copy_landmark_distances_for_kept_indices(source_path, destination_path, kept
     else:
         filtered_distances = distances_data
 
-    with open(destination_path, 'w') as jf:
-        json.dump(filtered_distances, jf, indent=4)
+    atomic_write_json(destination_path, filtered_distances, indent=4)
     return True
 
 
@@ -9030,10 +8878,7 @@ class ApplyRotationView(APIView):
         
         # Get all scan directories (excluding faulty ones)
         faulty_files = []
-        for file in os.listdir(os.path.join(directory, "extracted")):
-            # Skip project_settings.json file
-            if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                continue
+        for file in list_extracted_scan_names(directory, log_prefix="ApplyRotation"):
             json_path = os.path.join(directory, "extracted", file, f"{file}.json")
             if os.path.exists(json_path):
                 with open(json_path, 'r') as jf:
@@ -9043,8 +8888,7 @@ class ApplyRotationView(APIView):
 
         main_threshold = main_metadata.get('threshold', 0)
         
-        scan_names = [d for d in os.listdir(os.path.join(directory, "extracted")) 
-                    if os.path.isdir(os.path.join(directory, "extracted", d)) and d not in faulty_files]
+        scan_names = [d for d in list_extracted_scan_names(directory) if d not in faulty_files]
 
         # remove main image from list
         if filename in scan_names:
@@ -9134,7 +8978,7 @@ class ApplyRotationView(APIView):
         print("Saving the rotated image (full resolution)")
         output_path = os.path.join(directory, "extracted", filename, f"{filename}_edit_{main_edit_number}_rotated.nii.gz")
         new_nifti = nib.Nifti1Image(rotated_data.astype(original_dtype), main_nifti.affine)
-        nib.save(new_nifti, output_path)
+        atomic_nib_save(new_nifti, output_path)
 
         # Update main metadata with rotation matrix info
         main_metadata['rotated_by_matrix'] = {
@@ -9142,8 +8986,7 @@ class ApplyRotationView(APIView):
             'edit_number': main_edit_number,
             'interpolation_method': interpolation
         }
-        with open(main_json_path, 'w') as jf:
-            json.dump(main_metadata, jf, indent=4)
+        atomic_write_json(main_json_path, main_metadata, indent=4)
         print(f"Updated metadata with rotation matrix info for {filename}")
 
         # Create the lossy version
@@ -9167,72 +9010,67 @@ class ApplyRotationView(APIView):
             if os.path.isfile(source_mask_path) and hasattr(self, '_rotation_embed'):
                 print(f"Found paired mask for main image: {source_mask_path}")
                 mask_src_temp = os.path.join(directory, "extracted", filename, f"{source_mask_edit_base}_mask.nii.gz")
-                os.replace(source_mask_path, mask_src_temp)
-                try:
-                    mask_img = nib.load(source_mask_path)
-                    mask_dtype = mask_img.get_data_dtype()
-                    # Round before astype to avoid truncating floats
-                    mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                # Read in place (crash-safe rule 2): the file is never renamed to be read.
+                mask_img = load_nifti_readonly(source_mask_path)
+                mask_dtype = mask_img.get_data_dtype()
+                # Round before astype to avoid truncating floats
+                mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
 
-                    # Build target box for mask using stored embedding
-                    target_shape = self._rotation_embed['target_shape']
-                    sxs, sys, szs = self._rotation_embed['source_slices']
-                    txs, tys, tzs = self._rotation_embed['target_slices']
+                # Build target box for mask using stored embedding
+                target_shape = self._rotation_embed['target_shape']
+                sxs, sys, szs = self._rotation_embed['source_slices']
+                txs, tys, tzs = self._rotation_embed['target_slices']
 
-                    mask_target_box = np.zeros(target_shape, dtype=mask_dtype)
-                    mask_target_box[txs, tys, tzs] = mask_data[sxs, sys, szs]
+                mask_target_box = np.zeros(target_shape, dtype=mask_dtype)
+                mask_target_box[txs, tys, tzs] = mask_data[sxs, sys, szs]
 
-                    # Rotate mask using nearest neighbor
-                    mask_rotated = np.zeros_like(mask_target_box, dtype=mask_dtype)
-                    ndimage.affine_transform(
-                        mask_target_box,
-                        rotation_matrix.T,
-                        offset=origin_offset,
-                        output=mask_rotated,
-                        output_shape=mask_target_box.shape,
-                        order=0,
-                        mode='constant',
-                        prefilter=False,
-                        cval=0
-                    )
+                # Rotate mask using nearest neighbor
+                mask_rotated = np.zeros_like(mask_target_box, dtype=mask_dtype)
+                ndimage.affine_transform(
+                    mask_target_box,
+                    rotation_matrix.T,
+                    offset=origin_offset,
+                    output=mask_rotated,
+                    output_shape=mask_target_box.shape,
+                    order=0,
+                    mode='constant',
+                    prefilter=False,
+                    cval=0
+                )
 
-                    # Save full-res rotated mask (no cropping, deferred to cropping tool)
-                    new_mask_edit_base = f"{filename}_edit_{main_edit_number}_rotated"
-                    mask_dest_path = os.path.join(directory, "extracted", filename, f"{new_mask_edit_base}.nii.mask.gz")
-                    mask_dest_temp = os.path.join(directory, "extracted", filename, f"{new_mask_edit_base}_mask.nii.gz")
-                    nib.save(nib.Nifti1Image(mask_rotated, main_nifti.affine), mask_dest_temp)
-                    os.replace(mask_dest_temp, mask_dest_path)
-                    print(f"Saved rotated mask: {mask_dest_path}")
+                # Save full-res rotated mask (no cropping, deferred to cropping tool)
+                new_mask_edit_base = f"{filename}_edit_{main_edit_number}_rotated"
+                mask_dest_path = os.path.join(directory, "extracted", filename, f"{new_mask_edit_base}.nii.mask.gz")
+                mask_dest_temp = os.path.join(directory, "extracted", filename, f"{new_mask_edit_base}_mask.nii.gz")
+                atomic_nib_save(nib.Nifti1Image(mask_rotated, main_nifti.affine), mask_dest_path)
+                print(f"Saved rotated mask: {mask_dest_path}")
 
-                    # Create lossy mask by downsampling with same resolution factor
-                    resolution_factor = 2
-                    lc = main_metadata.get('lossy_compression', None)
-                    if isinstance(lc, list) and len(lc) > 0:
-                        try:
-                            resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
-                        except Exception:
-                            pass
-                    elif isinstance(lc, dict) and lc:
-                        try:
-                            resolution_factor = int(lc.get('resolution_factor', resolution_factor))
-                        except Exception:
-                            pass
+                # Create lossy mask by downsampling with same resolution factor
+                resolution_factor = 2
+                lc = main_metadata.get('lossy_compression', None)
+                if isinstance(lc, list) and len(lc) > 0:
+                    try:
+                        resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
+                    except Exception:
+                        pass
+                elif isinstance(lc, dict) and lc:
+                    try:
+                        resolution_factor = int(lc.get('resolution_factor', resolution_factor))
+                    except Exception:
+                        pass
 
-                    # load the lossy destination nifti image to get the affine
-                    lossy_nifti_img = nib.load(lossy_output_path)
-                    lossy_affine = lossy_nifti_img.affine
+                # load the lossy destination nifti image to get the affine
+                lossy_nifti_img = nib.load(lossy_output_path)
+                lossy_affine = lossy_nifti_img.affine
 
-                    slices = [slice(None, None, resolution_factor) for _ in range(3)]
-                    lossy_mask = mask_rotated[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
+                slices = [slice(None, None, resolution_factor) for _ in range(3)]
+                lossy_mask = mask_rotated[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
 
-                    lossy_mask_edit_base = f"{filename}_lossy_edit_{main_edit_number}_rotated"
-                    lossy_mask_dest_path = os.path.join(directory, "extracted", filename, f"{lossy_mask_edit_base}.nii.mask.gz")
-                    lossy_mask_temp = os.path.join(directory, "extracted", filename, f"{lossy_mask_edit_base}_mask.nii.gz")
-                    nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_mask_temp)
-                    os.replace(lossy_mask_temp, lossy_mask_dest_path)
-                    print(f"Saved lossy rotated mask: {lossy_mask_dest_path}")
-                finally:
-                    os.replace(mask_src_temp, source_mask_path)
+                lossy_mask_edit_base = f"{filename}_lossy_edit_{main_edit_number}_rotated"
+                lossy_mask_dest_path = os.path.join(directory, "extracted", filename, f"{lossy_mask_edit_base}.nii.mask.gz")
+                lossy_mask_temp = os.path.join(directory, "extracted", filename, f"{lossy_mask_edit_base}_mask.nii.gz")
+                atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_mask_dest_path)
+                print(f"Saved lossy rotated mask: {lossy_mask_dest_path}")
         except Exception as me:
             print(f"Error handling mask for main image: {me}")
 
@@ -9263,15 +9101,14 @@ class ApplyRotationView(APIView):
                 if transformed_landmarks:
                     new_landmark_base = f"{filename}_edit_{main_edit_number}_rotated"
                     dest_landmarks_path = os.path.join(directory, "extracted", filename, f"{new_landmark_base}_landmarks.json")
-                    with open(dest_landmarks_path, 'w') as jf:
-                        json.dump(transformed_landmarks, jf, indent=4)
+                    atomic_write_json(dest_landmarks_path, transformed_landmarks, indent=4)
                     print(f"Saved rotated landmarks: {dest_landmarks_path}")
 
             source_landmark_distances_path = os.path.join(directory, "extracted", filename, f"{source_landmark_base}_landmark_distances.json")
             if os.path.isfile(source_landmark_distances_path):
                 new_landmark_base = f"{filename}_edit_{main_edit_number}_rotated"
                 dest_landmark_distances_path = os.path.join(directory, "extracted", filename, f"{new_landmark_base}_landmark_distances.json")
-                shutil.copy(source_landmark_distances_path, dest_landmark_distances_path)
+                atomic_copy(source_landmark_distances_path, dest_landmark_distances_path)
                 print(f"Copied landmark distances: {dest_landmark_distances_path}")
 
         except Exception as le:
@@ -9309,133 +9146,135 @@ class ApplyRotationView(APIView):
         # === PROCESS REMAINING SCANS ONE BY ONE ===
         for idx, scan in enumerate(scan_names):
             # Increment processed counter
-            processed_count += 1
+            # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+            # subject is one transaction. A crash or an exception rolls back only this subject;
+            # the subjects already finished stay done. New derivative files go inside this
+            # block, written with the atomic_* helpers.
+            with subject_transaction(directory, scan, 'apply_rotation_all'):
+                processed_count += 1
             
-            print(f"\n--- Processing scan {idx+1}/{len(scan_names)}: {scan} ---")
+                print(f"\n--- Processing scan {idx+1}/{len(scan_names)}: {scan} ---")
 
-            # Send progress update via WebSocket
-            progress = min(float(processed_count) / float(total_items), 1.0)
-            print(f"Progress: {progress:.1%}")
-            try:
-                if channel_layer is not None:
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan,
-                            'total': total_items,
-                            'custom_message': f'Rotating {scan}...',
-                            'current': processed_count,
-                        }
-                    )
-            except Exception as e:
-                print(f"Warning: unable to send progress websocket message: {e}")
+                # Send progress update via WebSocket
+                progress = min(float(processed_count) / float(total_items), 1.0)
+                print(f"Progress: {progress:.1%}")
+                try:
+                    if channel_layer is not None:
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan,
+                                'total': total_items,
+                                'custom_message': f'Rotating {scan}...',
+                                'current': processed_count,
+                            }
+                        )
+                except Exception as e:
+                    print(f"Warning: unable to send progress websocket message: {e}")
 
-            # Load scan
-            json_path = os.path.join(directory, "extracted", scan, f"{scan}.json")
-            with open(json_path, 'r') as jf:
-                scan_metadata = json.load(jf)
+                # Load scan
+                json_path = os.path.join(directory, "extracted", scan, f"{scan}.json")
+                with open(json_path, 'r') as jf:
+                    scan_metadata = json.load(jf)
 
-            # Find the latest scan file (could be from a previous edit)
-            edit_number = 0
-            while glob.glob(os.path.join(directory, "extracted", scan, f"{scan}_edit_{edit_number}_*.nii.gz")):
-                edit_number += 1
+                # Find the latest scan file (could be from a previous edit)
+                edit_number = 0
+                while glob.glob(os.path.join(directory, "extracted", scan, f"{scan}_edit_{edit_number}_*.nii.gz")):
+                    edit_number += 1
 
-            if edit_number == 0:
-                image_path = os.path.join(directory, "extracted", scan, f"{scan}.nii.gz")
-            else:
-                image_path = glob.glob(os.path.join(directory, "extracted", scan, f"{scan}_edit_{edit_number-1}_*.nii.gz"))[0]
+                if edit_number == 0:
+                    image_path = os.path.join(directory, "extracted", scan, f"{scan}.nii.gz")
+                else:
+                    image_path = glob.glob(os.path.join(directory, "extracted", scan, f"{scan}_edit_{edit_number-1}_*.nii.gz"))[0]
 
             
-            # If the latest edit is a rotated edit, skip this scan
-            if edit_number > 0:
-                latest_edit_path = glob.glob(os.path.join(directory, "extracted", scan, f"{scan}_edit_{edit_number-1}_*.nii.gz"))[0]
-                if latest_edit_path.endswith("_rotated.nii.gz"):
-                    print(f"Skipping {scan} because it is already rotated")
+                # If the latest edit is a rotated edit, skip this scan
+                if edit_number > 0:
+                    latest_edit_path = glob.glob(os.path.join(directory, "extracted", scan, f"{scan}_edit_{edit_number-1}_*.nii.gz"))[0]
+                    if latest_edit_path.endswith("_rotated.nii.gz"):
+                        print(f"Skipping {scan} because it is already rotated")
+                        continue
+
+                print(f"Loading from: {image_path}")
+                scan_nifti = nib.load(image_path)
+                original_dtype = scan_nifti.get_data_dtype()
+                scan_shape = scan_nifti.header.get_data_shape()
+            
+                # Verify shape matches reference
+                if scan_shape != reference_shape:
+                    print(f"Scan {scan} has different shape {scan_shape} than reference {reference_shape}, skipping")
                     continue
-
-            print(f"Loading from: {image_path}")
-            scan_nifti = nib.load(image_path)
-            original_dtype = scan_nifti.get_data_dtype()
-            scan_shape = scan_nifti.header.get_data_shape()
             
-            # Verify shape matches reference
-            if scan_shape != reference_shape:
-                print(f"Scan {scan} has different shape {scan_shape} than reference {reference_shape}, skipping")
-                continue
-            
-            scan_nifti_data = scan_nifti.get_fdata().astype(original_dtype)
-            voxel_size = scan_metadata.get('voxel_size', 1.0)
+                scan_nifti_data = scan_nifti.get_fdata().astype(original_dtype)
+                voxel_size = scan_metadata.get('voxel_size', 1.0)
 
-            background_value = self.registration_tools.get_background_value(scan_nifti_data, mode="border")
+                background_value = self.registration_tools.get_background_value(scan_nifti_data, mode="border")
 
-            # Build target box for this scan
-            target_box_loop = np.full(target_box.shape, background_value, dtype=original_dtype)
-            sxs, sys, szs = self._rotation_embed['source_slices']
-            txs, tys, tzs = self._rotation_embed['target_slices']
-            target_box_loop[txs, tys, tzs] = scan_nifti_data[sxs, sys, szs]
+                # Build target box for this scan
+                target_box_loop = np.full(target_box.shape, background_value, dtype=original_dtype)
+                sxs, sys, szs = self._rotation_embed['source_slices']
+                txs, tys, tzs = self._rotation_embed['target_slices']
+                target_box_loop[txs, tys, tzs] = scan_nifti_data[sxs, sys, szs]
 
-            # Create output volume
-            rotated_data = np.full(target_box_loop.shape, background_value, dtype=original_dtype)
+                # Create output volume
+                rotated_data = np.full(target_box_loop.shape, background_value, dtype=original_dtype)
 
-            # Apply rotation
-            ndimage.affine_transform(
-                target_box_loop,
-                rotation_matrix.T,
-                offset=origin_offset,
-                output=rotated_data,
-                output_shape=rotated_data.shape,
-                order=interpolation_order,
-                mode='constant',
-                prefilter=False,
-                cval=background_value
-            )
+                # Apply rotation
+                ndimage.affine_transform(
+                    target_box_loop,
+                    rotation_matrix.T,
+                    offset=origin_offset,
+                    output=rotated_data,
+                    output_shape=rotated_data.shape,
+                    order=interpolation_order,
+                    mode='constant',
+                    prefilter=False,
+                    cval=background_value
+                )
 
-            # Find next edit number for this scan
-            scan_edit_number = 0
-            while glob.glob(os.path.join(directory, "extracted", scan, f"{scan}_edit_{scan_edit_number}_*.nii.gz")):
-                scan_edit_number += 1
+                # Find next edit number for this scan
+                scan_edit_number = 0
+                while glob.glob(os.path.join(directory, "extracted", scan, f"{scan}_edit_{scan_edit_number}_*.nii.gz")):
+                    scan_edit_number += 1
 
-            # Save the rotated image (full resolution, NO cropping)
-            print(f"Saving rotated image for {scan}")
-            output_path = os.path.join(directory, "extracted", scan, f"{scan}_edit_{scan_edit_number}_rotated.nii.gz")
-            new_nifti = nib.Nifti1Image(rotated_data.astype(original_dtype), scan_nifti.affine)
-            nib.save(new_nifti, output_path)
+                # Save the rotated image (full resolution, NO cropping)
+                print(f"Saving rotated image for {scan}")
+                output_path = os.path.join(directory, "extracted", scan, f"{scan}_edit_{scan_edit_number}_rotated.nii.gz")
+                new_nifti = nib.Nifti1Image(rotated_data.astype(original_dtype), scan_nifti.affine)
+                atomic_nib_save(new_nifti, output_path)
 
-            # Update scan metadata with rotation matrix info
-            scan_metadata['rotated_by_matrix'] = {
-                'rotation_matrix': rotation_matrix.tolist(),
-                'edit_number': scan_edit_number,
-                'interpolation_method': interpolation
-            }
-            with open(json_path, 'w') as jf:
-                json.dump(scan_metadata, jf, indent=4)
-            print(f"Updated metadata with rotation matrix info for {scan}")
+                # Update scan metadata with rotation matrix info
+                scan_metadata['rotated_by_matrix'] = {
+                    'rotation_matrix': rotation_matrix.tolist(),
+                    'edit_number': scan_edit_number,
+                    'interpolation_method': interpolation
+                }
+                atomic_write_json(json_path, scan_metadata, indent=4)
+                print(f"Updated metadata with rotation matrix info for {scan}")
 
-            # Create the lossy version
-            print(f"Creating lossy version for {scan}")
-            lossy_output_path = os.path.join(directory, "extracted", scan, f"{scan}_lossy_edit_{scan_edit_number}_rotated.nii.gz")
-            self.registration_tools.save_as_lossy_nifti(
-                rotated_data.astype(original_dtype), 
-                voxel_size, 
-                json_path, 
-                lossy_output_path
-            )
+                # Create the lossy version
+                print(f"Creating lossy version for {scan}")
+                lossy_output_path = os.path.join(directory, "extracted", scan, f"{scan}_lossy_edit_{scan_edit_number}_rotated.nii.gz")
+                self.registration_tools.save_as_lossy_nifti(
+                    rotated_data.astype(original_dtype), 
+                    voxel_size, 
+                    json_path, 
+                    lossy_output_path
+                )
 
             
 
-            # === Handle paired masks for this scan ===
-            try:
-                source_mask_edit_base = f"{scan}_edit_{edit_number-1}_*" if edit_number > 0 else scan
-                source_mask_path = glob.glob(os.path.join(directory, "extracted", scan, f"{source_mask_edit_base}.nii.mask.gz"))[0] if glob.glob(os.path.join(directory, "extracted", scan, f"{source_mask_edit_base}.nii.mask.gz")) else None
+                # === Handle paired masks for this scan ===
+                try:
+                    source_mask_edit_base = f"{scan}_edit_{edit_number-1}_*" if edit_number > 0 else scan
+                    source_mask_path = glob.glob(os.path.join(directory, "extracted", scan, f"{source_mask_edit_base}.nii.mask.gz"))[0] if glob.glob(os.path.join(directory, "extracted", scan, f"{source_mask_edit_base}.nii.mask.gz")) else None
 
-                if source_mask_path and os.path.isfile(source_mask_path):
-                    print(f"Found paired mask for {scan}: {source_mask_path}")
-                    mask_src_temp = os.path.join(directory, "extracted", scan, f"{source_mask_edit_base}_mask.nii.gz")
-                    os.replace(source_mask_path, mask_src_temp)
-                    try:
-                        mask_img = nib.load(mask_src_temp)
+                    if source_mask_path and os.path.isfile(source_mask_path):
+                        print(f"Found paired mask for {scan}: {source_mask_path}")
+                        mask_src_temp = os.path.join(directory, "extracted", scan, f"{source_mask_edit_base}_mask.nii.gz")
+                        mask_img = load_nifti_readonly(source_mask_path)
                         mask_dtype = mask_img.get_data_dtype()
                         # Round before astype to avoid truncating floats
                         mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
@@ -9466,8 +9305,7 @@ class ApplyRotationView(APIView):
                         new_mask_edit_base = f"{scan}_edit_{scan_edit_number}_rotated"
                         mask_dest_path = os.path.join(directory, "extracted", scan, f"{new_mask_edit_base}.nii.mask.gz")
                         mask_dest_temp = os.path.join(directory, "extracted", scan, f"{new_mask_edit_base}_mask.nii.gz")
-                        nib.save(nib.Nifti1Image(mask_rotated, scan_nifti.affine), mask_dest_temp)
-                        os.replace(mask_dest_temp, mask_dest_path)
+                        atomic_nib_save(nib.Nifti1Image(mask_rotated, scan_nifti.affine), mask_dest_path)
                         print(f"Saved rotated mask: {mask_dest_path}")
 
                         # Create lossy mask
@@ -9493,68 +9331,64 @@ class ApplyRotationView(APIView):
                         lossy_mask_edit_base = f"{scan}_lossy_edit_{scan_edit_number}_rotated"
                         lossy_mask_dest_path = os.path.join(directory, "extracted", scan, f"{lossy_mask_edit_base}.nii.mask.gz")
                         lossy_mask_temp = os.path.join(directory, "extracted", scan, f"{lossy_mask_edit_base}_mask.nii.gz")
-                        nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_mask_temp)
-                        os.replace(lossy_mask_temp, lossy_mask_dest_path)
+                        atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_mask_dest_path)
                         print(f"Saved lossy rotated mask: {lossy_mask_dest_path}")
-                    finally:
-                        os.replace(mask_src_temp, source_mask_path)
-            except Exception as me:
-                print(f"Error handling mask for {scan}: {me}")
+                except Exception as me:
+                    print(f"Error handling mask for {scan}: {me}")
 
-            # === Handle landmarks for this scan ===
-            try:
-                source_landmark_base = f"{scan}_edit_{edit_number-1}_*" if edit_number > 0 else scan
-                source_landmarks_files = glob.glob(os.path.join(directory, "extracted", scan, f"{source_landmark_base}_landmarks.json"))
-                source_landmarks_path = source_landmarks_files[0] if source_landmarks_files else None
+                # === Handle landmarks for this scan ===
+                try:
+                    source_landmark_base = f"{scan}_edit_{edit_number-1}_*" if edit_number > 0 else scan
+                    source_landmarks_files = glob.glob(os.path.join(directory, "extracted", scan, f"{source_landmark_base}_landmarks.json"))
+                    source_landmarks_path = source_landmarks_files[0] if source_landmarks_files else None
 
-                if source_landmarks_path and os.path.isfile(source_landmarks_path):
-                    print(f"Found landmarks for {scan}: {source_landmarks_path}")
-                    with open(source_landmarks_path, 'r') as jf:
-                        landmarks_dict = json.load(jf)
+                    if source_landmarks_path and os.path.isfile(source_landmarks_path):
+                        print(f"Found landmarks for {scan}: {source_landmarks_path}")
+                        with open(source_landmarks_path, 'r') as jf:
+                            landmarks_dict = json.load(jf)
 
-                    embedding_offset = rotation_center_voxel - center_box
+                        embedding_offset = rotation_center_voxel - center_box
                     
-                    # Transform landmarks (NO cropping, deferred to cropping tool)
-                    transformed_landmarks = self.registration_tools.transform_landmarks_by_rotation(
-                        landmarks_dict,
-                        voxel_size,
-                        rotation_matrix,
-                        center_box,
-                        origin_offset,
-                        final_bbox_min=np.array([0, 0, 0]),
-                        final_bbox_max=np.array(rotated_data.shape),
-                        embedding_offset=embedding_offset
-                    )
+                        # Transform landmarks (NO cropping, deferred to cropping tool)
+                        transformed_landmarks = self.registration_tools.transform_landmarks_by_rotation(
+                            landmarks_dict,
+                            voxel_size,
+                            rotation_matrix,
+                            center_box,
+                            origin_offset,
+                            final_bbox_min=np.array([0, 0, 0]),
+                            final_bbox_max=np.array(rotated_data.shape),
+                            embedding_offset=embedding_offset
+                        )
                     
-                    if transformed_landmarks:
+                        if transformed_landmarks:
+                            new_landmark_base = f"{scan}_edit_{scan_edit_number}_rotated"
+                            dest_landmarks_path = os.path.join(directory, "extracted", scan, f"{new_landmark_base}_landmarks.json")
+                            atomic_write_json(dest_landmarks_path, transformed_landmarks, indent=4)
+                            print(f"Saved rotated landmarks: {dest_landmarks_path}")
+
+                    source_landmark_distances_files = glob.glob(os.path.join(directory, "extracted", scan, f"{source_landmark_base}_landmark_distances.json"))
+                    source_landmark_distances_path = source_landmark_distances_files[0] if source_landmark_distances_files else None
+
+                    if source_landmark_distances_path and os.path.isfile(source_landmark_distances_path):
                         new_landmark_base = f"{scan}_edit_{scan_edit_number}_rotated"
-                        dest_landmarks_path = os.path.join(directory, "extracted", scan, f"{new_landmark_base}_landmarks.json")
-                        with open(dest_landmarks_path, 'w') as jf:
-                            json.dump(transformed_landmarks, jf, indent=4)
-                        print(f"Saved rotated landmarks: {dest_landmarks_path}")
+                        dest_landmark_distances_path = os.path.join(directory, "extracted", scan, f"{new_landmark_base}_landmark_distances.json")
+                        atomic_copy(source_landmark_distances_path, dest_landmark_distances_path)
+                        print(f"Copied landmark distances: {dest_landmark_distances_path}")
 
-                source_landmark_distances_files = glob.glob(os.path.join(directory, "extracted", scan, f"{source_landmark_base}_landmark_distances.json"))
-                source_landmark_distances_path = source_landmark_distances_files[0] if source_landmark_distances_files else None
+                except Exception as le:
+                    print(f"Error handling landmarks for {scan}: {le}")
 
-                if source_landmark_distances_path and os.path.isfile(source_landmark_distances_path):
-                    new_landmark_base = f"{scan}_edit_{scan_edit_number}_rotated"
-                    dest_landmark_distances_path = os.path.join(directory, "extracted", scan, f"{new_landmark_base}_landmark_distances.json")
-                    shutil.copy(source_landmark_distances_path, dest_landmark_distances_path)
-                    print(f"Copied landmark distances: {dest_landmark_distances_path}")
-
-            except Exception as le:
-                print(f"Error handling landmarks for {scan}: {le}")
-
-            # CLEAR MEMORY AFTER EACH SCAN
-            scan_nifti_data = None
-            scan_nifti = None
-            new_nifti = None
-            mask_img = None
-            mask_data = None
-            mask_rotated = None           
-            rotated_data = None
-            cleanup_memory()
-            print(f"Completed and cleared memory for {scan}")
+                # CLEAR MEMORY AFTER EACH SCAN
+                scan_nifti_data = None
+                scan_nifti = None
+                new_nifti = None
+                mask_img = None
+                mask_data = None
+                mask_rotated = None           
+                rotated_data = None
+                cleanup_memory()
+                print(f"Completed and cleared memory for {scan}")
 
         # Final progress message
         try:
@@ -9577,6 +9411,14 @@ class ApplyRotationView(APIView):
         print("All scans have been rotated with the same rotation matrix.")
         print("Next: Use the cropping tool to crop all scans to final bounding box if needed.") 
         
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_rotation', lambda request: [] if request.data.get('all') else request_subjects(request, 'filename'))
     def post(self, request, *args, **kwargs):
         rotation_data = request.data.get('rotation')
         m = rotation_data['_m']
@@ -9850,7 +9692,7 @@ class ApplyRotationView(APIView):
         print("Saving the rotated image (full resolution)")
         output_path = os.path.join(directory, "extracted", filename, f"{filename}_edit_{edit_number}_rotated.nii.gz")
         new_nifti = nib.Nifti1Image(rotated_data.astype(original_dtype), nifti_img.affine)
-        nib.save(new_nifti, output_path)
+        atomic_nib_save(new_nifti, output_path)
 
         # Create the lossy version using the RegistrationTools method        
         print("Creating the lossy version method")
@@ -9879,79 +9721,73 @@ class ApplyRotationView(APIView):
             if os.path.isfile(mask_src_path) and hasattr(self, '_rotation_embed'):
                 print(f"Found paired mask for rotation: {mask_src_path}")
                 mask_src_temp = os.path.join(directory, "extracted", filename, f"{source_mask_edit_base}_mask.nii.gz")
-                os.replace(mask_src_path, mask_src_temp)
-                try:
-                    mask_img = nib.load(mask_src_temp)
-                    mask_dtype = mask_img.get_data_dtype()
-                    # Round before astype to avoid truncating floats
-                    mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                mask_img = load_nifti_readonly(mask_src_path)
+                mask_dtype = mask_img.get_data_dtype()
+                # Round before astype to avoid truncating floats
+                mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
 
-                    # Build target box for mask using stored embedding
-                    target_shape = self._rotation_embed['target_shape']
-                    sxs, sys, szs = self._rotation_embed['source_slices']
-                    txs, tys, tzs = self._rotation_embed['target_slices']
+                # Build target box for mask using stored embedding
+                target_shape = self._rotation_embed['target_shape']
+                sxs, sys, szs = self._rotation_embed['source_slices']
+                txs, tys, tzs = self._rotation_embed['target_slices']
 
-                    mask_target_box = np.zeros(target_shape, dtype=mask_dtype)
-                    mask_target_box[txs, tys, tzs] = mask_data[sxs, sys, szs]
+                mask_target_box = np.zeros(target_shape, dtype=mask_dtype)
+                mask_target_box[txs, tys, tzs] = mask_data[sxs, sys, szs]
 
-                    # Rotate mask using nearest neighbor
-                    mask_rotated = np.zeros_like(mask_target_box, dtype=mask_dtype)
-                    ndimage.affine_transform(
-                        mask_target_box,
-                        rotation_matrix.T,
-                        offset=origin_offset,
-                        output=mask_rotated,
-                        output_shape=mask_target_box.shape,
-                        order=0,             # nearest neighbor for binary mask
-                        mode='constant',
-                        prefilter=False,
-                        cval=0
-                    )
+                # Rotate mask using nearest neighbor
+                mask_rotated = np.zeros_like(mask_target_box, dtype=mask_dtype)
+                ndimage.affine_transform(
+                    mask_target_box,
+                    rotation_matrix.T,
+                    offset=origin_offset,
+                    output=mask_rotated,
+                    output_shape=mask_target_box.shape,
+                    order=0,             # nearest neighbor for binary mask
+                    mode='constant',
+                    prefilter=False,
+                    cval=0
+                )
 
-                    # Crop mask with the same final bbox as image
-                    mask_cropped = mask_rotated[
-                        final_bbox_min[0]:final_bbox_max[0],
-                        final_bbox_min[1]:final_bbox_max[1],
-                        final_bbox_min[2]:final_bbox_max[2]
-                    ].astype(mask_dtype, copy=False)
+                # Crop mask with the same final bbox as image
+                mask_cropped = mask_rotated[
+                    final_bbox_min[0]:final_bbox_max[0],
+                    final_bbox_min[1]:final_bbox_max[1],
+                    final_bbox_min[2]:final_bbox_max[2]
+                ].astype(mask_dtype, copy=False)
 
-                    # Save full-res rotated mask via temp rename
-                    new_mask_edit_base = f"{filename}_edit_{edit_number}_rotated"
-                    mask_dest_path = os.path.join(directory, "extracted", filename, f"{new_mask_edit_base}.nii.mask.gz")
-                    mask_dest_temp = os.path.join(directory, "extracted", filename, f"{new_mask_edit_base}_mask.nii.gz")
-                    nib.save(nib.Nifti1Image(mask_cropped, nifti_img.affine), mask_dest_temp)
-                    os.replace(mask_dest_temp, mask_dest_path)
-                    print(f"Saved rotated mask: {mask_dest_path}")
+                # Save full-res rotated mask via temp rename
+                new_mask_edit_base = f"{filename}_edit_{edit_number}_rotated"
+                mask_dest_path = os.path.join(directory, "extracted", filename, f"{new_mask_edit_base}.nii.mask.gz")
+                mask_dest_temp = os.path.join(directory, "extracted", filename, f"{new_mask_edit_base}_mask.nii.gz")
+                atomic_nib_save(nib.Nifti1Image(mask_cropped, nifti_img.affine), mask_dest_path)
+                print(f"Saved rotated mask: {mask_dest_path}")
 
-                    # Create lossy mask by downsampling with same resolution factor
-                    resolution_factor = 2
-                    lc = json_metadata.get('lossy_compression', None)
-                    if isinstance(lc, list) and len(lc) > 0:
-                        try:
-                            resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
-                        except Exception:
-                            pass
-                    elif isinstance(lc, dict) and lc:
-                        try:
-                            resolution_factor = int(lc.get('resolution_factor', resolution_factor))
-                        except Exception:
-                            pass
+                # Create lossy mask by downsampling with same resolution factor
+                resolution_factor = 2
+                lc = json_metadata.get('lossy_compression', None)
+                if isinstance(lc, list) and len(lc) > 0:
+                    try:
+                        resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
+                    except Exception:
+                        pass
+                elif isinstance(lc, dict) and lc:
+                    try:
+                        resolution_factor = int(lc.get('resolution_factor', resolution_factor))
+                    except Exception:
+                        pass
 
-                    # load the lossy destination nifti image to get the affine
-                    lossy_nifti_img = nib.load(lossy_output_path)
-                    lossy_affine = lossy_nifti_img.affine
+                # load the lossy destination nifti image to get the affine
+                lossy_nifti_img = nib.load(lossy_output_path)
+                lossy_affine = lossy_nifti_img.affine
 
-                    slices = [slice(None, None, resolution_factor) for _ in range(3)]
-                    lossy_mask = mask_cropped[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
+                slices = [slice(None, None, resolution_factor) for _ in range(3)]
+                lossy_mask = mask_cropped[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
 
-                    lossy_mask_edit_base = f"{filename}_lossy_edit_{edit_number}_rotated"
-                    lossy_mask_dest_path = os.path.join(directory, "extracted", filename, f"{lossy_mask_edit_base}.nii.mask.gz")
-                    lossy_mask_temp = os.path.join(directory, "extracted", filename, f"{lossy_mask_edit_base}_mask.nii.gz")
-                    nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_mask_temp)
-                    os.replace(lossy_mask_temp, lossy_mask_dest_path)
-                    print(f"Saved lossy rotated mask: {lossy_mask_dest_path}")
-                finally:
-                    os.replace(mask_src_temp, mask_src_path)
+                lossy_mask_edit_base = f"{filename}_lossy_edit_{edit_number}_rotated"
+                lossy_mask_dest_path = os.path.join(directory, "extracted", filename, f"{lossy_mask_edit_base}.nii.mask.gz")
+                lossy_mask_temp = os.path.join(directory, "extracted", filename, f"{lossy_mask_edit_base}_mask.nii.gz")
+                atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_mask_dest_path)
+                print(f"Saved lossy rotated mask: {lossy_mask_dest_path}")
             else:
                 print("No paired mask found for rotation; skipping mask propagation.")
         except Exception as me:
@@ -9992,8 +9828,7 @@ class ApplyRotationView(APIView):
                 if transformed_landmarks:
                     new_landmark_base = f"{filename}_edit_{edit_number}_rotated"
                     dest_landmarks_path = os.path.join(directory, "extracted", filename, f"{new_landmark_base}_landmarks.json")
-                    with open(dest_landmarks_path, 'w') as jf:
-                        json.dump(transformed_landmarks, jf, indent=4)
+                    atomic_write_json(dest_landmarks_path, transformed_landmarks, indent=4)
                     print(f"Saved rotated landmarks: {dest_landmarks_path}")
                 else:
                     print("No landmarks remained after rotation (all outside crop region)")
@@ -10008,7 +9843,7 @@ class ApplyRotationView(APIView):
                 # Copy the landmark_distances.json from the previous edit to the new edit
                 new_landmark_base = f"{filename}_edit_{edit_number}_rotated"
                 dest_landmark_distances_path = os.path.join(directory, "extracted", filename, f"{new_landmark_base}_landmark_distances.json")
-                shutil.copy(source_landmark_distances_path, dest_landmark_distances_path)
+                atomic_copy(source_landmark_distances_path, dest_landmark_distances_path)
                 print(f"Copied landmark distances: {dest_landmark_distances_path}")
             else:
                 print("No landmark distances found for rotation")
@@ -10033,6 +9868,14 @@ class ApplyRotationView(APIView):
 class ApplyCropView(APIView):
     registration_tools = RegistrationTools()
     
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_crop', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         print("Applying crop")
         
@@ -10106,7 +9949,7 @@ class ApplyCropView(APIView):
 
         # Save the full resolution cropped image
         output_path = os.path.join(directory, "extracted", filename, f"{filename}_edit_{edit_number}_cropped.nii.gz")
-        nib.save(new_nifti, output_path)
+        atomic_nib_save(new_nifti, output_path)
 
         # Generate lossy version from the full resolution cropped image using save_as_lossy_nifti
         if 'lossy_compression' in json_metadata:
@@ -10131,32 +9974,26 @@ class ApplyCropView(APIView):
                 print(f"Found paired mask: {mask_src_path}")
                 mask_src_temp = os.path.join(directory, "extracted", filename, f"{source_mask_edit_base}_mask.nii.gz")
 
-                # Temporarily rename to standard extension for nibabel
-                os.replace(mask_src_path, mask_src_temp)
-                try:
-                    mask_img = nib.load(mask_src_temp)
-                    mask_dtype = mask_img.get_data_dtype()
-                    # Round before astype to avoid truncating floats
-                    mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                # Read in place (crash-safe rule 2): the mask is never renamed to be read.
+                mask_img = load_nifti_readonly(mask_src_path)
+                mask_dtype = mask_img.get_data_dtype()
+                # Round before astype to avoid truncating floats
+                mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
 
-                    # Apply identical crop and padding (nearest neighbor via slicing)
-                    mask_cropped = mask_data[z_min:z_max, y_min:y_max, x_min:x_max]
-                    mask_cropped = np.pad(
-                        mask_cropped,
-                        ((padding, padding), (padding, padding), (padding, padding)),
-                        mode='constant',
-                        constant_values=0
-                    ).astype(mask_dtype)
-                finally:
-                    # Restore original name
-                    os.replace(mask_src_temp, mask_src_path)
+                # Apply identical crop and padding (nearest neighbor via slicing)
+                mask_cropped = mask_data[z_min:z_max, y_min:y_max, x_min:x_max]
+                mask_cropped = np.pad(
+                    mask_cropped,
+                    ((padding, padding), (padding, padding), (padding, padding)),
+                    mode='constant',
+                    constant_values=0
+                ).astype(mask_dtype)
 
                 # Save full-res new mask via temp rename
                 new_mask_edit_base = f"{filename}_edit_{edit_number}_cropped"
                 mask_dest_path = os.path.join(directory, "extracted", filename, f"{new_mask_edit_base}.nii.mask.gz")
                 mask_dest_temp = os.path.join(directory, "extracted", filename, f"{new_mask_edit_base}_mask.nii.gz")
-                nib.save(nib.Nifti1Image(mask_cropped, nifti_img.affine), mask_dest_temp)
-                os.replace(mask_dest_temp, mask_dest_path)
+                atomic_nib_save(nib.Nifti1Image(mask_cropped, nifti_img.affine), mask_dest_path)
                 print(f"Saved cropped mask: {mask_dest_path}")
 
                 # Create lossy mask by downsampling with the same resolution factor (no filtering/compression)
@@ -10183,8 +10020,7 @@ class ApplyCropView(APIView):
                 lossy_mask_edit_base = f"{filename}_lossy_edit_{edit_number}_cropped"
                 lossy_mask_dest_path = os.path.join(directory, "extracted", filename, f"{lossy_mask_edit_base}.nii.mask.gz")
                 lossy_mask_temp = os.path.join(directory, "extracted", filename, f"{lossy_mask_edit_base}_mask.nii.gz")
-                nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_mask_temp)
-                os.replace(lossy_mask_temp, lossy_mask_dest_path)
+                atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_mask_dest_path)
                 print(f"Saved lossy cropped mask: {lossy_mask_dest_path}")
             else:
                 print("No paired mask found for source edit; skipping mask propagation.")
@@ -10225,8 +10061,7 @@ class ApplyCropView(APIView):
                 if transformed_landmarks:
                     new_landmark_base = f"{filename}_edit_{edit_number}_cropped"
                     dest_landmarks_path = os.path.join(directory, "extracted", filename, f"{new_landmark_base}_landmarks.json")
-                    with open(dest_landmarks_path, 'w') as jf:
-                        json.dump(transformed_landmarks, jf, indent=4)
+                    atomic_write_json(dest_landmarks_path, transformed_landmarks, indent=4)
                     print(f"Saved cropped landmarks: {dest_landmarks_path}")
 
                     source_landmark_distances_path = os.path.join(directory, "extracted", filename, f"{source_landmark_base}_landmark_distances.json")
@@ -10396,6 +10231,10 @@ def _mesh_storage_offset_to_shared(
 class ApplyCropToAllScansView(MeshEditMixin, APIView):
     registration_tools = RegistrationTools()
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _crop_voxel_subject(
         self,
         directory,
@@ -10460,7 +10299,7 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
         output_path = os.path.join(
             directory, "extracted", scan, f"{scan}_edit_{save_edit_number}_cropped.nii.gz"
         )
-        nib.save(new_nifti, output_path)
+        atomic_nib_save(new_nifti, output_path)
 
         lossy_output_path = None
         if 'lossy_compression' in json_metadata:
@@ -10487,20 +10326,16 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
                     directory, "extracted", scan, f"{source_mask_edit_base}_mask.nii.gz"
                 )
 
-                os.replace(mask_src_path, mask_src_temp)
-                try:
-                    mask_img = nib.load(mask_src_temp)
-                    mask_dtype = mask_img.get_data_dtype()
-                    mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
-                    mask_cropped = mask_data[z_min:z_max, y_min:y_max, x_min:x_max]
-                    mask_cropped = np.pad(
-                        mask_cropped,
-                        ((pad_voxels, pad_voxels), (pad_voxels, pad_voxels), (pad_voxels, pad_voxels)),
-                        mode='constant',
-                        constant_values=0,
-                    ).astype(mask_dtype)
-                finally:
-                    os.replace(mask_src_temp, mask_src_path)
+                mask_img = load_nifti_readonly(mask_src_path)
+                mask_dtype = mask_img.get_data_dtype()
+                mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                mask_cropped = mask_data[z_min:z_max, y_min:y_max, x_min:x_max]
+                mask_cropped = np.pad(
+                    mask_cropped,
+                    ((pad_voxels, pad_voxels), (pad_voxels, pad_voxels), (pad_voxels, pad_voxels)),
+                    mode='constant',
+                    constant_values=0,
+                ).astype(mask_dtype)
 
                 new_mask_edit_base = f"{scan}_edit_{save_edit_number}_cropped"
                 mask_dest_path = os.path.join(
@@ -10509,8 +10344,7 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
                 mask_dest_temp = os.path.join(
                     directory, "extracted", scan, f"{new_mask_edit_base}_mask.nii.gz"
                 )
-                nib.save(nib.Nifti1Image(mask_cropped, nifti_img.affine), mask_dest_temp)
-                os.replace(mask_dest_temp, mask_dest_path)
+                atomic_nib_save(nib.Nifti1Image(mask_cropped, nifti_img.affine), mask_dest_path)
 
                 if lossy_output_path and os.path.isfile(lossy_output_path):
                     resolution_factor = 2
@@ -10532,8 +10366,7 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
                     lossy_mask_temp = os.path.join(
                         directory, "extracted", scan, f"{lossy_mask_edit_base}_mask.nii.gz"
                     )
-                    nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_mask_temp)
-                    os.replace(lossy_mask_temp, lossy_mask_dest_path)
+                    atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_mask_dest_path)
         except Exception as me:
             print(f"Error handling paired mask for {scan}: {me}")
 
@@ -10566,8 +10399,7 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
                     dest_landmarks_path = os.path.join(
                         directory, "extracted", scan, f"{new_landmark_base}_landmarks.json"
                     )
-                    with open(dest_landmarks_path, 'w') as jf:
-                        json.dump(transformed_landmarks, jf, indent=4)
+                    atomic_write_json(dest_landmarks_path, transformed_landmarks, indent=4)
                     print(f"Saved cropped landmarks: {dest_landmarks_path}")
                 else:
                     print("No landmarks remained after cropping (all outside region)")
@@ -10599,7 +10431,7 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
                         kept_landmark_indices,
                     )
                 else:
-                    shutil.copy(source_landmark_distances_path, dest_landmark_distances_path)
+                    atomic_copy(source_landmark_distances_path, dest_landmark_distances_path)
                 print(f"Copied landmark distances: {dest_landmark_distances_path}")
             else:
                 print("No landmark distances found for crop")
@@ -10679,6 +10511,10 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
             array_padding=0,
         )
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _crop_preserved_mesh_subject(
         self,
         directory,
@@ -10771,8 +10607,7 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
                     dest_guidepoints_path = os.path.join(
                         subject_dir, f"{edit_stem}_guidepoints.json"
                     )
-                    with open(dest_guidepoints_path, "w") as jf:
-                        json.dump(cropped_guidepoints.tolist(), jf, indent=4)
+                    atomic_write_json(dest_guidepoints_path, cropped_guidepoints.tolist(), indent=4)
                     guidepoint_details = {
                         "source_guidepoints": os.path.basename(source_guidepoints_path),
                         "guidepoints_file": os.path.basename(dest_guidepoints_path),
@@ -10794,6 +10629,10 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
         })
         return edit_filename
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _crop_preserved_mesh_subject_mesh_space(
         self,
         directory,
@@ -10904,8 +10743,7 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
                     dest_guidepoints_path = os.path.join(
                         subject_dir, f"{edit_stem}_guidepoints.json"
                     )
-                    with open(dest_guidepoints_path, "w") as jf:
-                        json.dump(cropped_guidepoints.tolist(), jf, indent=4)
+                    atomic_write_json(dest_guidepoints_path, cropped_guidepoints.tolist(), indent=4)
                     guidepoint_details = {
                         "source_guidepoints": os.path.basename(source_guidepoints_path),
                         "guidepoints_file": os.path.basename(dest_guidepoints_path),
@@ -10933,9 +10771,7 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
         print("mesh_space: ", mesh_space)
 
         # Get all scans in the directory
-        scan_names = [d for d in os.listdir(os.path.join(directory, "extracted")) 
-                    if os.path.isdir(os.path.join(directory, "extracted", d))]
-        scan_names.sort()
+        scan_names = list_extracted_scan_names(directory, log_prefix="ApplyCropToAllScans")
 
         # Exclude faulty files by checking the metadata entry
         faulty_files = []
@@ -11097,93 +10933,98 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
         
         for idx, scan in enumerate(scan_names):
             try:
-                print(f"Cropping {scan}...")
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan, 'apply_crop_to_all'):
+                    print(f"Cropping {scan}...")
 
-                if channel_layer is not None:
-                    progress = 0.5 + ((idx + 1) / (total_scans * 2))
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan,
-                            'custom_message': f'Cropping {scan} ({idx + 1}/{total_scans})...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
+                    if channel_layer is not None:
+                        progress = 0.5 + ((idx + 1) / (total_scans * 2))
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan,
+                                'custom_message': f'Cropping {scan} ({idx + 1}/{total_scans})...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
 
-                json_path = os.path.join(directory, "extracted", scan, f"{scan}.json")
-                with open(json_path, 'r') as jf:
-                    json_metadata = json.load(jf)
+                    json_path = os.path.join(directory, "extracted", scan, f"{scan}.json")
+                    with open(json_path, 'r') as jf:
+                        json_metadata = json.load(jf)
 
-                if is_preserved_mesh_metadata(json_metadata):
-                    if mesh_space:
-                        edit_filename = self._crop_preserved_mesh_subject_mesh_space(
+                    if is_preserved_mesh_metadata(json_metadata):
+                        if mesh_space:
+                            edit_filename = self._crop_preserved_mesh_subject_mesh_space(
+                                directory,
+                                scan,
+                                json_metadata,
+                                json_path,
+                                mesh_mm_mins,
+                                mesh_mm_maxs,
+                                crop,
+                                reference,
+                                reference_metadata,
+                                reference_prism_corner,
+                                padding,
+                            )
+                        else:
+                            edit_filename = self._crop_preserved_mesh_subject(
+                                directory,
+                                scan,
+                                json_metadata,
+                                json_path,
+                                mesh_mm_mins,
+                                mesh_mm_maxs,
+                                crop,
+                                reference_voxel_size,
+                                padding,
+                            )
+                        results.append({
+                            'scan': scan,
+                            'success': True,
+                            'edit': edit_filename,
+                            'mode': 'mesh',
+                        })
+                    elif mesh_space:
+                        if not reference_is_mesh:
+                            raise ValueError(
+                                f"Voxel scan {scan} cannot be cropped in mesh_space without a "
+                                "preserved-mesh reference."
+                            )
+                        edit_filename = self._crop_voxel_subject_mesh_space(
                             directory,
                             scan,
                             json_metadata,
-                            json_path,
                             mesh_mm_mins,
                             mesh_mm_maxs,
-                            crop,
                             reference,
-                            reference_metadata,
-                            reference_prism_corner,
-                            padding,
+                            padding=padding,
                         )
+                        results.append({
+                            'scan': scan,
+                            'success': True,
+                            'edit': edit_filename,
+                            'mode': 'voxel_mesh_space',
+                        })
                     else:
-                        edit_filename = self._crop_preserved_mesh_subject(
-                            directory,
-                            scan,
-                            json_metadata,
-                            json_path,
-                            mesh_mm_mins,
-                            mesh_mm_maxs,
-                            crop,
-                            reference_voxel_size,
-                            padding,
+                        edit_filename = self._crop_voxel_subject(
+                            directory, scan, json_metadata, crop, padding
                         )
-                    results.append({
-                        'scan': scan,
-                        'success': True,
-                        'edit': edit_filename,
-                        'mode': 'mesh',
-                    })
-                elif mesh_space:
-                    if not reference_is_mesh:
-                        raise ValueError(
-                            f"Voxel scan {scan} cannot be cropped in mesh_space without a "
-                            "preserved-mesh reference."
-                        )
-                    edit_filename = self._crop_voxel_subject_mesh_space(
-                        directory,
-                        scan,
-                        json_metadata,
-                        mesh_mm_mins,
-                        mesh_mm_maxs,
-                        reference,
-                        padding=padding,
-                    )
-                    results.append({
-                        'scan': scan,
-                        'success': True,
-                        'edit': edit_filename,
-                        'mode': 'voxel_mesh_space',
-                    })
-                else:
-                    edit_filename = self._crop_voxel_subject(
-                        directory, scan, json_metadata, crop, padding
-                    )
-                    results.append({
-                        'scan': scan,
-                        'success': True,
-                        'edit': edit_filename,
-                        'mode': 'voxel',
-                    })
+                        results.append({
+                            'scan': scan,
+                            'success': True,
+                            'edit': edit_filename,
+                            'mode': 'voxel',
+                        })
 
-                if scan == reference:
-                    reference_edit = edit_filename
+                    if scan == reference:
+                        reference_edit = edit_filename
 
             except Exception as e:
                 print(f"Error cropping {scan}: {e}")
@@ -11217,6 +11058,9 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
         }, status=status.HTTP_200_OK)
 
 class RandomLandmarkingView(APIView):
+
+    # Steps reported to the progress bar; paths that skip a stage jump ahead.
+    PROGRESS_STEPS = 7
 
     def displace_coordinate_by_closest_field_vector(self, coordinate, field_vector, voxel_size, original_shape):
         """
@@ -11750,19 +11594,35 @@ class RandomLandmarkingView(APIView):
 
         dim_x, dim_y, dim_z = nifti_data.shape
 
-        # Physical coordinate grid (mm) — same space as the mesh vertices.
-        gi, gj, gk = np.mgrid[0:dim_x, 0:dim_y, 0:dim_z]
-        phys = np.stack([gi * voxel_size,
-                         gj * voxel_size,
-                         gk * voxel_size], axis=-1)          # (X,Y,Z,3)
+        left_nifti_data  = np.zeros_like(nifti_data)
+        right_nifti_data = np.zeros_like(nifti_data)
 
-        # Signed distance of every voxel from the symmetry plane.
-        signed_distances = np.einsum('ijkl,l->ijk', phys - point, normal)
+        # Done in slabs along x (see _x_slabs): the full-volume coordinate grid and its
+        # temporaries need ~100 bytes per voxel and ran large scans out of memory.
+        # Per-voxel arithmetic is unchanged, so the result is identical.
+        for x0, x1 in self._x_slabs(nifti_data.shape):
+            # Physical coordinate grid (mm) — same space as the mesh vertices.
+            gi, gj, gk = np.mgrid[x0:x1, 0:dim_y, 0:dim_z]
+            phys = np.stack([gi * voxel_size,
+                             gj * voxel_size,
+                             gk * voxel_size], axis=-1)          # (x1-x0,Y,Z,3)
 
-        left_nifti_data  = np.where(signed_distances <= 0, nifti_data, 0)
-        right_nifti_data = np.where(signed_distances  > 0, nifti_data, 0)
+            # Signed distance of every voxel from the symmetry plane.
+            signed_distances = np.einsum('ijkl,l->ijk', phys - point, normal)
 
-        return left_nifti_data.astype(nifti_data.dtype), right_nifti_data.astype(nifti_data.dtype)
+            block = nifti_data[x0:x1]
+            left_nifti_data[x0:x1]  = np.where(signed_distances <= 0, block, 0)
+            right_nifti_data[x0:x1] = np.where(signed_distances  > 0, block, 0)
+
+        return left_nifti_data, right_nifti_data
+
+    def _x_slabs(self, shape, voxels_per_slab=4_000_000):
+        """Yield (x0, x1) ranges covering shape[0], each slab ~voxels_per_slab voxels
+        (~0.5 GB of grid temporaries in split/mirror_nifti_data)."""
+        dim_x, dim_y, dim_z = shape
+        step = max(1, int(voxels_per_slab // max(1, dim_y * dim_z)))
+        for x0 in range(0, dim_x, step):
+            yield x0, min(dim_x, x0 + step)
 
     def mirror_nifti_data(self, nifti_data, symmetry_plane, voxel_size=1.0):
         """
@@ -11784,29 +11644,34 @@ class RandomLandmarkingView(APIView):
 
         dim_x, dim_y, dim_z = nifti_data.shape
 
-        # Physical coordinate grid.
-        gi, gj, gk = np.mgrid[0:dim_x, 0:dim_y, 0:dim_z]
-        phys = np.stack([gi * voxel_size,
-                         gj * voxel_size,
-                         gk * voxel_size], axis=-1)          # (X,Y,Z,3)
-
-        # Reflect: phys_reflected = phys - 2*(phys-point)·n * n
-        rel = phys - point                                    # (X,Y,Z,3)
-        dots = np.einsum('ijkl,l->ijk', rel, normal)          # (X,Y,Z)
-        phys_reflected = phys - 2.0 * dots[..., np.newaxis] * normal
-
-        # Convert back to voxel indices.
-        ri = np.round(phys_reflected[..., 0] / voxel_size).astype(np.int32)
-        rj = np.round(phys_reflected[..., 1] / voxel_size).astype(np.int32)
-        rk = np.round(phys_reflected[..., 2] / voxel_size).astype(np.int32)
-
-        # Mask out voxels whose reflection falls outside the volume.
-        valid = ((ri >= 0) & (ri < dim_x) &
-                 (rj >= 0) & (rj < dim_y) &
-                 (rk >= 0) & (rk < dim_z))
-
         mirrored_data = np.zeros_like(nifti_data)
-        mirrored_data[valid] = nifti_data[ri[valid], rj[valid], rk[valid]]
+
+        # Output voxels in x slabs (see _x_slabs), each reading from the full source
+        # volume: same per-voxel arithmetic as the whole-volume version, far less memory.
+        for x0, x1 in self._x_slabs(nifti_data.shape):
+            # Physical coordinate grid.
+            gi, gj, gk = np.mgrid[x0:x1, 0:dim_y, 0:dim_z]
+            phys = np.stack([gi * voxel_size,
+                             gj * voxel_size,
+                             gk * voxel_size], axis=-1)          # (x1-x0,Y,Z,3)
+
+            # Reflect: phys_reflected = phys - 2*(phys-point)·n * n
+            rel = phys - point                                    # (x1-x0,Y,Z,3)
+            dots = np.einsum('ijkl,l->ijk', rel, normal)          # (x1-x0,Y,Z)
+            phys_reflected = phys - 2.0 * dots[..., np.newaxis] * normal
+
+            # Convert back to voxel indices.
+            ri = np.round(phys_reflected[..., 0] / voxel_size).astype(np.int32)
+            rj = np.round(phys_reflected[..., 1] / voxel_size).astype(np.int32)
+            rk = np.round(phys_reflected[..., 2] / voxel_size).astype(np.int32)
+
+            # Mask out voxels whose reflection falls outside the volume.
+            valid = ((ri >= 0) & (ri < dim_x) &
+                     (rj >= 0) & (rj < dim_y) &
+                     (rk >= 0) & (rk < dim_z))
+
+            mirrored_slab = mirrored_data[x0:x1]  # view into mirrored_data
+            mirrored_slab[valid] = nifti_data[ri[valid], rj[valid], rk[valid]]
 
         return mirrored_data
 
@@ -12055,12 +11920,26 @@ class RandomLandmarkingView(APIView):
         )
         return landmarks_raw, symmetry_plane, icp_transform
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('random_landmarking', lambda request: request_subjects(request, 'filename'))
+    # ANTs temp files of this request (run folders, loose .mat/.nii.gz) are removed
+    # when it returns or fails, even on error paths (see antsWorker.temp_scoped).
+    @antsWorker.temp_scoped
     def post(self, request):
         print("Applying random landmarking")
         directory = request.data['directory']
         filename = request.data['filename']
         edit_lossy = request.data['edit']
         num_landmarks = request.data['num_landmarks']
+        steps = self.PROGRESS_STEPS
+        _send_step_progress(0, steps, 'Random landmarking', filename)
+        _send_step_progress(1, steps, 'Loading scan', filename)
         # change edit to not-lossy
         if edit_lossy is not None:
             edit = edit_lossy.replace("_lossy", "")
@@ -12082,6 +11961,7 @@ class RandomLandmarkingView(APIView):
             faces = np.asarray(mesh_obj.faces, dtype=np.int64)
             unit = _mesh_distance_unit(json_metadata, vertices)
             print(f"Random landmarking preserved mesh from {mesh_path}")
+            _send_step_progress(5, steps, 'Placing landmarks', filename)
 
             landmarks_raw, symmetry_plane, icp_transform = self._preserved_mesh_symmetric_landmarks(
                 vertices,
@@ -12096,24 +11976,24 @@ class RandomLandmarkingView(APIView):
             else:
                 random_mode = 'preserved_mesh_symmetry_mirror_warp'
 
+            _send_step_progress(6, steps, 'Snapping landmarks to the surface', filename)
             landmarks, snap_mag = self.snap_landmarks_to_mesh(landmarks_raw, vertices, faces, unit)
             distances_residual = alpaca.calculate_landmark_distances(landmarks, vertices, faces)
             edit_base = edit_stem or filename
 
+            _send_step_progress(7, steps, 'Saving landmarks', filename)
             landmarks_serializable = [
                 {'position': list(map(float, lm)), 'landmark_type': 'main'}
                 for lm in landmarks
             ]
             landmarks_path = os.path.join(directory, sub_path, edit_base + "_landmarks.json")
-            with open(landmarks_path, 'w') as jf:
-                json.dump(landmarks_serializable, jf, indent=4)
+            atomic_write_json(landmarks_path, landmarks_serializable, indent=4)
 
             distances_path = os.path.join(directory, sub_path, edit_base + "_landmark_distances.json")
-            with open(distances_path, 'w') as jf:
-                json.dump({
+            atomic_write_json(distances_path, {
                     'distances': distances_residual.tolist(),
                     'snap_distance': snap_mag.tolist(),
-                }, jf, indent=4)
+                }, indent=4)
 
             json_metadata['landmarks'] = {
                 'num_landmarks': int(len(landmarks)),
@@ -12136,8 +12016,7 @@ class RandomLandmarkingView(APIView):
                 }
             if icp_transform is not None:
                 json_metadata['landmarks']['symmetry_icp_transform'] = np.asarray(icp_transform, dtype=float).tolist()
-            with open(json_path, 'w') as jf:
-                json.dump(json_metadata, jf, indent=4)
+            atomic_write_json(json_path, json_metadata, indent=4)
 
             return Response(
                 {'message': 'Random landmarking applied to preserved mesh successfully'},
@@ -12148,7 +12027,9 @@ class RandomLandmarkingView(APIView):
         nifti_path = os.path.join(directory, sub_path, edit)
         nifti_img = nib.load(nifti_path)
         original_dtype = nifti_img.get_data_dtype()
-        nifti_data = nifti_img.get_fdata().astype(original_dtype)
+        # caching='unchanged': nibabel would otherwise keep its own float64 copy of the
+        # whole volume on nifti_img for the rest of the request (incl. the ANTs wait).
+        nifti_data = nifti_img.get_fdata(caching='unchanged').astype(original_dtype)
 
         # Get threshold from json metadata
         threshold = json_metadata['threshold']
@@ -12163,37 +12044,43 @@ class RandomLandmarkingView(APIView):
             threshold = float(np.clip(threshold, data_min, data_max))
 
         # Marching cubes to get the surface mesh
+        _send_step_progress(2, steps, 'Building surface mesh', filename)
         volume = gaussian_filter(nifti_data, sigma=1.0)
 
         # Apply the Marching Cubes algorithm to extract the mesh's vertices and faces from the volume data
         vertices, faces, _, _ = measure.marching_cubes(volume, level=threshold, spacing=(json_metadata['voxel_size'], json_metadata['voxel_size'], json_metadata['voxel_size']))
+        # The smoothed volume is only needed for marching cubes.
+        del volume
 
         # Invert face normals by reversing the order of vertices in each face
         faces = faces[:, ::-1]
 
         # Find the symmetry plane; returns None when mesh is not sufficiently symmetric.
+        _send_step_progress(3, steps, 'Finding symmetry plane', filename)
         symmetry_plane = self.find_symmetry_plane(vertices, faces, voxel_size=json_metadata['voxel_size'])
 
         if symmetry_plane is None:
             vs = float(json_metadata['voxel_size'])
             outer_v, outer_f = self._resolve_outer_mesh(vertices, faces)
             print("Non-symmetric: {} landmarks (outer snap + metrics)".format(num_landmarks))
+            _send_step_progress(5, steps, 'Placing landmarks', filename)
             landmarks_raw = self.random_surface_landmarks(
                 vertices, faces, int(num_landmarks), outer=(outer_v, outer_f)
             )
+            _send_step_progress(6, steps, 'Snapping landmarks to the surface', filename)
             landmarks, _ = self.snap_landmarks_to_mesh(landmarks_raw, outer_v, outer_f, vs)
             distances_residual = alpaca.calculate_landmark_distances(landmarks, outer_v, outer_f)
             snap_mag = np.linalg.norm(landmarks_raw - landmarks, axis=1)
 
             edit_base = edit.replace(".nii.gz", "")
+            _send_step_progress(7, steps, 'Saving landmarks', filename)
 
             landmarks_serializable = [
                 {'position': list(map(float, lm)), 'landmark_type': 'main'}
                 for lm in landmarks
             ]
             landmarks_path = os.path.join(directory, sub_path, edit_base + "_landmarks.json")
-            with open(landmarks_path, 'w') as jf:
-                json.dump(landmarks_serializable, jf, indent=4)
+            atomic_write_json(landmarks_path, landmarks_serializable, indent=4)
 
             mean_distance = float(np.mean(distances_residual))
             std_distance = float(np.std(distances_residual))
@@ -12207,8 +12094,7 @@ class RandomLandmarkingView(APIView):
                 'snap_distance': snap_mag.tolist(),
             }
             distances_path = os.path.join(directory, sub_path, edit_base + "_landmark_distances.json")
-            with open(distances_path, 'w') as jf:
-                json.dump(distances_dict, jf, indent=4)
+            atomic_write_json(distances_path, distances_dict, indent=4)
 
             json_metadata['landmarks'] = {
                 'num_landmarks': int(num_landmarks),
@@ -12223,8 +12109,7 @@ class RandomLandmarkingView(APIView):
                 'edit_name': edit_base,
                 'mode': 'random_surface',
             }
-            with open(json_path, 'w') as jf:
-                json.dump(json_metadata, jf, indent=4)
+            atomic_write_json(json_path, json_metadata, indent=4)
 
             return Response(
                 {'message': 'Random surface landmarking applied (non-symmetric mesh)'},
@@ -12241,6 +12126,7 @@ class RandomLandmarkingView(APIView):
         print("Left outer half: {} faces".format(len(left_outer_faces)))
 
         # -symmetry mode- Split the original (full) mesh for volume operations.
+        _send_step_progress(4, steps, 'Registering mirrored halves', filename)
         left_vertices, left_faces, right_vertices, right_faces = self.split_mesh(vertices, faces, symmetry_plane)
 
         # -symmetry mode- Split the nifti_data into two halves based on the symmetry plane keeping the original nifti_data shape.
@@ -12253,9 +12139,11 @@ class RandomLandmarkingView(APIView):
         spacing_tuple = (vs, vs, vs)
         right_nifti_ants = ants.from_numpy(right_nifti_data.astype(np.float32), spacing=spacing_tuple)
         mirrored_ants    = ants.from_numpy(mirrored_left_to_right_nifti_data.astype(np.float32), spacing=spacing_tuple)
+        # The numpy halves are not used again; free them before the (long) registration.
+        del left_nifti_data, right_nifti_data, mirrored_left_to_right_nifti_data, nifti_data
 
         # -symmetry mode- SyNOnly: "guided-mattes-3" preset
-        elastic_transform = ants.registration(
+        elastic_transform = antsWorker.registration(
             fixed=right_nifti_ants,
             moving=mirrored_ants,
             type_of_transform='SyNOnly',
@@ -12267,26 +12155,37 @@ class RandomLandmarkingView(APIView):
             reg_iterations=(300, 200, 50, 0),
             verbose=True,
         )
- 
+        del right_nifti_ants, mirrored_ants
 
-        # Poisson oversample + FPS on left outer-shell half (spacing).
-        print("Symmetry path: {} landmarks on left outer half (Poisson+FPS)".format(num_landmarks))
-        left_landmarks = self.surface_landmarks_poisson_fps(
-            left_outer_vertices, left_outer_faces, int(num_landmarks)
-        )
+        try:
+            # Poisson oversample + FPS on left outer-shell half (spacing).
+            print("Symmetry path: {} landmarks on left outer half (Poisson+FPS)".format(num_landmarks))
+            _send_step_progress(5, steps, 'Placing landmarks', filename)
+            left_landmarks = self.surface_landmarks_poisson_fps(
+                left_outer_vertices, left_outer_faces, int(num_landmarks)
+            )
 
-        # -symmetry mode- Mirror the landmarks to the right side at the symmetry plane.
-        mirrored_landmarks_to_right = self.mirror_landmarks(left_landmarks, symmetry_plane)
+            # -symmetry mode- Mirror the landmarks to the right side at the symmetry plane.
+            mirrored_landmarks_to_right = self.mirror_landmarks(left_landmarks, symmetry_plane)
 
-        # Map mirrored landmarks from moving (mirrored-left) space → fixed (right) space.
-        # ANTs convention: fwdtransforms is a pull-back field stored in fixed space, so
-        # apply_transforms_to_points(fwdtransforms) maps fixed→moving for points.
-        # We need moving→fixed, which is what invtransforms gives.
-        pts_df = pd.DataFrame(mirrored_landmarks_to_right, columns=['x', 'y', 'z'])
-        warped_df = ants.apply_transforms_to_points(
-            3, pts_df, elastic_transform['invtransforms']
-        )
-        transformed_landmarks_to_right = warped_df[['x', 'y', 'z']].to_numpy(dtype=np.float64)
+            # Map mirrored landmarks from moving (mirrored-left) space → fixed (right) space.
+            # ANTs convention: fwdtransforms is a pull-back field stored in fixed space, so
+            # apply_transforms_to_points(fwdtransforms) maps fixed→moving for points.
+            # We need moving→fixed, which is what invtransforms gives.
+            pts_df = pd.DataFrame(mirrored_landmarks_to_right, columns=['x', 'y', 'z'])
+            warped_df = ants.apply_transforms_to_points(
+                3, pts_df, elastic_transform['invtransforms']
+            )
+            transformed_landmarks_to_right = warped_df[['x', 'y', 'z']].to_numpy(dtype=np.float64)
+        finally:
+            # Only the landmark positions are kept, so the Warp/InverseWarp fields (and
+            # the antsWorker run folder) can go now. Previously they were never removed
+            # and piled up in the temp folder, which is RAM on tmpfs systems.
+            _remove_ants_temp_outputs(
+                list(elastic_transform['fwdtransforms']) + list(elastic_transform['invtransforms'])
+            )
+            elastic_transform = None
+            cleanup_memory(stage=f"{filename}: random landmarking warps removed")
 
         # Collapse near-plane redundant pairs (same index left/right) before snap.
         landmarks_raw = self._merge_redundant_symmetry_pairs(
@@ -12294,19 +12193,20 @@ class RandomLandmarkingView(APIView):
         )
 
         # Snap all to outer shell only; distances = residual on outer, snap_distance = pre->post displacement.
+        _send_step_progress(6, steps, 'Snapping landmarks to the surface', filename)
         landmarks, _ = self.snap_landmarks_to_mesh(landmarks_raw, outer_vertices, outer_faces, vs)
         distances_residual = alpaca.calculate_landmark_distances(landmarks, outer_vertices, outer_faces)
         snap_mag = np.linalg.norm(landmarks_raw - landmarks, axis=1)
 
         edit_base = edit.replace(".nii.gz", "")
+        _send_step_progress(7, steps, 'Saving landmarks', filename)
 
         landmarks_serializable = [
             {'position': list(map(float, lm)), 'landmark_type': 'main'}
             for lm in landmarks
         ]
         landmarks_path = os.path.join(directory, sub_path, edit_base + "_landmarks.json")
-        with open(landmarks_path, 'w') as jf:
-            json.dump(landmarks_serializable, jf, indent=4)
+        atomic_write_json(landmarks_path, landmarks_serializable, indent=4)
 
         mean_distance = float(np.mean(distances_residual))
         std_distance = float(np.std(distances_residual))
@@ -12320,8 +12220,7 @@ class RandomLandmarkingView(APIView):
             'snap_distance': snap_mag.tolist(),
         }
         distances_path = os.path.join(directory, sub_path, edit_base + "_landmark_distances.json")
-        with open(distances_path, 'w') as jf:
-            json.dump(distances_dict, jf, indent=4)
+        atomic_write_json(distances_path, distances_dict, indent=4)
 
         json_metadata['landmarks'] = {
             'num_landmarks': int(len(landmarks)),
@@ -12336,8 +12235,7 @@ class RandomLandmarkingView(APIView):
             'edit_name': edit_base,
             'mode': 'symmetry_mirror',
         }
-        with open(json_path, 'w') as jf:
-            json.dump(json_metadata, jf, indent=4)
+        atomic_write_json(json_path, json_metadata, indent=4)
 
         return Response({'message': 'Automatic landmarking applied successfully'}, status=status.HTTP_200_OK)
 
@@ -12835,6 +12733,14 @@ class DeleteEditView(APIView):
             if os.path.isfile(os.path.join(scan_dir, name))
         ]
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('delete_edit', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         
         directory = request.data['directory']
@@ -12926,6 +12832,11 @@ class DeleteEditView(APIView):
                     mask_file = edit_file.replace('.nii.gz', '.nii.mask.gz')
                     if os.path.exists(mask_file):
                         edit_mask_files.append(mask_file)
+                    # Linked-replay hand-off left by cleanup / slice when the replay never ran
+                    # (not matched by the `*.nii.gz` glob above).
+                    removal_mask_file = edit_file.replace('.nii.gz', '.nii.removal_mask.gz')
+                    if os.path.exists(removal_mask_file):
+                        edit_mask_files.append(removal_mask_file)
                 for lossy_file in lossy_files:
                     mask_file = lossy_file.replace('.nii.gz', '.nii.mask.gz')
                     if os.path.exists(mask_file):
@@ -12952,7 +12863,7 @@ class DeleteEditView(APIView):
             edit_deleted_flag = False
             files_to_delete = edit_payload_files + projection_files + landmarks_files + elastic_files + landmark_distances_files + guidepoints_files + guidepoints_reference_files + edit_mask_files + lossy_mask_files + mesh_cache_files
             for file in files_to_delete:
-                os.remove(file)
+                tracked_remove(file)
                 edit_deleted_flag = True
 
             if edit_deleted_flag:
@@ -12989,8 +12900,7 @@ class DeleteEditView(APIView):
                             )
                             if new_lc != lc or mapping_removed:
                                 scan_metadata['lossy_compression'] = new_lc
-                                with open(json_path, 'w') as jf:
-                                    json.dump(scan_metadata, jf, indent=4)
+                                atomic_write_json(json_path, scan_metadata, indent=4)
                     except Exception as e:
                         print(f"Warning: could not update lossy_compression after delete: {e}")
 
@@ -13030,7 +12940,7 @@ class DeleteEditView(APIView):
                         + glob.glob(os.path.join(scan_dir, f"{filename}_*_ants_rigid_affine.mat"))
                     ):
                         try:
-                            os.remove(ants_mat)
+                            tracked_remove(ants_mat)
                         except OSError as ants_err:
                             print(f"Warning: could not remove stale rigid affine {ants_mat}: {ants_err}")
                     # GPU / DINO-Reg forensic folders are not edit-numbered; clear with the aligned edit.
@@ -13043,8 +12953,7 @@ class DeleteEditView(APIView):
                                 print(
                                     f"Warning: could not remove rigid debug folder {debug_dir}: {debug_err}"
                                 )
-                    with open(json_path, 'w') as jf:
-                        json.dump(scan_metadata, jf, indent=4)
+                    atomic_write_json(json_path, scan_metadata, indent=4)
 
                 # Check if edit was an elastic registration by looking for "_elastic" in filenames
                 is_elastic = any("_elastic" in file for file in edit_payload_files)
@@ -13059,13 +12968,13 @@ class DeleteEditView(APIView):
                         glob.glob(os.path.join(directory, sub_path, f"{filename}_lossy_edit_{edit}_elastic*.nii.backup.gz"))
                     ):
                         try:
-                            os.remove(_backup)
+                            tracked_remove(_backup)
                         except OSError as _be:
                             print(f"Warning: could not remove elastic backup {_backup}: {_be}")
 
                     # Delete registration error file
                     try:
-                        os.remove(os.path.join(scan_dir, f"{filename}_registration_error.json"))
+                        tracked_remove(os.path.join(scan_dir, f"{filename}_registration_error.json"))
                     except:
                         pass
 
@@ -13086,8 +12995,7 @@ class DeleteEditView(APIView):
                     scan_metadata['elastic_error'] = None
                     scan_metadata['elastic_to'] = None                        
                     scan_metadata['elastic_shift'] = None
-                    with open(json_path, 'w') as jf:
-                        json.dump(scan_metadata, jf, indent=4)
+                    atomic_write_json(json_path, scan_metadata, indent=4)
                     
                     # If the atlas/atlas.json exists, open it and find the filename under atlas_subjects, then if found remove it
                     if os.path.exists(os.path.join(resolve_atlas_dir(directory), "atlas.json")):
@@ -13095,8 +13003,7 @@ class DeleteEditView(APIView):
                             atlas_metadata = json.load(jf)
                         if filename in atlas_metadata['atlas_subjects']:
                             atlas_metadata['atlas_subjects'].remove(filename)
-                            with open(os.path.join(resolve_atlas_dir(directory), "atlas.json"), 'w') as jf:
-                                json.dump(atlas_metadata, jf, indent=4)
+                            atomic_write_json(os.path.join(resolve_atlas_dir(directory), "atlas.json"), atlas_metadata, indent=4)
 
                 is_backfixed = any("_backfixed" in file for file in edit_payload_files)
                 if is_backfixed:
@@ -13113,8 +13020,7 @@ class DeleteEditView(APIView):
                         legacy_restore=_legacy_backfixed_threshold_restore,
                     )
                     scan_metadata['backfixed_shift'] = None
-                    with open(json_path, 'w') as jf:
-                        json.dump(scan_metadata, jf, indent=4)
+                    atomic_write_json(json_path, scan_metadata, indent=4)
 
 
                 # Check if edit was a landmarks.json 
@@ -13138,8 +13044,7 @@ class DeleteEditView(APIView):
                             scan_metadata = json.load(jf)
                         if 'landmarks' in scan_metadata:
                             scan_metadata['landmarks'] = None
-                            with open(json_path, 'w') as jf:
-                                json.dump(scan_metadata, jf, indent=4)
+                            atomic_write_json(json_path, scan_metadata, indent=4)
 
                 # Check if edit was a histogram matching by looking for "_histmatched" in filenames
                 is_histmatched = any("_histmatched" in file for file in edit_payload_files)
@@ -13158,8 +13063,7 @@ class DeleteEditView(APIView):
                     )
                     scan_metadata['histogram_matched_to'] = None
                     scan_metadata['histogram_matched_old_threshold'] = None
-                    with open(json_path, 'w') as jf:
-                        json.dump(scan_metadata, jf, indent=4)
+                    atomic_write_json(json_path, scan_metadata, indent=4)
 
                 # If an inserted _masked edit was deleted (the elastic at edit+1 has a pre-mask
                 # backup), restore that elastic and un-bump it back to the now-vacated slot.
@@ -13195,7 +13099,7 @@ class DeleteEditView(APIView):
                                 f"_edit_{next_edit_num}_elastic",
                                 f"_edit_{edit}_elastic",
                             )
-                            os.rename(src, dst)
+                            tracked_rename(src, dst)
                         print(f"Un-bumped elastic edit from slot {next_edit_num} back to {edit} after deleting masked insertion")
                         # Fix the lossy_compression entry whose filename still references the
                         # bumped slot number — the masked entry was already removed above by
@@ -13234,8 +13138,7 @@ class DeleteEditView(APIView):
                             for stem in deleted_threshold_stems:
                                 remove_old_threshold(_meta, stem)
                             _meta['lossy_compression'] = _lc
-                            with open(_json_path, 'w') as _f:
-                                json.dump(_meta, _f, indent=4)
+                            atomic_write_json(_json_path, _meta, indent=4)
                         except Exception as _e:
                             print(f"Warning: could not fix lossy_compression after elastic un-bump: {_e}")
 
@@ -13252,8 +13155,7 @@ class DeleteEditView(APIView):
                         filename,
                         is_preserved_mesh,
                     )
-                    with open(json_path, 'w') as jf:
-                        json.dump(scan_metadata, jf, indent=4)
+                    atomic_write_json(json_path, scan_metadata, indent=4)
                 except Exception as e:
                     print(f"Warning: could not update old_thresholds after delete: {e}")
 
@@ -13263,39 +13165,39 @@ class DeleteEditView(APIView):
             previous_edit = None
              
             try:
-                os.remove(os.path.join(scan_dir, f"{filename}.nii.gz"))
+                tracked_remove(os.path.join(scan_dir, f"{filename}.nii.gz"))
             except:
                 pass
             try:
-                os.remove(os.path.join(scan_dir, f"{filename}_lossy.nii.gz"))
+                tracked_remove(os.path.join(scan_dir, f"{filename}_lossy.nii.gz"))
             except:
                 pass
             try:
-                os.remove(os.path.join(scan_dir, f"{filename}.ply"))
+                tracked_remove(os.path.join(scan_dir, f"{filename}.ply"))
             except:
                 pass
             for projection_path in self._base_projection_sidecar_paths(scan_dir, filename):
                 try:
-                    os.remove(projection_path)
+                    tracked_remove(projection_path)
                 except OSError:
                     pass
             try:
-                os.remove(json_path)
+                tracked_remove(json_path)
             except:
                 pass
             try:
-                os.remove(os.path.join(scan_dir, f"{filename}_landmark_distances.json"))
+                tracked_remove(os.path.join(scan_dir, f"{filename}_landmark_distances.json"))
             except:
                 pass
             try:
-                os.remove(os.path.join(scan_dir, f"{filename}_landmarks.json"))
+                tracked_remove(os.path.join(scan_dir, f"{filename}_landmarks.json"))
             except:
                 pass
 
             # If the folder is atlas and no edit, delete everything inside the folder
             if sub_path == "atlas":
                 for file in os.listdir(scan_dir):
-                    os.remove(os.path.join(scan_dir, file))
+                    tracked_remove(os.path.join(scan_dir, file))
 
         return Response({'message': 'Edit deleted', 'previous_edit': previous_edit}, status=status.HTTP_200_OK)
 
@@ -13365,8 +13267,27 @@ class ElasticRegistrationView(APIView):
         if any(p[1] for p in pads):
             tmp = np.pad(tmp, pads, mode='edge')
         return tmp
-    
+
+    # ANTs temp files of this request (run folders, loose .mat/.nii.gz) are removed
+    # when it returns or fails, even on error paths (see antsWorker.temp_scoped).
+    @antsWorker.temp_scoped
     def post(self, request):
+        # Mark the project as having a live elastic run so project-open scrubbing
+        # (scrub_elastic_staging_dirs) leaves this run's staging folders alone.
+        run_key = _elastic_run_key(request.data['directory'])
+        with _ACTIVE_ELASTIC_RUN_LOCK:
+            _ACTIVE_ELASTIC_RUN_DIRECTORIES.add(run_key)
+        try:
+            return self._run_elastic_registration(request)
+        finally:
+            with _ACTIVE_ELASTIC_RUN_LOCK:
+                _ACTIVE_ELASTIC_RUN_DIRECTORIES.discard(run_key)
+
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
+    def _run_elastic_registration(self, request):
         directory = request.data['directory']
         reference = request.data['reference']
         quick_registration = request.data['quick_registration']
@@ -13452,10 +13373,7 @@ class ElasticRegistrationView(APIView):
 
         # Make a list of faulty files
         faulty_files = []
-        for file in os.listdir(os.path.join(directory, "extracted")):
-            # Skip project_settings.json file
-            if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                continue
+        for file in list_extracted_scan_names(directory, log_prefix="ElasticRegistration"):
             if file != reference:
                 json_path = os.path.join(directory, "extracted", file, f"{file}.json")
                 with open(json_path, 'r') as jf:
@@ -13465,10 +13383,8 @@ class ElasticRegistrationView(APIView):
 
 
         # Get all the directories in the extracted directory except the reference scan and any faulty files
-        moving_images = [f for f in os.listdir(os.path.join(directory, "extracted")) 
-                        if f != reference and f not in faulty_files 
-                        and f != "project_settings.json" 
-                        and os.path.isdir(os.path.join(directory, "extracted", f))]
+        moving_images = [f for f in list_extracted_scan_names(directory)
+                        if f != reference and f not in faulty_files]
         # This pathway only understands NIfTI volumes; preserved PLY meshes are registered
         # separately via NR-ICP (see meshBasedTools.MeshElasticRegistrationView).
         moving_images, _ = partition_voxel_and_preserved_mesh_scans(directory, moving_images)
@@ -13540,18 +13456,10 @@ class ElasticRegistrationView(APIView):
             while glob.glob(os.path.join(directory, "extracted", moving_image_name, f"{moving_image_name}_edit_{latest_edit}_*.nii.gz")):
                 latest_edit += 1
 
-            # Delete all .mat and .nii.gz files in the temp directory (cross-platform)
-            temp_dir = tempfile.gettempdir()
-            for file in glob.glob(os.path.join(temp_dir, "*.mat")):
-                try:
-                    os.remove(file)
-                except (OSError, PermissionError):
-                    pass  # File may be locked or already deleted
-            for file in glob.glob(os.path.join(temp_dir, "*.nii.gz")):
-                try:
-                    os.remove(file)
-                except (OSError, PermissionError):
-                    pass  # File may be locked or already deleted
+            # ANTs temp files are removed per registration (_remove_ants_temp_outputs below)
+            # and, on any error path, by @antsWorker.temp_scoped on post. The old blanket
+            # delete of every *.mat / *.nii.gz in the temp folder is gone: it also hit files
+            # of other jobs and programs.
 
 
             # Send progress update after each scan is processed
@@ -13764,9 +13672,14 @@ class ElasticRegistrationView(APIView):
                             direction=moving_image_data.direction
                         )
 
+            # Every ANTs temp output this subject creates; removed from the temp folder
+            # as soon as the warps are copied into the staging folder (see below).
+            ants_temp_outputs = []
+
             if affine_initialization:
                 # Calculate the affine transformation matrix using ants, then turn it into a deformation field and use it as the initial_transform for the non-linear elastic registration
                 initial_affine_path, initial_affine_field_path = self.registration_tools.calculate_affine_transform_as_field(fixed_image_data, moving_image_data)
+                ants_temp_outputs.extend([initial_affine_path, initial_affine_field_path])
                 #initial_affine_field_path = "/tmp/tmpjfrmbow11Warp.nii.gz" # for quick debugging loading a pre-calculated affine field
                 print(f"initial_affine_field_path: {initial_affine_field_path}")
 
@@ -13884,7 +13797,7 @@ class ElasticRegistrationView(APIView):
                 }
                 if preset["syn_metric"] != "demons":
                     reg_kwargs["syn_sampling"] = preset["syn_sampling"]
-                return ants.registration(**reg_kwargs)
+                return antsWorker.registration(**reg_kwargs)
 
             if quick_registration in guided_presets:
                 elastix_transform = run_preset_registration(
@@ -13909,9 +13822,12 @@ class ElasticRegistrationView(APIView):
                 }
                 if elastic_custom_opts["syn_metric"] != "demons":
                     _reg_kwargs["syn_sampling"] = elastic_custom_opts["syn_sampling"]
-                elastix_transform = ants.registration(**_reg_kwargs)
+                elastix_transform = antsWorker.registration(**_reg_kwargs)
             else:
                 raise ValueError(f"Unknown quick_registration preset: {quick_registration}")
+            # Pass-1 outputs must stay on disk until pass 2 and the warp composition have read them.
+            ants_temp_outputs.extend(elastix_transform['fwdtransforms'] + elastix_transform['invtransforms'])
+            elastic_ants_runs = [antsWorker.run_stats(elastix_transform)]
 
             if double_pass:
                 fwd_warps = [t for t in elastix_transform['fwdtransforms'] if t.endswith('.nii.gz')]
@@ -13939,8 +13855,10 @@ class ElasticRegistrationView(APIView):
                     }
                     if o2["syn_metric"] != "demons":
                         _reg_kwargs["syn_sampling"] = o2["syn_sampling"]
-                    elastix_transform = ants.registration(**_reg_kwargs)
-            
+                    elastix_transform = antsWorker.registration(**_reg_kwargs)
+                ants_temp_outputs.extend(elastix_transform['fwdtransforms'] + elastix_transform['invtransforms'])
+                elastic_ants_runs.append(antsWorker.run_stats(elastix_transform))
+
 
             # load the pre-calculated elastic transform
             """
@@ -13952,6 +13870,16 @@ class ElasticRegistrationView(APIView):
 
 
             print("Registration complete")
+            cleanup_memory(stage=f"{moving_image_name}: after SyN")
+            # Compute cost of this scan's registration (all passes); saved in the subject
+            # JSON as elastic_compute for the scientific report's compute paragraph.
+            elastic_compute = antsWorker.summarize_runs(elastic_ants_runs, fixed_image_data)
+
+            # From here on every output is written into the hidden staging folder and
+            # only moved into the subject folder once all of them are saved (see
+            # _ELASTIC_STAGING_DIRNAME). Nothing was written to the subject folder above.
+            subject_scan_dir = os.path.join(directory, "extracted", moving_image_name)
+            elastic_staging_dir = _create_elastic_staging_dir(subject_scan_dir)
 
             # Send progress update after each scan is processed
             channel_layer = get_channel_layer()
@@ -13982,7 +13910,7 @@ class ElasticRegistrationView(APIView):
                 for i in range(len(nii_transforms)-1):
                 
                     # Create path for the combined warp field
-                    combined_warp = os.path.join(directory, "extracted", moving_image_name, 
+                    combined_warp = os.path.join(elastic_staging_dir,
                                                 f"{moving_image_name}_edit_{latest_edit}_elastic_fwd.nii.gz")
                     
                     # load the displacement fields in order
@@ -14083,6 +14011,7 @@ class ElasticRegistrationView(APIView):
                         self.registration_tools.save_displacement_field_nifti(
                             composed_file_path, C, fixed_image
                         )
+                        ants_temp_outputs.append(composed_file_path)
                         nii_transforms = nii_transforms[:-2]
                         nii_transforms_inv = nii_transforms_inv[:-1]
                         nii_transforms.append(composed_file_path)
@@ -14102,9 +14031,17 @@ class ElasticRegistrationView(APIView):
 
                 # Inverse on the same FOV-matched grid as the forward field.
                 elastic_inv_path = os.path.join(
-                    directory, "extracted", moving_image_name,
+                    elastic_staging_dir,
                     f"{moving_image_name}_edit_{latest_edit}_elastic_inv.nii.gz",
                 )
+                # The composition arrays are not read past this point (the inverse is
+                # computed from the saved combined warp). Release them now: they are
+                # ~1.6 GB each on the registration grid and would otherwise stay alive
+                # through the full-res steps below and into the next subject's SyN.
+                A = B = B_inv = comp = C = C_resampled = None
+                xx = yy = zz = None
+                inv_field = inv_vox = None
+                src_x = src_y = src_z = None
                 elastic_ants_fwd = ants.image_read(combined_warp)
                 print(f"Loaded now inverting... - Time: {time.time() - start_time:.2f}s")
                 C_ants_inv = ants.invert_displacement_field(elastic_ants_fwd, elastic_ants_fwd)
@@ -14122,16 +14059,16 @@ class ElasticRegistrationView(APIView):
                 
                 for transform in elastix_transform['fwdtransforms']:
                     # determine if transform is affine mat or deformable nii.gz
-                    if transform.endswith('.mat'):                   
-                        shutil.copy(transform, os.path.join(directory, "extracted", moving_image_name, 
+                    if transform.endswith('.mat'):
+                        shutil.copy(transform, os.path.join(elastic_staging_dir,
                                     f"{moving_image_name}_edit_{latest_edit}_elastic_fwd.mat"))
-                        list_of_transforms.append(os.path.join(directory, "extracted", moving_image_name, 
+                        list_of_transforms.append(os.path.join(elastic_staging_dir,
                                         f"{moving_image_name}_edit_{latest_edit}_elastic_fwd.mat"))
                     elif transform.endswith('.nii.gz'):
                         # If this is our combined warp, use a consistent name
-                        output_path = os.path.join(directory, "extracted", moving_image_name, 
+                        output_path = os.path.join(elastic_staging_dir,
                                                 f"{moving_image_name}_edit_{latest_edit}_elastic_fwd.nii.gz")
-                        shutil.copy(transform, output_path)
+                        atomic_copy(transform, output_path)
                         # Shrink-path copies can inherit a wrong pixdim; lock FOV to full-res.
                         self.registration_tools.ensure_displacement_field_fov(
                             output_path, fixed_image, rewrite_in_place=True
@@ -14148,7 +14085,7 @@ class ElasticRegistrationView(APIView):
                     shutil.copy(
                         inv_mat,
                         os.path.join(
-                            directory, "extracted", moving_image_name,
+                            elastic_staging_dir,
                             f"{moving_image_name}_edit_{latest_edit}_elastic_inv.mat",
                         ),
                     )
@@ -14159,14 +14096,23 @@ class ElasticRegistrationView(APIView):
                 )
                 if inv_warp is not None:
                     inv_out = os.path.join(
-                        directory, "extracted", moving_image_name,
+                        elastic_staging_dir,
                         f"{moving_image_name}_edit_{latest_edit}_elastic_inv.nii.gz",
                     )
                     shutil.copy(inv_warp, inv_out)
                     self.registration_tools.ensure_displacement_field_fov(
                         inv_out, fixed_image, rewrite_in_place=True
                     )
-                
+
+            # Both warps now live in the staging folder and list_of_transforms points
+            # there, so the ANTs temp outputs (pass 1, pass 2, affine init, composed
+            # intermediates) are no longer needed. Remove them now instead of at the
+            # start of the next subject: on tmpfs they occupy RAM (~10 GB per subject).
+            _remove_ants_temp_outputs(ants_temp_outputs)
+            ants_temp_outputs = []
+            elastix_transform = None
+            cleanup_memory(stage=f"{moving_image_name}: warps saved")
+
 
 
             # Apply the transformation to the moving image with background value
@@ -14205,7 +14151,11 @@ class ElasticRegistrationView(APIView):
                 )
 
             # Convert the rigid transformed image back to numpy and restore original range
-            moving_image_numpy = moving_image_data_combined.numpy()              
+            moving_image_numpy = moving_image_data_combined.numpy()
+            # Not read again: drop the full-res ANTs copy (and the normalized
+            # registration-grid image kept for distance-map mode).
+            moving_image_data_combined = None
+            moving_image_data_for_transform = None
 
             # Replace all values equal to -1 with the adjusted background value
             moving_image_numpy = np.where(moving_image_numpy == -1, adjusted_background_value, moving_image_numpy)
@@ -14216,6 +14166,7 @@ class ElasticRegistrationView(APIView):
                     moving_image_range[0], 
                     moving_image_range[1]
                 ).astype(original_dtype)
+            cleanup_memory(stage=f"{moving_image_name}: full-res warp applied")
 
             if shrinked:
                 fixed_image_numpy = fixed_image.numpy()
@@ -14419,24 +14370,29 @@ class ElasticRegistrationView(APIView):
 
 
             # Save the transformed image
-            registration_path = os.path.join(directory, "extracted", moving_image_name, f"{moving_image_name}_edit_{latest_edit}_elastic.nii.gz")    
+            registration_path = os.path.join(elastic_staging_dir, f"{moving_image_name}_edit_{latest_edit}_elastic.nii.gz")
             nifti_img = nib.load(moving_image_path)
             elastic_volume_to_save = _moving_volume_for_mesh_reference_save(
                 moving_image_numpy, reference_is_preserved_mesh
             )
             nifti_img = nib.Nifti1Image(elastic_volume_to_save, nifti_img.affine, nifti_img.header)
-            nib.save(nifti_img, registration_path)
+            atomic_nib_save(nifti_img, registration_path)
+            nifti_img = None
+            elastic_volume_to_save = None
+
+            # Lossy mask is saved only after the lossy volume exists (its affine comes
+            # from that file); the mask step below fills this in when it applies.
+            pending_lossy_mask = None
 
             # ---------------------------------------------------------------
             # Paired mask: apply same elastic transformations using nearest neighbor
             # ---------------------------------------------------------------
             try:
-                # Determine source mask base from the latest edit
-                latest_edit_check = 0
-                while glob.glob(os.path.join(directory, "extracted", moving_image_name, f"{moving_image_name}_edit_{latest_edit_check}_*.nii.gz")):
-                    latest_edit_check += 1
-                latest_edit_check -= 2  # Go back to previous edit (before current elastic)
-                
+                # Determine source mask base from the edit before the current elastic.
+                # (Previously derived by counting edits on disk, which included the new
+                # elastic; its outputs now stay in the staging folder until commit.)
+                latest_edit_check = latest_edit - 1
+
                 if latest_edit_check >= 0:
                     latest_files = glob.glob(os.path.join(directory, "extracted", moving_image_name, f"{moving_image_name}_edit_{latest_edit_check}_*.nii.gz"))
                     if latest_files:
@@ -14451,9 +14407,11 @@ class ElasticRegistrationView(APIView):
                 if os.path.isfile(mask_src_path):
                     print(f"Found paired mask for elastic registration: {mask_src_path}")
                     
-                    # Load mask data
-                    mask_src_temp = os.path.join(directory, "extracted", moving_image_name, f"{source_mask_edit_base}_mask.nii.gz")
-                    os.replace(mask_src_path, mask_src_temp)
+                    # Load mask data from a readable copy (NiBabel cannot sniff
+                    # `.nii.mask.gz`). Copying instead of renaming the source means a
+                    # crash here can no longer leave the subject's mask renamed away.
+                    mask_src_temp = os.path.join(elastic_staging_dir, f"{source_mask_edit_base}_source_mask_read.nii.gz")
+                    shutil.copyfile(mask_src_path, mask_src_temp)
                     try:
                         mask_img = nib.load(mask_src_temp)
                         mask_dtype = mask_img.get_data_dtype()
@@ -14501,14 +14459,12 @@ class ElasticRegistrationView(APIView):
                             
                             # Save full-res elastically registered mask
                             new_mask_edit_base = f"{moving_image_name}_edit_{latest_edit}_elastic"
-                            mask_dest_path = os.path.join(directory, "extracted", moving_image_name, f"{new_mask_edit_base}.nii.mask.gz")
-                            mask_dest_temp = os.path.join(directory, "extracted", moving_image_name, f"{new_mask_edit_base}_mask.nii.gz")
-                            lossy_output_path = os.path.join(directory, "extracted", moving_image_name, f"{moving_image_name}_lossy_edit_{latest_edit}_elastic.nii.gz")
-                            
+                            mask_dest_path = os.path.join(elastic_staging_dir, f"{new_mask_edit_base}.nii.mask.gz")
+                            mask_dest_temp = os.path.join(elastic_staging_dir, f"{new_mask_edit_base}_mask.nii.gz")
+
                             # Use the same affine and header as the transformed image
                             original_nifti = nib.load(moving_image_path)
-                            nib.save(nib.Nifti1Image(mask_transformed, original_nifti.affine, original_nifti.header), mask_dest_temp)
-                            os.replace(mask_dest_temp, mask_dest_path)
+                            atomic_nib_save(nib.Nifti1Image(mask_transformed, original_nifti.affine, original_nifti.header), mask_dest_path)
                             print(f"Saved elastically registered mask: {mask_dest_path}")
 
                             # Create lossy mask by downsampling if lossy compression is enabled
@@ -14526,20 +14482,19 @@ class ElasticRegistrationView(APIView):
                                     except Exception:
                                         pass
 
-                                # load the lossy destination nifti image to get the affine
-                                lossy_nifti_img = nib.load(lossy_output_path)
-                                lossy_affine = lossy_nifti_img.affine
-
                                 slices = [slice(None, None, resolution_factor) for _ in range(3)]
-                                lossy_mask = mask_transformed[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
+                                # Contiguous copy so the full-res mask can be freed below.
+                                lossy_mask = np.ascontiguousarray(
+                                    mask_transformed[slices[0], slices[1], slices[2]]
+                                ).astype(mask_dtype, copy=False)
 
-                                lossy_mask_edit_base = f"{moving_image_name}_lossy_edit_{latest_edit}_elastic"
-                                lossy_mask_dest_path = os.path.join(directory, "extracted", moving_image_name, f"{lossy_mask_edit_base}.nii.mask.gz")
-                                lossy_mask_temp = os.path.join(directory, "extracted", moving_image_name, f"{lossy_mask_edit_base}_mask.nii.gz")
-                                nib.save(nib.Nifti1Image(lossy_mask, lossy_affine, original_nifti.header), lossy_mask_temp)
-                                os.replace(lossy_mask_temp, lossy_mask_dest_path)
-                                print(f"Saved lossy elastically registered mask: {lossy_mask_dest_path}")
-                            
+                                # The lossy volume (whose affine this mask must share) is
+                                # written later by save_as_lossy_nifti; reading it here
+                                # failed on every fresh run, so the lossy mask was never
+                                # created. Save it right after the lossy volume instead.
+                                pending_lossy_mask = (lossy_mask, original_nifti.header)
+                                lossy_mask = None
+
                             # Clean up mask processing objects
                             mask_transformed = None
                             original_nifti = None
@@ -14554,8 +14509,13 @@ class ElasticRegistrationView(APIView):
                         cleanup_memory()
                             
                     finally:
-                        # Restore original mask filename
-                        os.replace(mask_src_temp, mask_src_path)
+                        # Drop the readable copy so it is not committed with the outputs
+                        try:
+                            os.remove(mask_src_temp)
+                        except OSError:
+                            pass
+                        mask_img = None
+                        mask_data = None
                 else:
                     print("No paired mask found for elastic registration; skipping mask propagation.")
                     
@@ -14578,6 +14538,10 @@ class ElasticRegistrationView(APIView):
             if quick_registration == 'custom':
                 _elastic_settings['elastic_custom_options'] = elastic_custom_opts
             json_metadata['elastic_settings'] = _elastic_settings
+            if elastic_compute:
+                json_metadata['elastic_compute'] = elastic_compute
+            else:
+                json_metadata.pop('elastic_compute', None)  # never keep a previous run's numbers
             previous_threshold = float(json_metadata.get('threshold', best_threshold))
             previous_stem = (
                 normalize_threshold_edit_stem(
@@ -14591,19 +14555,44 @@ class ElasticRegistrationView(APIView):
             json_metadata['threshold'] = float(best_threshold)
             json_metadata['elastic_shift'] = float(previous_threshold - best_threshold)
             json_metadata['elastic_error'] = float(intensity_mean_absolute_error)
-            with open(os.path.join(directory, "extracted", moving_image_name, f"{moving_image_name}.json"), 'w') as jf:
-                json.dump(json_metadata, jf, indent=4)
+            # Staged copy of the subject JSON: it carries elastic_to, so it is the last
+            # file moved into the subject folder (_commit_elastic_staging_dir).
+            subject_json_basename = f"{moving_image_name}.json"
+            staged_json_path = os.path.join(elastic_staging_dir, subject_json_basename)
+            atomic_write_json(staged_json_path, json_metadata, indent=4)
 
             # Compress the registered image and save it as a lossy version
             # (Must be called after json.dump so save_as_lossy_nifti gets the final word on lossy_compression)
+            lossy_output_path = os.path.join(elastic_staging_dir, f"{moving_image_name}_lossy_edit_{latest_edit}_elastic.nii.gz")
             self.registration_tools.save_as_lossy_nifti(
                     _moving_volume_for_mesh_reference_save(
                         moving_image_numpy, reference_is_preserved_mesh
                     ),
-                    json_metadata['voxel_size'], 
-                    os.path.join(directory, "extracted", moving_image_name, f"{moving_image_name}.json"), 
-                    os.path.join(directory, "extracted", moving_image_name, f"{moving_image_name}_lossy_edit_{latest_edit}_elastic.nii.gz")
+                    json_metadata['voxel_size'],
+                    staged_json_path,
+                    lossy_output_path
                 )
+
+            # Lossy elastic mask, on the same grid/affine as the lossy volume just saved.
+            if pending_lossy_mask is not None:
+                try:
+                    lossy_mask, lossy_mask_header = pending_lossy_mask
+                    lossy_affine = nib.load(lossy_output_path).affine
+                    lossy_mask_edit_base = f"{moving_image_name}_lossy_edit_{latest_edit}_elastic"
+                    lossy_mask_dest_path = os.path.join(elastic_staging_dir, f"{lossy_mask_edit_base}.nii.mask.gz")
+                    lossy_mask_temp = os.path.join(elastic_staging_dir, f"{lossy_mask_edit_base}_mask.nii.gz")
+                    atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine, lossy_mask_header), lossy_mask_dest_path)
+                    print(f"Saved lossy elastically registered mask: {lossy_mask_dest_path}")
+                except Exception as lme:
+                    print(f"Error saving lossy elastic mask for {moving_image_name}: {lme}")
+                finally:
+                    lossy_mask = None
+                    pending_lossy_mask = None
+
+            # Every output for this subject is saved: move them into the subject folder
+            # (JSON last). Until this point a crash leaves only the staging folder.
+            _commit_elastic_staging_dir(subject_scan_dir, subject_json_basename)
+            print(f"Committed elastic outputs for {moving_image_name}")
 
             # --- Memory Cleanup Start ---
             print(f"Cleaning up memory for {moving_image_name}...")
@@ -14624,6 +14613,20 @@ class ElasticRegistrationView(APIView):
             elastic_inv_numpy = None
             overlap = None
             nifti_img = None # Both loaded and created Nifti objects
+            # Previously missed: these kept the last subject's full-res / mask arrays
+            # alive into the next subject's registration.
+            moving_image_mask = None
+            moving_image_data_combined = None
+            moving_image_data_for_transform = None
+            elastic_volume_to_save = None
+            cleaned_data = None
+            _removal_mask = None
+            mask_data = None
+            mask_transformed = None
+            ref_mask_data = None
+            mov_mask_data = None
+            fixed_binary = moving_binary = None
+            fixed_edt = moving_edt = fixed_edt_norm = moving_edt_norm = None
 
             # Explicitly call the cleanup function
             cleanup_memory()
@@ -14674,6 +14677,14 @@ class CreateAtlasView(APIView):
 
     registration_tools = RegistrationTools()
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('create_atlas', lambda request: subject_folders(request.data.get('directory'), ['atlas']))
     def post(self, request, format=None):
         print(request.data)
 
@@ -14715,11 +14726,10 @@ class CreateAtlasView(APIView):
         print(f"reference image: {reference_image}")
 
         # Check if any image is tagged as faulty, the json metadata has a field called faulty
+        # Only real subject folders are considered: folders without <name>.json (e.g. figures_cache
+        # in older projects) are skipped with a warning instead of aborting the atlas build.
         faulty_files = []
-        for file in os.listdir(os.path.join(directory, "extracted")):
-            # Skip project_settings.json file
-            if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                continue
+        for file in list_extracted_scan_names(directory, log_prefix="CreateAtlas"):
             if file != reference:
                 json_path = os.path.join(directory, "extracted", file, f"{file}.json")
                 try:
@@ -14735,10 +14745,8 @@ class CreateAtlasView(APIView):
                     raise
 
         # Get all the directories in the extracted directory except the atlas and any faulty files
-        dataset_images = [f for f in os.listdir(os.path.join(directory, "extracted")) 
-                         if f != reference and f not in faulty_files 
-                         and f != "project_settings.json" 
-                         and os.path.isdir(os.path.join(directory, "extracted", f))]
+        dataset_images = [f for f in list_extracted_scan_names(directory)
+                         if f != reference and f not in faulty_files]
 
         # Find the latest edit of each dataset image that matches with _elastic.nii.gz and their inverse transformation matching with _elastic_inv.nii.gz
         dataset_images_transformed = []
@@ -14975,14 +14983,14 @@ class CreateAtlasView(APIView):
         # Save the average intensity image and the average transformation deformation
         average_intensity_image_path = os.path.join(resolve_atlas_dir(directory), f"{reference}_average_intensity.nii.gz")
         average_forward_transformation_deformation_path = os.path.join(resolve_atlas_dir(directory), f"{reference}_average_forward_transformation_deformation.nii.gz")
-        ants.image_write(average_intensity_image, average_intensity_image_path)
-        nib.save(deformation_field_nifti, average_forward_transformation_deformation_path)
+        atomic_ants_write(average_intensity_image, average_intensity_image_path)
+        atomic_nib_save(deformation_field_nifti, average_forward_transformation_deformation_path)
 
         # Load the average forward transformation deformation
         average_forward_transformation_deformation = ants.image_read(average_forward_transformation_deformation_path)
         average_inverse_transformation_deformation = ants.invert_displacement_field(average_forward_transformation_deformation, average_forward_transformation_deformation)
         average_inverse_transformation_deformation_path = os.path.join(resolve_atlas_dir(directory), f"{reference}_average_inverse_transformation_deformation.nii.gz")
-        ants.image_write(average_inverse_transformation_deformation, average_inverse_transformation_deformation_path)
+        atomic_ants_write(average_inverse_transformation_deformation, average_inverse_transformation_deformation_path)
 
 
         # Save the min max values
@@ -15046,7 +15054,7 @@ class CreateAtlasView(APIView):
 
         # Save the average intensity image transformed aka the atlas
         average_intensity_image_transformed_path = os.path.join(resolve_atlas_dir(directory), f"atlas.nii.gz")
-        ants.image_write(average_intensity_image_transformed_restored, average_intensity_image_transformed_path)
+        atomic_ants_write(average_intensity_image_transformed_restored, average_intensity_image_transformed_path)
 
         # Store as uint16 like every extracted/edited volume: subjects are uint16 and the
         # restored range lies within theirs, so rounding to the nearest integer loses at most
@@ -15057,7 +15065,7 @@ class CreateAtlasView(APIView):
         atlas_header = atlas_written.header.copy()
         atlas_header.set_data_dtype(np.uint16)
         atlas_header.set_slope_inter(1.0, 0.0)
-        nib.save(nib.Nifti1Image(atlas_uint16, atlas_written.affine, atlas_header), average_intensity_image_transformed_path)
+        atomic_nib_save(nib.Nifti1Image(atlas_uint16, atlas_written.affine, atlas_header), average_intensity_image_transformed_path)
         del atlas_written, atlas_uint16
 
         # Copy json metadata from reference image but remove metrics that are not needed
@@ -15075,8 +15083,7 @@ class CreateAtlasView(APIView):
         reference_metadata['alignment_to'] = None
         reference_metadata['landmarks'] = None
         reference_metadata['lossy_compression'] = []
-        with open(os.path.join(resolve_atlas_dir(directory), f"atlas.json"), 'w') as jf:
-            json.dump(reference_metadata, jf, indent=4)
+        atomic_write_json(os.path.join(resolve_atlas_dir(directory), f"atlas.json"), reference_metadata, indent=4)
 
         # Send progress update before each scan is processed
         channel_layer = get_channel_layer()
@@ -15346,6 +15353,10 @@ class RegistrationSubjectDataView(APIView):
 
 
 class PhysicallyAccurateMeshView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def post(self, request, *args, **kwargs):
         try:
             # Get the files
@@ -15404,6 +15415,11 @@ class PhysicallyAccurateMeshView(APIView):
             threshold = metadata['threshold']
             print(f"Using voxel spacing: {spacing}, threshold: {threshold}")
 
+            # Stages for the progress bar (see stepProgress.py).
+            steps = StepProgress(3, filename, 'Creating full-resolution mesh')
+            steps.start()
+            steps(1, 'Loading full-resolution scan')
+
             # Load the nifti file with nibabel
             print("Loading volume data...")
             volume = nib.load(nifti_file).get_fdata()
@@ -15414,6 +15430,7 @@ class PhysicallyAccurateMeshView(APIView):
                 volume = gaussian_filter(volume, sigma=gaussian_blur)
             
             # Generate the mesh using marching cubes
+            steps(2, 'Building surface mesh')
             print(f"Generating mesh with marching cubes at threshold {threshold}...")
             vertices, faces, _, _ = measure.marching_cubes(volume, level=threshold, spacing=(spacing, spacing, spacing))
             """
@@ -15437,6 +15454,7 @@ class PhysicallyAccurateMeshView(APIView):
             faces = faces[:, ::-1]
 
             # Create GLTF object
+            steps(3, 'Writing mesh file')
             print("Creating GLTF object...")
             gltf = pygltflib.GLTF2()
             
@@ -15502,12 +15520,13 @@ class PhysicallyAccurateMeshView(APIView):
             # Save GLB file
             glb_path = os.path.join(directory, sub_path, f"{filename}_mesh.glb")
             print(f"Saving GLB file to: {glb_path}")
-            gltf.save_binary(glb_path)
+            with atomic_output(glb_path) as glb_tmp:
+                gltf.save_binary(glb_tmp)
 
             # Create PLY file using the vertices and faces directly
             ply_path = os.path.join(directory, sub_path, f"{filename}_mesh.ply")
             print(f"Creating PLY file: {ply_path}")
-            with open(ply_path, 'w') as f:
+            with atomic_output(ply_path) as ply_tmp, open(ply_tmp, 'w') as f:
                 # Write PLY header
                 f.write("ply\n")
                 f.write("format ascii 1.0\n")
@@ -15863,6 +15882,10 @@ def _compute_landmark_mesh_distances(landmarks_array, vertices, faces, voxel_siz
     return distances, mean_distance, std_distance, outliers, outliers_six
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _save_landmarks_bundle(
     directory,
     sub_path,
@@ -15878,16 +15901,14 @@ def _save_landmarks_bundle(
     outliers_six,
 ):
     landmarks_path = os.path.join(directory, sub_path, edit + "_landmarks.json")
-    with open(landmarks_path, 'w') as jf:
-        json.dump(landmarks_list, jf, indent=4)
+    atomic_write_json(landmarks_path, landmarks_list, indent=4)
 
     distances_path = os.path.join(directory, sub_path, edit + "_landmark_distances.json")
     distances_dict = {
         'distances': distances.tolist(),
         'snap_distance': None,
     }
-    with open(distances_path, 'w') as jf:
-        json.dump(distances_dict, jf, indent=4)
+    atomic_write_json(distances_path, distances_dict, indent=4)
 
     num_landmarks = len(landmarks_list)
     json_metadata['landmarks'] = {
@@ -15897,11 +15918,18 @@ def _save_landmarks_bundle(
         'outliers': int(outliers) if outliers is not None else None,
         'outliers_six': int(outliers_six) if outliers_six is not None else None,
     }
-    with open(json_path, 'w') as jf:
-        json.dump(json_metadata, jf, indent=4)
+    atomic_write_json(json_path, json_metadata, indent=4)
 
 
 class UploadLandmarksView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('upload_landmarks', lambda request: request_subjects(request, 'filename'))
     def post(self, request, *args, **kwargs):
         try:
             directory = request.data.get('directory')
@@ -16233,6 +16261,10 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
         return displaced_coordinate
 
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def apply_deformation(self, image_path, deformation_field_path, mat_file=None, output_path=None):
         """
         Apply a deformation field to an image while properly handling normalization and background values.
@@ -16305,7 +16337,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
         
         # Save if output path provided
         if output_path:
-            ants.image_write(image_transformed, output_path)
+            atomic_ants_write(image_transformed, output_path)
             print(f"Saved transformed image to: {output_path}")
 
         return image_transformed
@@ -16393,10 +16425,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
 
             # Make a list of faulty files
             faulty_files = []
-            for file in os.listdir(os.path.join(directory, "extracted")):
-                # Skip project_settings.json file
-                if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                    continue
+            for file in list_extracted_scan_names(directory, log_prefix="TransferLandmarks"):
                 if file != reference:
                     json_path = os.path.join(directory, "extracted", file, f"{file}.json")
                     with open(json_path, 'r') as jf:
@@ -16454,7 +16483,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
             print(latest_landmarks_file)
 
             # Load all the folder names inside the extracted folder
-            extracted_folders = os.listdir(os.path.join(directory, "extracted"))
+            extracted_folders = list_extracted_scan_names(directory)
             extracted_folders = [os.path.basename(f) for f in extracted_folders 
                                if f != reference and f not in faulty_files 
                                and f != "project_settings.json" 
@@ -16529,9 +16558,9 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
             forward_elastic = deformation_back_to_reference['fwdtransforms']
             for transform in forward_elastic:
                 if transform.endswith(".nii.gz"):
-                    shutil.copy(transform, os.path.join(resolve_atlas_dir(directory), "deformation_back_to_reference.nii.gz"))
+                    atomic_copy(transform, os.path.join(resolve_atlas_dir(directory), "deformation_back_to_reference.nii.gz"))
                 if transform.endswith(".mat"):
-                    shutil.copy(transform, os.path.join(resolve_atlas_dir(directory), "deformation_back_to_reference.mat"))
+                    atomic_copy(transform, os.path.join(resolve_atlas_dir(directory), "deformation_back_to_reference.mat"))
 
             deformation_back_to_reference = ants.image_read(os.path.join(resolve_atlas_dir(directory), "deformation_back_to_reference.nii.gz"))
             matrix_back_to_reference = ants.read_transform(os.path.join(resolve_atlas_dir(directory), "deformation_back_to_reference.mat"))        
@@ -16622,14 +16651,10 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                     
                     if os.path.exists(mask_path):
                         temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-                        os.replace(mask_path, temp_mask_path)
-                        try:
-                            mask_data = nib.load(temp_mask_path).get_fdata()
-                            reference_nifti_data = (mask_data == mask_label).astype(float)
-                            reference_nifti_data = gaussian_filter(reference_nifti_data, sigma=0.3)
-                            reference_threshold = 0.5
-                        finally:
-                            os.replace(temp_mask_path, mask_path)
+                        mask_data = load_nifti_readonly(mask_path).get_fdata()
+                        reference_nifti_data = (mask_data == mask_label).astype(float)
+                        reference_nifti_data = gaussian_filter(reference_nifti_data, sigma=0.3)
+                        reference_threshold = 0.5
 
                 data_min, data_max = np.min(reference_nifti_data), np.max(reference_nifti_data)
                 if reference_threshold < data_min or reference_threshold > data_max:
@@ -16681,8 +16706,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
             # Save the landmarks to a json file in the reference folder with the latest edit as the prepend
             landmarks_path = os.path.join(directory, "extracted", reference, f"{reference_file}_landmarks.json")
             print(f"Saving landmarks to {landmarks_path}")
-            with open(landmarks_path, 'w') as jf:
-                json.dump(landmarks_atlas, jf, indent=4)
+            atomic_write_json(landmarks_path, landmarks_atlas, indent=4)
 
             k = 1
 
@@ -16690,77 +16714,82 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
             for folder in extracted_folders:
 
                 # Send progress update before each scan is processed
-                channel_layer = get_channel_layer()
-                if channel_layer is not None:
-                    progress = (k/(total_scans+1))
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': folder,
-                            'custom_message': f'Transferring landmarks to {folder}...',
-                            'total': total_scans+1,
-                            'current': k+1,
-                        }
-                    )
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, folder, 'transfer_landmarks'):
+                    channel_layer = get_channel_layer()
+                    if channel_layer is not None:
+                        progress = (k/(total_scans+1))
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': folder,
+                                'custom_message': f'Transferring landmarks to {folder}...',
+                                'total': total_scans+1,
+                                'current': k+1,
+                            }
+                        )
 
-                initial_landmark_copy = landmarks_atlas.copy()
+                    initial_landmark_copy = landmarks_atlas.copy()
 
-                # Load the inverse deformation field
-                elastic_fwd_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}*elastic_fwd.nii.gz"))
-                print(elastic_fwd_files)
-                if len(elastic_fwd_files) > 1:
-                    return Response({'message': 'More than one elastic inverse deformation field found in '+folder}, status=status.HTTP_400_BAD_REQUEST)
-                elif len(elastic_fwd_files) == 0 or elastic_fwd_files[0] is None:
-                    path = os.path.join(directory, "extracted", folder, f"{folder}*elastic_fwd.nii.gz")
-                    print(f"No elastic inverse deformation field found in {path}, skipping...")
-                    continue # Skip this subject rather than returning an error
-                    #return Response({'message': 'No elastic inverse deformation field found in '+folder}, status=status.HTTP_400_BAD_REQUEST)
-                else:
-                    elastic_fwd_file = elastic_fwd_files[0]
-                elastic_fwd_file = os.path.join(directory, "extracted", folder, elastic_fwd_files[0])
-                elastic_fwd = ants.image_read(elastic_fwd_file)
-                # Get the deformation field in numpy and invert the vector values so that the landmarks move in the correct direction
-                elastic_fwd = elastic_fwd.numpy()
-                # By trial and error, the x and y vectors need to be inverted, but the z vector does not
-                elastic_fwd[:, :, :, 0] = -elastic_fwd[:, :, :, 0]
-                elastic_fwd[:, :, :, 1] = -elastic_fwd[:, :, :, 1]
-                print(elastic_fwd.shape)
+                    # Load the inverse deformation field
+                    elastic_fwd_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}*elastic_fwd.nii.gz"))
+                    print(elastic_fwd_files)
+                    if len(elastic_fwd_files) > 1:
+                        return Response({'message': 'More than one elastic inverse deformation field found in '+folder}, status=status.HTTP_400_BAD_REQUEST)
+                    elif len(elastic_fwd_files) == 0 or elastic_fwd_files[0] is None:
+                        path = os.path.join(directory, "extracted", folder, f"{folder}*elastic_fwd.nii.gz")
+                        print(f"No elastic inverse deformation field found in {path}, skipping...")
+                        continue # Skip this subject rather than returning an error
+                        #return Response({'message': 'No elastic inverse deformation field found in '+folder}, status=status.HTTP_400_BAD_REQUEST)
+                    else:
+                        elastic_fwd_file = elastic_fwd_files[0]
+                    elastic_fwd_file = os.path.join(directory, "extracted", folder, elastic_fwd_files[0])
+                    elastic_fwd = ants.image_read(elastic_fwd_file)
+                    # Get the deformation field in numpy and invert the vector values so that the landmarks move in the correct direction
+                    elastic_fwd = elastic_fwd.numpy()
+                    # By trial and error, the x and y vectors need to be inverted, but the z vector does not
+                    elastic_fwd[:, :, :, 0] = -elastic_fwd[:, :, :, 0]
+                    elastic_fwd[:, :, :, 1] = -elastic_fwd[:, :, :, 1]
+                    print(elastic_fwd.shape)
 
-                # Find the edit that came before and get the edit file name without the extension
-                edit_number = int(elastic_fwd_files[0].split("_edit_")[1].split("_")[0])
-                previous_edit_number = edit_number - 1
-                folder_scan_dir = os.path.join(directory, "extracted", folder)
-                if previous_edit_number < 0:
-                    # edit_0 elastic maps from raw subject volume (no _edit_ prefix in filename)
-                    edit_nifti_path = os.path.join(folder_scan_dir, f"{folder}.nii.gz")
-                    edit_nifti_path = edit_nifti_path if os.path.isfile(edit_nifti_path) else None
-                else:
-                    edit_nifti_path = _resolve_primary_edit_nifti_path(
-                        folder_scan_dir, folder, edit_number=previous_edit_number
-                    )
-                if not edit_nifti_path:
-                    return Response({'message': 'No edit file found for '+folder}, status=status.HTTP_400_BAD_REQUEST)
-                edit_file = strip_nifti_basename(edit_nifti_path)
+                    # Find the edit that came before and get the edit file name without the extension
+                    edit_number = int(elastic_fwd_files[0].split("_edit_")[1].split("_")[0])
+                    previous_edit_number = edit_number - 1
+                    folder_scan_dir = os.path.join(directory, "extracted", folder)
+                    if previous_edit_number < 0:
+                        # edit_0 elastic maps from raw subject volume (no _edit_ prefix in filename)
+                        edit_nifti_path = os.path.join(folder_scan_dir, f"{folder}.nii.gz")
+                        edit_nifti_path = edit_nifti_path if os.path.isfile(edit_nifti_path) else None
+                    else:
+                        edit_nifti_path = _resolve_primary_edit_nifti_path(
+                            folder_scan_dir, folder, edit_number=previous_edit_number
+                        )
+                    if not edit_nifti_path:
+                        return Response({'message': 'No edit file found for '+folder}, status=status.HTTP_400_BAD_REQUEST)
+                    edit_file = strip_nifti_basename(edit_nifti_path)
             
-                # Skip this folder if landmarks already exist and overwriteExistingLandmarks is False
-                if not overwriteExistingLandmarks:
-                    landmarks_check_path = os.path.join(directory, "extracted", folder, f"{edit_file}_landmarks.json")
-                    if os.path.exists(landmarks_check_path):
-                        print(f"Landmarks already exist for {folder} ({landmarks_check_path}), skipping...")
-                        k += 1
-                        continue
+                    # Skip this folder if landmarks already exist and overwriteExistingLandmarks is False
+                    if not overwriteExistingLandmarks:
+                        landmarks_check_path = os.path.join(directory, "extracted", folder, f"{edit_file}_landmarks.json")
+                        if os.path.exists(landmarks_check_path):
+                            print(f"Landmarks already exist for {folder} ({landmarks_check_path}), skipping...")
+                            k += 1
+                            continue
 
-                print(f"Reference landmarks file: {landmarks_path}\nElastic forward file: {elastic_fwd_file}\nTarget edit file: {edit_file}")
+                    print(f"Reference landmarks file: {landmarks_path}\nElastic forward file: {elastic_fwd_file}\nTarget edit file: {edit_file}")
 
 
-                # Load the nifti header to get shape without loading data
-                current_nifti = nib.load(os.path.join(directory, "extracted", folder, f"{edit_file}.nii.gz"))
-                current_shape = current_nifti.header.get_data_shape()  # Get shape without loading data
-                del current_nifti
+                    # Load the nifti header to get shape without loading data
+                    current_nifti = nib.load(os.path.join(directory, "extracted", folder, f"{edit_file}.nii.gz"))
+                    current_shape = current_nifti.header.get_data_shape()  # Get shape without loading data
+                    del current_nifti
 
-                """ 
+                    """ 
                 atlas_average_intensity = ants.image_read(os.path.join(resolve_atlas_dir(directory), f"{reference}_average_intensity.nii.gz"))
                 latest_subject = ants.image_read(os.path.join(directory, "extracted", folder, edit_file+".nii.gz"))
                 reference_to_subject = ants.registration(
@@ -16774,14 +16803,14 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                 forward_elastic = reference_to_subject['fwdtransforms']
                 for transform in forward_elastic:
                     if transform.endswith(".nii.gz"):
-                        shutil.copy(transform, os.path.join(directory, "extracted", folder, "deformation_from_reference_to_subject.nii.gz"))
+                        atomic_copy(transform, os.path.join(directory, "extracted", folder, "deformation_from_reference_to_subject.nii.gz"))
                         elastic_inv_file = os.path.join(directory, "extracted", folder, "deformation_from_reference_to_subject.nii.gz")
 
                 elastic_inv = ants.image_read(elastic_inv_file)
                 elastic_inv = elastic_inv.numpy()
                 print(elastic_inv.shape) """
 
-                """
+                    """
                 # Search for the inverse .mat file
                 elastic_inv_mat = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}*elastic_inv.mat"))
                 if len(elastic_inv_mat) > 1:
@@ -16811,106 +16840,101 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                 print(f"Reconstruction error: {reconstruction_error}")
                 """
 
-                # Displace the landmarks by the closest field vector
-                for i, landmark_obj in enumerate(initial_landmark_copy):
-                    # Extract position from landmark object
-                    position = landmark_obj['position']
-                    landmark_type = landmark_obj.get('landmark_type', 'main')
-                    # Displace the position
-                    displaced_position = self.displace_coordinate_by_closest_field_vector(position, elastic_fwd, ref_voxel_size, current_shape)
-                    # Update landmark with new position, preserving landmark_type and the
-                    # group / family / semi-parent metadata (see transferred_landmark_row)
-                    initial_landmark_copy[i] = transferred_landmark_row(landmark_obj, displaced_position)
+                    # Displace the landmarks by the closest field vector
+                    for i, landmark_obj in enumerate(initial_landmark_copy):
+                        # Extract position from landmark object
+                        position = landmark_obj['position']
+                        landmark_type = landmark_obj.get('landmark_type', 'main')
+                        # Displace the position
+                        displaced_position = self.displace_coordinate_by_closest_field_vector(position, elastic_fwd, ref_voxel_size, current_shape)
+                        # Update landmark with new position, preserving landmark_type and the
+                        # group / family / semi-parent metadata (see transferred_landmark_row)
+                        initial_landmark_copy[i] = transferred_landmark_row(landmark_obj, displaced_position)
 
-                # Clean up immediately after use
-                del elastic_fwd
-                cleanup_memory()
+                    # Clean up immediately after use
+                    del elastic_fwd
+                    cleanup_memory()
 
-                snap_distance = None
-                if autoSnapToMesh:
-                    # Load the reference nifti data
-                    current_nifti_data = nib.load(os.path.join(directory, "extracted", folder, f"{edit_file}.nii.gz"))
-                    current_nifti_data_type = current_nifti_data.get_data_dtype()
-                    current_nifti_data = current_nifti_data.get_fdata().astype(current_nifti_data_type)
-                    current_nifti_data = gaussian_filter(current_nifti_data, sigma=0.3)
+                    snap_distance = None
+                    if autoSnapToMesh:
+                        # Load the reference nifti data
+                        current_nifti_data = nib.load(os.path.join(directory, "extracted", folder, f"{edit_file}.nii.gz"))
+                        current_nifti_data_type = current_nifti_data.get_data_dtype()
+                        current_nifti_data = current_nifti_data.get_fdata().astype(current_nifti_data_type)
+                        current_nifti_data = gaussian_filter(current_nifti_data, sigma=0.3)
 
-                    # Load json metadata
-                    with open(os.path.join(directory, "extracted", folder, f"{folder}.json"), 'r') as jf:
-                        current_json_metadata = json.load(jf)
-                    current_threshold = current_json_metadata['threshold']
-                    current_voxel_size = current_json_metadata['voxel_size']
+                        # Load json metadata
+                        with open(os.path.join(directory, "extracted", folder, f"{folder}.json"), 'r') as jf:
+                            current_json_metadata = json.load(jf)
+                        current_threshold = current_json_metadata['threshold']
+                        current_voxel_size = current_json_metadata['voxel_size']
 
-                    # Add validation:
-                    if np.any(np.isnan(current_nifti_data)) or np.any(np.isinf(current_nifti_data)):
-                        print(f"ERROR: Invalid values in nifti data for {edit_file}")
-                        # Either skip or fix the data
-                        current_nifti_data = np.nan_to_num(current_nifti_data, nan=0.0, posinf=0.0, neginf=0.0)
+                        # Add validation:
+                        if np.any(np.isnan(current_nifti_data)) or np.any(np.isinf(current_nifti_data)):
+                            print(f"ERROR: Invalid values in nifti data for {edit_file}")
+                            # Either skip or fix the data
+                            current_nifti_data = np.nan_to_num(current_nifti_data, nan=0.0, posinf=0.0, neginf=0.0)
 
-                    if prefer_mask:
-                        mask_path = os.path.join(directory, "extracted", folder, f"{edit_file}.nii.mask.gz")
-                        if not os.path.exists(mask_path):
-                            mask_path = os.path.join(directory, "extracted", folder, f"{folder}.nii.mask.gz")
+                        if prefer_mask:
+                            mask_path = os.path.join(directory, "extracted", folder, f"{edit_file}.nii.mask.gz")
+                            if not os.path.exists(mask_path):
+                                mask_path = os.path.join(directory, "extracted", folder, f"{folder}.nii.mask.gz")
 
-                        if os.path.exists(mask_path):
-                            temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-                            os.replace(mask_path, temp_mask_path)
-                            try:
-                                mask_data = nib.load(temp_mask_path).get_fdata()
+                            if os.path.exists(mask_path):
+                                temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
+                                mask_data = load_nifti_readonly(mask_path).get_fdata()
                                 current_nifti_data = (mask_data == mask_label).astype(float)
                                 current_nifti_data = gaussian_filter(current_nifti_data, sigma=0.3)
                                 current_threshold = 0.5
-                            finally:
-                                os.replace(temp_mask_path, mask_path)
 
-                    data_min, data_max = np.min(current_nifti_data), np.max(current_nifti_data)
-                    if current_threshold < data_min or current_threshold > data_max:
-                        print(f"WARNING: Threshold {current_threshold} outside data range [{data_min}, {data_max}]")
-                        current_threshold = np.clip(current_threshold, data_min, data_max)
+                        data_min, data_max = np.min(current_nifti_data), np.max(current_nifti_data)
+                        if current_threshold < data_min or current_threshold > data_max:
+                            print(f"WARNING: Threshold {current_threshold} outside data range [{data_min}, {data_max}]")
+                            current_threshold = np.clip(current_threshold, data_min, data_max)
 
-                    # Create the mesh
-                    vertices, faces, _, _ = measure.marching_cubes(current_nifti_data, level=current_threshold, spacing=(current_voxel_size, current_voxel_size, current_voxel_size))
+                        # Create the mesh
+                        vertices, faces, _, _ = measure.marching_cubes(current_nifti_data, level=current_threshold, spacing=(current_voxel_size, current_voxel_size, current_voxel_size))
 
-                    if use_outer_shell:
-                        # Invert face normals so get_outer_mesh selects the outer surface
-                        faces = faces[:, ::-1]
-                        vertices, faces = alpaca.get_outer_mesh(vertices, faces)
+                        if use_outer_shell:
+                            # Invert face normals so get_outer_mesh selects the outer surface
+                            faces = faces[:, ::-1]
+                            vertices, faces = alpaca.get_outer_mesh(vertices, faces)
 
-                    try:
-                        # Extract positions for snapping
-                        positions_only = np.array([lm['position'] for lm in initial_landmark_copy])
-                        snapped_positions, snap_distance = self.snap_landmarks_to_mesh(positions_only, vertices, faces, current_voxel_size)
-                        # Update landmarks with snapped positions, preserving landmark_type
-                        for i, lm in enumerate(initial_landmark_copy):
-                            lm['position'] = snapped_positions[i].tolist() if hasattr(snapped_positions[i], 'tolist') else list(snapped_positions[i])
-                    except Exception as e:
-                        print(f"Error snapping landmarks to mesh: {e}")
+                        try:
+                            # Extract positions for snapping
+                            positions_only = np.array([lm['position'] for lm in initial_landmark_copy])
+                            snapped_positions, snap_distance = self.snap_landmarks_to_mesh(positions_only, vertices, faces, current_voxel_size)
+                            # Update landmarks with snapped positions, preserving landmark_type
+                            for i, lm in enumerate(initial_landmark_copy):
+                                lm['position'] = snapped_positions[i].tolist() if hasattr(snapped_positions[i], 'tolist') else list(snapped_positions[i])
+                        except Exception as e:
+                            print(f"Error snapping landmarks to mesh: {e}")
 
-                # Perform distance analysis (extract positions only)
-                positions_array = np.array([lm['position'] for lm in initial_landmark_copy])
-                self.distance_analysis(directory, folder, edit_file, positions_array, snap_distance)
+                    # Perform distance analysis (extract positions only)
+                    positions_array = np.array([lm['position'] for lm in initial_landmark_copy])
+                    self.distance_analysis(directory, folder, edit_file, positions_array, snap_distance)
 
-                # Save the landmarks
-                landmarks_path = os.path.join(directory, "extracted", folder, f"{edit_file}_landmarks.json")
-                print(f"Saving landmarks to {landmarks_path}")
-                with open(landmarks_path, 'w') as jf:
-                    json.dump(initial_landmark_copy, jf, indent=4)
+                    # Save the landmarks
+                    landmarks_path = os.path.join(directory, "extracted", folder, f"{edit_file}_landmarks.json")
+                    print(f"Saving landmarks to {landmarks_path}")
+                    atomic_write_json(landmarks_path, initial_landmark_copy, indent=4)
 
-                # Clean up memory after each subject
-                del initial_landmark_copy
+                    # Clean up memory after each subject
+                    del initial_landmark_copy
                 
-                # Clean up snap-to-mesh related objects
-                if autoSnapToMesh:
-                    del current_nifti_data, vertices, faces
-                    # Clean up snapped_landmarks if it was created
-                    if 'snapped_landmarks' in locals():
-                        del snapped_landmarks
-                    # Clean up snap_distance if it's not None
-                    if snap_distance is not None:
-                        del snap_distance
+                    # Clean up snap-to-mesh related objects
+                    if autoSnapToMesh:
+                        del current_nifti_data, vertices, faces
+                        # Clean up snapped_landmarks if it was created
+                        if 'snapped_landmarks' in locals():
+                            del snapped_landmarks
+                        # Clean up snap_distance if it's not None
+                        if snap_distance is not None:
+                            del snap_distance
                 
-                cleanup_memory()
+                    cleanup_memory()
 
-                k += 1
+                    k += 1
         # ------------------------ Landmarks from Reference to Subjects ------------------------
         elif transferType == "reference-to-subjects":
             print(f"Transferring landmarks from {reference} to subjects in {directory}")
@@ -16918,10 +16942,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
 
             # Make a list of faulty files
             faulty_files = []
-            for file in os.listdir(os.path.join(directory, "extracted")):
-                # Skip project_settings.json file
-                if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                    continue
+            for file in list_extracted_scan_names(directory, log_prefix="TransferLandmarks"):
                 if file != reference:
                     json_path = os.path.join(directory, "extracted", file, f"{file}.json")
                     with open(json_path, 'r') as jf:
@@ -16930,7 +16951,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                             faulty_files.append(file)
 
             # Load all the folder names inside the extracted folder
-            extracted_folders = os.listdir(os.path.join(directory, "extracted"))
+            extracted_folders = list_extracted_scan_names(directory)
             extracted_folders = [os.path.basename(f) for f in extracted_folders 
                                if f != reference and f not in faulty_files 
                                and f != "project_settings.json" 
@@ -17024,190 +17045,190 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
             for folder in extracted_folders:
 
                 # Send progress update before each scan is processed
-                channel_layer = get_channel_layer()
-                if channel_layer is not None:
-                    progress = (k/(total_scans))
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': folder,
-                            'custom_message': f'Transferring landmarks to {folder}...',
-                            'total': total_scans,
-                            'current': k+1,
-                        }
-                    )
-
-                initial_landmark_copy = landmarks_ref.copy()
-
-                # Preserved-mesh subjects have no deformation field to walk; instead, adopt the
-                # coordinate of the nearest vertex on the pre-elastic edit (see
-                # transfer_reference_landmarks_to_mesh_subject). Route them separately and move on.
-                _, folder_metadata_for_transfer = self._load_metadata(directory, folder)
-                if is_preserved_mesh_metadata(folder_metadata_for_transfer):
-                    try:
-                        edit_stem = self.transfer_reference_landmarks_to_mesh_subject(
-                            directory, folder, reference, initial_landmark_copy,
-                            overwrite_existing=overwriteExistingLandmarks,
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, folder, 'transfer_landmarks'):
+                    channel_layer = get_channel_layer()
+                    if channel_layer is not None:
+                        progress = (k/(total_scans))
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': folder,
+                                'custom_message': f'Transferring landmarks to {folder}...',
+                                'total': total_scans,
+                                'current': k+1,
+                            }
                         )
-                        if edit_stem is None:
-                            print(f"No elastic mesh edit found for {folder}, skipping...")
-                    except Exception as exc:
-                        print(f"Error transferring landmarks to mesh subject {folder}: {exc}")
-                    k += 1
-                    continue
 
-                # Load the forward deformation field
-                elastic_fwd_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}*elastic_fwd.nii.gz"))
-                print(f"Looking for elastic_fwd files in folder '{folder}': {elastic_fwd_files}")
-                
-                if len(elastic_fwd_files) > 1:
-                    return Response({'message': 'More than one elastic inverse deformation field found in '+folder}, status=status.HTTP_400_BAD_REQUEST)
-                elif len(elastic_fwd_files) == 0:
-                    path = os.path.join(directory, "extracted", folder, f"{folder}*elastic_fwd.nii.gz")
-                    print(f"No elastic forward deformation field found in {path}, skipping...")
-                    continue # Skip this subject rather than returning an error
-                else:
-                    elastic_fwd_file = elastic_fwd_files[0]
-                elastic_fwd_file = os.path.join(directory, "extracted", folder, elastic_fwd_files[0])
-                elastic_fwd = ants.image_read(elastic_fwd_file)
-                # Get the deformation field in numpy and invert the vector values so that the landmarks move in the correct direction
-                elastic_fwd = elastic_fwd.numpy()
-                # By trial and error, the x and y vectors need to be inverted, but the z vector does not
-                elastic_fwd[:, :, :, 0] = -elastic_fwd[:, :, :, 0]
-                elastic_fwd[:, :, :, 1] = -elastic_fwd[:, :, :, 1]
-                print(elastic_fwd.shape)
+                    initial_landmark_copy = landmarks_ref.copy()
 
-                # Find the edit that came before and get the edit file name without the extension
-                edit_number = int(elastic_fwd_files[0].split("_edit_")[1].split("_")[0])
-                previous_edit_number = edit_number - 1
-                folder_scan_dir = os.path.join(directory, "extracted", folder)
-                if previous_edit_number < 0:
-                    # edit_0 elastic maps from raw subject volume (no _edit_ prefix in filename)
-                    edit_nifti_path = os.path.join(folder_scan_dir, f"{folder}.nii.gz")
-                    edit_nifti_path = edit_nifti_path if os.path.isfile(edit_nifti_path) else None
-                else:
-                    edit_nifti_path = _resolve_primary_edit_nifti_path(
-                        folder_scan_dir, folder, edit_number=previous_edit_number
-                    )
-                if not edit_nifti_path:
-                    return Response({'message': 'No edit file found for '+folder}, status=status.HTTP_400_BAD_REQUEST)
-                edit_file = strip_nifti_basename(edit_nifti_path)
-
-
-                # Skip this folder if landmarks already exist and overwriteExistingLandmarks is False
-                if not overwriteExistingLandmarks:
-                    landmarks_check_path = os.path.join(directory, "extracted", folder, f"{edit_file}_landmarks.json")
-                    if os.path.exists(landmarks_check_path):
-                        print(f"Landmarks already exist for {folder} ({landmarks_check_path}), skipping...")
+                    # Preserved-mesh subjects have no deformation field to walk; instead, adopt the
+                    # coordinate of the nearest vertex on the pre-elastic edit (see
+                    # transfer_reference_landmarks_to_mesh_subject). Route them separately and move on.
+                    _, folder_metadata_for_transfer = self._load_metadata(directory, folder)
+                    if is_preserved_mesh_metadata(folder_metadata_for_transfer):
+                        try:
+                            edit_stem = self.transfer_reference_landmarks_to_mesh_subject(
+                                directory, folder, reference, initial_landmark_copy,
+                                overwrite_existing=overwriteExistingLandmarks,
+                            )
+                            if edit_stem is None:
+                                print(f"No elastic mesh edit found for {folder}, skipping...")
+                        except Exception as exc:
+                            print(f"Error transferring landmarks to mesh subject {folder}: {exc}")
                         k += 1
                         continue
 
-                print(f"Reference landmarks file: {landmarks_path}\nElastic forward file: {elastic_fwd_file}\nTarget edit file: {edit_file}")
+                    # Load the forward deformation field
+                    elastic_fwd_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}*elastic_fwd.nii.gz"))
+                    print(f"Looking for elastic_fwd files in folder '{folder}': {elastic_fwd_files}")
+                
+                    if len(elastic_fwd_files) > 1:
+                        return Response({'message': 'More than one elastic inverse deformation field found in '+folder}, status=status.HTTP_400_BAD_REQUEST)
+                    elif len(elastic_fwd_files) == 0:
+                        path = os.path.join(directory, "extracted", folder, f"{folder}*elastic_fwd.nii.gz")
+                        print(f"No elastic forward deformation field found in {path}, skipping...")
+                        continue # Skip this subject rather than returning an error
+                    else:
+                        elastic_fwd_file = elastic_fwd_files[0]
+                    elastic_fwd_file = os.path.join(directory, "extracted", folder, elastic_fwd_files[0])
+                    elastic_fwd = ants.image_read(elastic_fwd_file)
+                    # Get the deformation field in numpy and invert the vector values so that the landmarks move in the correct direction
+                    elastic_fwd = elastic_fwd.numpy()
+                    # By trial and error, the x and y vectors need to be inverted, but the z vector does not
+                    elastic_fwd[:, :, :, 0] = -elastic_fwd[:, :, :, 0]
+                    elastic_fwd[:, :, :, 1] = -elastic_fwd[:, :, :, 1]
+                    print(elastic_fwd.shape)
 
-                # Load the nifti header to get shape without loading data
-                current_nifti = nib.load(os.path.join(directory, "extracted", folder, f"{edit_file}.nii.gz"))
-                current_shape = current_nifti.header.get_data_shape()  # Get shape without loading data
-                del current_nifti
+                    # Find the edit that came before and get the edit file name without the extension
+                    edit_number = int(elastic_fwd_files[0].split("_edit_")[1].split("_")[0])
+                    previous_edit_number = edit_number - 1
+                    folder_scan_dir = os.path.join(directory, "extracted", folder)
+                    if previous_edit_number < 0:
+                        # edit_0 elastic maps from raw subject volume (no _edit_ prefix in filename)
+                        edit_nifti_path = os.path.join(folder_scan_dir, f"{folder}.nii.gz")
+                        edit_nifti_path = edit_nifti_path if os.path.isfile(edit_nifti_path) else None
+                    else:
+                        edit_nifti_path = _resolve_primary_edit_nifti_path(
+                            folder_scan_dir, folder, edit_number=previous_edit_number
+                        )
+                    if not edit_nifti_path:
+                        return Response({'message': 'No edit file found for '+folder}, status=status.HTTP_400_BAD_REQUEST)
+                    edit_file = strip_nifti_basename(edit_nifti_path)
 
-                # Displace the landmarks by the closest field vector
-                for i, landmark_obj in enumerate(initial_landmark_copy):
-                    # Extract position from landmark object
-                    position = landmark_obj['position']
-                    landmark_type = landmark_obj.get('landmark_type', 'main')
-                    # Displace the position
-                    displaced_position = self.displace_coordinate_by_closest_field_vector(position, elastic_fwd, ref_voxel_size, current_shape)
-                    # Update landmark with new position, preserving landmark_type and the
-                    # group / family / semi-parent metadata (see transferred_landmark_row)
-                    initial_landmark_copy[i] = transferred_landmark_row(landmark_obj, displaced_position)
 
-                # Clean up immediately after use
-                del elastic_fwd
-                cleanup_memory()
+                    # Skip this folder if landmarks already exist and overwriteExistingLandmarks is False
+                    if not overwriteExistingLandmarks:
+                        landmarks_check_path = os.path.join(directory, "extracted", folder, f"{edit_file}_landmarks.json")
+                        if os.path.exists(landmarks_check_path):
+                            print(f"Landmarks already exist for {folder} ({landmarks_check_path}), skipping...")
+                            k += 1
+                            continue
 
-                snap_distance = None
-                if autoSnapToMesh:
-                    # Load the reference nifti data
-                    current_nifti_data = nib.load(os.path.join(directory, "extracted", folder, f"{edit_file}.nii.gz"))
-                    current_nifti_data_type = current_nifti_data.get_data_dtype()
-                    current_nifti_data = current_nifti_data.get_fdata().astype(current_nifti_data_type)
-                    current_nifti_data = gaussian_filter(current_nifti_data, sigma=0.3)
+                    print(f"Reference landmarks file: {landmarks_path}\nElastic forward file: {elastic_fwd_file}\nTarget edit file: {edit_file}")
 
-                    # Load json metadata
-                    with open(os.path.join(directory, "extracted", folder, f"{folder}.json"), 'r') as jf:
-                        current_json_metadata = json.load(jf)
-                    current_threshold = current_json_metadata['threshold']
-                    current_voxel_size = current_json_metadata['voxel_size']
+                    # Load the nifti header to get shape without loading data
+                    current_nifti = nib.load(os.path.join(directory, "extracted", folder, f"{edit_file}.nii.gz"))
+                    current_shape = current_nifti.header.get_data_shape()  # Get shape without loading data
+                    del current_nifti
 
-                    # Add validation:
-                    if np.any(np.isnan(current_nifti_data)) or np.any(np.isinf(current_nifti_data)):
-                        print(f"ERROR: Invalid values in nifti data for {edit_file}")
-                        # Either skip or fix the data
-                        current_nifti_data = np.nan_to_num(current_nifti_data, nan=0.0, posinf=0.0, neginf=0.0)
+                    # Displace the landmarks by the closest field vector
+                    for i, landmark_obj in enumerate(initial_landmark_copy):
+                        # Extract position from landmark object
+                        position = landmark_obj['position']
+                        landmark_type = landmark_obj.get('landmark_type', 'main')
+                        # Displace the position
+                        displaced_position = self.displace_coordinate_by_closest_field_vector(position, elastic_fwd, ref_voxel_size, current_shape)
+                        # Update landmark with new position, preserving landmark_type and the
+                        # group / family / semi-parent metadata (see transferred_landmark_row)
+                        initial_landmark_copy[i] = transferred_landmark_row(landmark_obj, displaced_position)
 
-                    if prefer_mask:
-                        mask_path = os.path.join(directory, "extracted", folder, f"{edit_file}.nii.mask.gz")
-                        if not os.path.exists(mask_path):
-                            mask_path = os.path.join(directory, "extracted", folder, f"{folder}.nii.mask.gz")
+                    # Clean up immediately after use
+                    del elastic_fwd
+                    cleanup_memory()
 
-                        if os.path.exists(mask_path):
-                            temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-                            os.replace(mask_path, temp_mask_path)
-                            try:
-                                mask_data = nib.load(temp_mask_path).get_fdata()
+                    snap_distance = None
+                    if autoSnapToMesh:
+                        # Load the reference nifti data
+                        current_nifti_data = nib.load(os.path.join(directory, "extracted", folder, f"{edit_file}.nii.gz"))
+                        current_nifti_data_type = current_nifti_data.get_data_dtype()
+                        current_nifti_data = current_nifti_data.get_fdata().astype(current_nifti_data_type)
+                        current_nifti_data = gaussian_filter(current_nifti_data, sigma=0.3)
+
+                        # Load json metadata
+                        with open(os.path.join(directory, "extracted", folder, f"{folder}.json"), 'r') as jf:
+                            current_json_metadata = json.load(jf)
+                        current_threshold = current_json_metadata['threshold']
+                        current_voxel_size = current_json_metadata['voxel_size']
+
+                        # Add validation:
+                        if np.any(np.isnan(current_nifti_data)) or np.any(np.isinf(current_nifti_data)):
+                            print(f"ERROR: Invalid values in nifti data for {edit_file}")
+                            # Either skip or fix the data
+                            current_nifti_data = np.nan_to_num(current_nifti_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+                        if prefer_mask:
+                            mask_path = os.path.join(directory, "extracted", folder, f"{edit_file}.nii.mask.gz")
+                            if not os.path.exists(mask_path):
+                                mask_path = os.path.join(directory, "extracted", folder, f"{folder}.nii.mask.gz")
+
+                            if os.path.exists(mask_path):
+                                temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
+                                mask_data = load_nifti_readonly(mask_path).get_fdata()
                                 current_nifti_data = (mask_data == mask_label).astype(float)
                                 current_nifti_data = gaussian_filter(current_nifti_data, sigma=0.3)
                                 current_threshold = 0.5
-                            finally:
-                                os.replace(temp_mask_path, mask_path)
 
-                    data_min, data_max = np.min(current_nifti_data), np.max(current_nifti_data)
-                    if current_threshold < data_min or current_threshold > data_max:
-                        print(f"WARNING: Threshold {current_threshold} outside data range [{data_min}, {data_max}]")
-                        current_threshold = np.clip(current_threshold, data_min, data_max)
+                        data_min, data_max = np.min(current_nifti_data), np.max(current_nifti_data)
+                        if current_threshold < data_min or current_threshold > data_max:
+                            print(f"WARNING: Threshold {current_threshold} outside data range [{data_min}, {data_max}]")
+                            current_threshold = np.clip(current_threshold, data_min, data_max)
 
-                    # Create the mesh
-                    vertices, faces, _, _ = measure.marching_cubes(current_nifti_data, level=current_threshold, spacing=(current_voxel_size, current_voxel_size, current_voxel_size))
+                        # Create the mesh
+                        vertices, faces, _, _ = measure.marching_cubes(current_nifti_data, level=current_threshold, spacing=(current_voxel_size, current_voxel_size, current_voxel_size))
 
-                    if use_outer_shell:
-                        # Invert face normals so get_outer_mesh selects the outer surface
-                        faces = faces[:, ::-1]
-                        vertices, faces = alpaca.get_outer_mesh(vertices, faces)
+                        if use_outer_shell:
+                            # Invert face normals so get_outer_mesh selects the outer surface
+                            faces = faces[:, ::-1]
+                            vertices, faces = alpaca.get_outer_mesh(vertices, faces)
 
-                    try:
-                        # Extract positions for snapping
-                        positions_only = np.array([lm['position'] for lm in initial_landmark_copy])
-                        snapped_positions, snap_distance = self.snap_landmarks_to_mesh(positions_only, vertices, faces, current_voxel_size)
-                        # Update landmarks with snapped positions, preserving landmark_type
-                        for i, lm in enumerate(initial_landmark_copy):
-                            lm['position'] = snapped_positions[i].tolist() if hasattr(snapped_positions[i], 'tolist') else list(snapped_positions[i])
-                    except Exception as e:
-                        print(f"Error snapping landmarks to mesh: {e}")
+                        try:
+                            # Extract positions for snapping
+                            positions_only = np.array([lm['position'] for lm in initial_landmark_copy])
+                            snapped_positions, snap_distance = self.snap_landmarks_to_mesh(positions_only, vertices, faces, current_voxel_size)
+                            # Update landmarks with snapped positions, preserving landmark_type
+                            for i, lm in enumerate(initial_landmark_copy):
+                                lm['position'] = snapped_positions[i].tolist() if hasattr(snapped_positions[i], 'tolist') else list(snapped_positions[i])
+                        except Exception as e:
+                            print(f"Error snapping landmarks to mesh: {e}")
 
-                # Perform distance analysis (extract positions only)
-                positions_array = np.array([lm['position'] for lm in initial_landmark_copy])
-                self.distance_analysis(directory, folder, edit_file, positions_array, snap_distance)
+                    # Perform distance analysis (extract positions only)
+                    positions_array = np.array([lm['position'] for lm in initial_landmark_copy])
+                    self.distance_analysis(directory, folder, edit_file, positions_array, snap_distance)
 
-                # Save the landmarks
-                landmarks_path = os.path.join(directory, "extracted", folder, f"{edit_file}_landmarks.json")
-                print(f"Saving landmarks to {landmarks_path}")
-                with open(landmarks_path, 'w') as jf:
-                    json.dump(initial_landmark_copy, jf, indent=4)
+                    # Save the landmarks
+                    landmarks_path = os.path.join(directory, "extracted", folder, f"{edit_file}_landmarks.json")
+                    print(f"Saving landmarks to {landmarks_path}")
+                    atomic_write_json(landmarks_path, initial_landmark_copy, indent=4)
 
-                # Clean up memory after each subject
-                del initial_landmark_copy
-                if 'current_nifti_data' in locals():
-                    del current_nifti_data
-                if 'vertices' in locals():
-                    del vertices, faces  
-                if 'snapped_landmarks' in locals():
-                    del snapped_landmarks
-                if snap_distance is not None:
-                    del snap_distance
-                cleanup_memory()
+                    # Clean up memory after each subject
+                    del initial_landmark_copy
+                    if 'current_nifti_data' in locals():
+                        del current_nifti_data
+                    if 'vertices' in locals():
+                        del vertices, faces  
+                    if 'snapped_landmarks' in locals():
+                        del snapped_landmarks
+                    if snap_distance is not None:
+                        del snap_distance
+                    cleanup_memory()
 
-                k += 1
+                    k += 1
         # ------------------------ Landmarks from Reference to Atlas ------------------------
         elif transferType == "reference-to-atlas":
 
@@ -17331,14 +17352,10 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                     mask_path = os.path.join(resolve_atlas_dir(directory), "atlas.nii.mask.gz")
                     if os.path.exists(mask_path):
                         temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-                        os.replace(mask_path, temp_mask_path)
-                        try:
-                            mask_data = nib.load(temp_mask_path).get_fdata()
-                            atlas_nifti_data = (mask_data == mask_label).astype(float)
-                            atlas_nifti_data = gaussian_filter(atlas_nifti_data, sigma=0.3)
-                            atlas_threshold = 0.5
-                        finally:
-                            os.replace(temp_mask_path, mask_path)
+                        mask_data = load_nifti_readonly(mask_path).get_fdata()
+                        atlas_nifti_data = (mask_data == mask_label).astype(float)
+                        atlas_nifti_data = gaussian_filter(atlas_nifti_data, sigma=0.3)
+                        atlas_threshold = 0.5
 
                 data_min, data_max = np.min(atlas_nifti_data), np.max(atlas_nifti_data)
                 if atlas_threshold < data_min or atlas_threshold > data_max:
@@ -17370,8 +17387,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
             # Save the landmarks
             landmarks_path = os.path.join(resolve_atlas_dir(directory), "atlas_landmarks.json")
             print(f"Saving landmarks to {landmarks_path}")
-            with open(landmarks_path, 'w') as jf:
-                json.dump(landmarks, jf, indent=4)
+            atomic_write_json(landmarks_path, landmarks, indent=4)
 
         # ------------------------ Landmarks from Selected Subject to Reference ------------------------
         elif transferType == "subject-to-reference":
@@ -17639,16 +17655,12 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                             )
                         if os.path.exists(mask_path):
                             temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-                            os.replace(mask_path, temp_mask_path)
-                            try:
-                                mask_data = nib.load(temp_mask_path).get_fdata()
-                                reference_nifti_data = (mask_data == mask_label).astype(float)
-                                reference_nifti_data = gaussian_filter(
-                                    reference_nifti_data, sigma=0.3
-                                )
-                                reference_threshold = 0.5
-                            finally:
-                                os.replace(temp_mask_path, mask_path)
+                            mask_data = load_nifti_readonly(mask_path).get_fdata()
+                            reference_nifti_data = (mask_data == mask_label).astype(float)
+                            reference_nifti_data = gaussian_filter(
+                                reference_nifti_data, sigma=0.3
+                            )
+                            reference_threshold = 0.5
 
                     data_min, data_max = np.min(reference_nifti_data), np.max(reference_nifti_data)
                     if reference_threshold < data_min or reference_threshold > data_max:
@@ -17705,14 +17717,12 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                         dist_payload = {}
                     dist_payload['transfer_query_mean_mm'] = float(np.mean(transfer_distances))
                     dist_payload['transfer_query_max_mm'] = float(np.max(transfer_distances))
-                    with open(distances_path, 'w') as jf:
-                        json.dump(dist_payload, jf, indent=4)
+                    atomic_write_json(distances_path, dist_payload, indent=4)
                 except Exception as e:
                     print(f"Warning: could not merge transfer distances: {e}")
 
             print(f"Saving landmarks to {landmarks_out_path}")
-            with open(landmarks_out_path, 'w') as jf:
-                json.dump(landmarks, jf, indent=4)
+            atomic_write_json(landmarks_out_path, landmarks, indent=4)
 
             if channel_layer is not None:
                 async_to_sync(channel_layer.group_send)(
@@ -17818,6 +17828,10 @@ class PropagateMaskView(APIView):
             print(f"Skipping preserved mesh subjects for mask propagation: {skipped_meshes}")
         return voxel_folders
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def propagate_mask_with_field(self, mask_path, displacement_field_path, 
                                    source_image_path, target_image_path,
                                    output_path, target_lossy_image_path=None, lossy_output_path=None, 
@@ -17873,130 +17887,119 @@ class PropagateMaskView(APIView):
                     inv_sibling, fov_image, rewrite_in_place=True
                 )
         
-        # Temporarily rename mask for loading
+        # Read in place (crash-safe rule 2): the mask is never renamed to be read.
         mask_src_path = mask_path
         mask_temp_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-        os.replace(mask_src_path, mask_temp_path)
         
-        try:
-            # Load mask data using nibabel
-            mask_img = nib.load(mask_temp_path)
-            mask_dtype = mask_img.get_data_dtype()
-            # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-            mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
-            
-            print(f"Loaded mask with shape {mask_data.shape} and dtype {mask_dtype}")
-            print(f"Mask data value range: {mask_data.min()} to {mask_data.max()}")
-            
-            # Create lightweight proxy for ANTs target image using the actual target image
-            proxy_array = np.zeros(target_image.numpy().shape, dtype=np.float32)
-            target_proxy = ants.from_numpy(
-                proxy_array,
-                spacing=target_image.spacing,
-                origin=target_image.origin,
-                direction=target_image.direction
-            )
-            
-            # Convert mask to ANTs image using SOURCE image metadata (must match mask's original space)
-            mask_ants = ants.from_numpy(
-                mask_data.astype(np.float32),
-                spacing=source_image.spacing,
-                origin=source_image.origin,
-                direction=source_image.direction
-            )
-            
-            print(f"Mask ANTs spacing: {mask_ants.spacing}, origin: {mask_ants.origin}")
-            
-            # Apply displacement field with nearest neighbor interpolation
-            print(f"Applying displacement field: {displacement_field_path}")
-            mask_transformed_ants = ants.apply_transforms(
-                fixed=target_proxy,
-                moving=mask_ants,
-                transformlist=[displacement_field_path],
-                defaultvalue=0,
-                singleprecision=False,  # Use double precision for safety
-                interpolator='nearestNeighbor',
-                verbose=True  # Enable verbose output for debugging
-            )
-            
-            # Convert back to numpy
-            if hasattr(mask_transformed_ants, "numpy"):
-                mask_transformed = mask_transformed_ants.numpy().astype(mask_dtype)
+        # Load mask data using nibabel
+        mask_img = load_nifti_readonly(mask_src_path)
+        mask_dtype = mask_img.get_data_dtype()
+        # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
+        mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+        
+        print(f"Loaded mask with shape {mask_data.shape} and dtype {mask_dtype}")
+        print(f"Mask data value range: {mask_data.min()} to {mask_data.max()}")
+        
+        # Create lightweight proxy for ANTs target image using the actual target image
+        proxy_array = np.zeros(target_image.numpy().shape, dtype=np.float32)
+        target_proxy = ants.from_numpy(
+            proxy_array,
+            spacing=target_image.spacing,
+            origin=target_image.origin,
+            direction=target_image.direction
+        )
+        
+        # Convert mask to ANTs image using SOURCE image metadata (must match mask's original space)
+        mask_ants = ants.from_numpy(
+            mask_data.astype(np.float32),
+            spacing=source_image.spacing,
+            origin=source_image.origin,
+            direction=source_image.direction
+        )
+        
+        print(f"Mask ANTs spacing: {mask_ants.spacing}, origin: {mask_ants.origin}")
+        
+        # Apply displacement field with nearest neighbor interpolation
+        print(f"Applying displacement field: {displacement_field_path}")
+        mask_transformed_ants = ants.apply_transforms(
+            fixed=target_proxy,
+            moving=mask_ants,
+            transformlist=[displacement_field_path],
+            defaultvalue=0,
+            singleprecision=False,  # Use double precision for safety
+            interpolator='nearestNeighbor',
+            verbose=True  # Enable verbose output for debugging
+        )
+        
+        # Convert back to numpy
+        if hasattr(mask_transformed_ants, "numpy"):
+            mask_transformed = mask_transformed_ants.numpy().astype(mask_dtype)
 
-                if selected_label is not None and selected_label > 0:
-                    # Merge: keep every label in the existing destination mask except
-                    # the one being propagated, which is replaced by the incoming region.
-                    if os.path.exists(output_path):
-                        mask_merge_read_temp = output_path.replace('.nii.mask.gz', '_mask_merge_read_temp.nii.gz')
-                        os.replace(output_path, mask_merge_read_temp)
-                        try:
-                            mask_dest = nib.load(mask_merge_read_temp)
-                            # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-                            mask_dest_data = np.round(mask_dest.get_fdata()).astype(mask_dtype)
-                            if mask_dest_data.shape != mask_transformed.shape:
-                                raise ValueError(
-                                    f"Cannot merge selected_label: existing mask shape {mask_dest_data.shape} "
-                                    f"!= propagated mask shape {mask_transformed.shape}"
-                                )
-                            cleaned = np.where(mask_dest_data == selected_label, 0, mask_dest_data).astype(mask_dtype)
-                            mask_transformed = np.where(mask_transformed == selected_label, selected_label, cleaned).astype(mask_dtype)
-                        finally:
-                            os.replace(mask_merge_read_temp, output_path)
-                
-                print(f"Transformed mask shape: {mask_transformed.shape}, value range: {mask_transformed.min()} to {mask_transformed.max()}")
-                
-                # Save full-resolution mask using target image's affine
-                mask_save_temp = output_path.replace('.nii.mask.gz', '_mask_save_temp.nii.gz')
-                
-                # Load target image with nibabel to get proper affine and header
-                target_nifti = nib.load(target_image_path)
-                nib.save(nib.Nifti1Image(mask_transformed, target_nifti.affine, target_nifti.header), mask_save_temp)
-                os.replace(mask_save_temp, output_path)
-                print(f"Saved propagated mask: {output_path}")
+            if selected_label is not None and selected_label > 0:
+                # Merge: keep every label in the existing destination mask except
+                # the one being propagated, which is replaced by the incoming region.
+                if os.path.exists(output_path):
+                    mask_merge_read_temp = output_path.replace('.nii.mask.gz', '_mask_merge_read_temp.nii.gz')
+                    mask_dest = load_nifti_readonly(output_path)
+                    # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
+                    mask_dest_data = np.round(mask_dest.get_fdata()).astype(mask_dtype)
+                    if mask_dest_data.shape != mask_transformed.shape:
+                        raise ValueError(
+                            f"Cannot merge selected_label: existing mask shape {mask_dest_data.shape} "
+                            f"!= propagated mask shape {mask_transformed.shape}"
+                        )
+                    cleaned = np.where(mask_dest_data == selected_label, 0, mask_dest_data).astype(mask_dtype)
+                    mask_transformed = np.where(mask_transformed == selected_label, selected_label, cleaned).astype(mask_dtype)
+            
+            print(f"Transformed mask shape: {mask_transformed.shape}, value range: {mask_transformed.min()} to {mask_transformed.max()}")
+            
+            # Save full-resolution mask using target image's affine
+            mask_save_temp = output_path.replace('.nii.mask.gz', '_mask_save_temp.nii.gz')
+            
+            # Load target image with nibabel to get proper affine and header
+            target_nifti = nib.load(target_image_path)
+            atomic_nib_save(nib.Nifti1Image(mask_transformed, target_nifti.affine, target_nifti.header), output_path)
+            print(f"Saved propagated mask: {output_path}")
 
-                # Create lossy mask if requested
-                if lossy_output_path and json_metadata and target_lossy_image_path:
-                    # load the lossy destination nifti image to get the affine
-                    target_lossy_nifti = nib.load(target_lossy_image_path)
-                    resolution_factor = 2
-                    lc = json_metadata.get('lossy_compression', None)
-                    if isinstance(lc, list) and len(lc) > 0:
-                        try:
-                            resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
-                        except Exception:
-                            pass
-                    elif isinstance(lc, dict) and lc:
-                        try:
-                            resolution_factor = int(lc.get('resolution_factor', resolution_factor))
-                        except Exception:
-                            pass
-                    
-                    slices = [slice(None, None, resolution_factor) for _ in range(3)]
-                    lossy_mask = mask_transformed[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
-                    
-                    lossy_mask_temp = lossy_output_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-                    nib.save(nib.Nifti1Image(lossy_mask, target_lossy_nifti.affine, target_lossy_nifti.header), lossy_mask_temp)
-                    os.replace(lossy_mask_temp, lossy_output_path)
-                    print(f"Saved lossy propagated mask: {lossy_output_path}")
+            # Create lossy mask if requested
+            if lossy_output_path and json_metadata and target_lossy_image_path:
+                # load the lossy destination nifti image to get the affine
+                target_lossy_nifti = nib.load(target_lossy_image_path)
+                resolution_factor = 2
+                lc = json_metadata.get('lossy_compression', None)
+                if isinstance(lc, list) and len(lc) > 0:
+                    try:
+                        resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
+                    except Exception:
+                        pass
+                elif isinstance(lc, dict) and lc:
+                    try:
+                        resolution_factor = int(lc.get('resolution_factor', resolution_factor))
+                    except Exception:
+                        pass
                 
-                # Clean up
-                mask_transformed = None
-            else:
-                print("ANTs returned unexpected type for mask transformation; skipping.")
+                slices = [slice(None, None, resolution_factor) for _ in range(3)]
+                lossy_mask = mask_transformed[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
+                
+                lossy_mask_temp = lossy_output_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
+                atomic_nib_save(nib.Nifti1Image(lossy_mask, target_lossy_nifti.affine, target_lossy_nifti.header), lossy_output_path)
+                print(f"Saved lossy propagated mask: {lossy_output_path}")
             
-            # Clean up ANTs objects
-            mask_ants = None
-            mask_transformed_ants = None
-            target_proxy = None
-            proxy_array = None
-            source_image = None
-            target_image = None
-            fov_image = None
-            cleanup_memory()
+            # Clean up
+            mask_transformed = None
+        else:
+            print("ANTs returned unexpected type for mask transformation; skipping.")
+        
+        # Clean up ANTs objects
+        mask_ants = None
+        mask_transformed_ants = None
+        target_proxy = None
+        proxy_array = None
+        source_image = None
+        target_image = None
+        fov_image = None
+        cleanup_memory()
             
-        finally:
-            # Restore original mask filename
-            os.replace(mask_temp_path, mask_src_path)
 
     def post(self, request, *args, **kwargs):
         directory = request.data.get('directory')
@@ -18049,9 +18052,7 @@ class PropagateMaskView(APIView):
             
             # Make a list of faulty files
             faulty_files = []
-            for file in os.listdir(os.path.join(directory, "extracted")):
-                if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                    continue
+            for file in list_extracted_scan_names(directory, log_prefix="PropagateMask"):
                 if file != reference:
                     json_path = os.path.join(directory, "extracted", file, f"{file}.json")
                     with open(json_path, 'r') as jf:
@@ -18128,10 +18129,8 @@ class PropagateMaskView(APIView):
                 ref_metadata = json.load(jf)
             
             # Get all extracted folders
-            extracted_folders = [f for f in os.listdir(os.path.join(directory, "extracted"))
-                               if f != reference and f not in faulty_files
-                               and f != "project_settings.json"
-                               and os.path.isdir(os.path.join(directory, "extracted", f))]
+            extracted_folders = [f for f in list_extracted_scan_names(directory)
+                               if f != reference and f not in faulty_files]
             extracted_folders.sort()
             extracted_folders = self._filter_voxel_extracted_folders(directory, extracted_folders)
             if not extracted_folders:
@@ -18222,144 +18221,149 @@ class PropagateMaskView(APIView):
             # Propagate to each subject
             for idx, folder in enumerate(extracted_folders):
                 # Send progress update
-                if channel_layer is not None:
-                    progress = (idx + 1) / total_scans
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': folder,
-                            'custom_message': f'Propagating mask to {folder}...',
-                            'total': total_scans,
-                            'current': idx + 2,
-                        }
-                    )
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, folder, 'propagate_mask'):
+                    if channel_layer is not None:
+                        progress = (idx + 1) / total_scans
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': folder,
+                                'custom_message': f'Propagating mask to {folder}...',
+                                'total': total_scans,
+                                'current': idx + 2,
+                            }
+                        )
                 
-                # Find elastic inverse deformation field (prefer highest _edit_N_)
-                elastic_inv_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}*elastic_inv.nii.gz"))
-                if len(elastic_inv_files) == 0:
-                    print(f"No elastic inverse deformation field found for {folder}, skipping...")
-                    continue
-                elif len(elastic_inv_files) > 1:
-                    elastic_inv_file = self._latest_elastic_inv_file(elastic_inv_files)
-                    print(
-                        f"Warning: Multiple elastic inverse fields found for {folder}, "
-                        f"using latest edit: {os.path.basename(elastic_inv_file)}"
-                    )
-                else:
-                    elastic_inv_file = elastic_inv_files[0]
-                
-                # Determine the edit number and target file
-                edit_number = int(os.path.basename(elastic_inv_file).split("_edit_")[1].split("_")[0])
-                previous_edit_number = edit_number - 1
-                
-                if previous_edit_number >= 0:
-                    edit_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}_edit_{previous_edit_number}*.nii.gz"))
-                    if edit_files:
-                        target_edit_base = os.path.basename(edit_files[0]).replace('.nii.gz', '')
-                        target_image_path = edit_files[0]
-                        target_lossy_image_path = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}_lossy_edit_{previous_edit_number}*.nii.gz"))[0]
-                    else:
-                        print(f"No edit file found for {folder}, skipping...")
+                    # Find elastic inverse deformation field (prefer highest _edit_N_)
+                    elastic_inv_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}*elastic_inv.nii.gz"))
+                    if len(elastic_inv_files) == 0:
+                        print(f"No elastic inverse deformation field found for {folder}, skipping...")
                         continue
-                else:
-                    target_edit_base = folder
-                    target_image_path = os.path.join(directory, "extracted", folder, f"{folder}.nii.gz")
-                    target_lossy_image_path = os.path.join(directory, "extracted", folder, f"{folder}_lossy.nii.gz")
-
-                # Load target image properties
-                target_img = ants.image_read(target_image_path)
-                target_spacing = target_img.spacing
-                target_origin = target_img.origin
-                target_direction = target_img.direction
-                target_shape = target_img.numpy().shape
+                    elif len(elastic_inv_files) > 1:
+                        elastic_inv_file = self._latest_elastic_inv_file(elastic_inv_files)
+                        print(
+                            f"Warning: Multiple elastic inverse fields found for {folder}, "
+                            f"using latest edit: {os.path.basename(elastic_inv_file)}"
+                        )
+                    else:
+                        elastic_inv_file = elastic_inv_files[0]
                 
-                # Load metadata
-                with open(os.path.join(directory, "extracted", folder, f"{folder}.json"), 'r') as jf:
-                    folder_metadata = json.load(jf)
+                    # Determine the edit number and target file
+                    edit_number = int(os.path.basename(elastic_inv_file).split("_edit_")[1].split("_")[0])
+                    previous_edit_number = edit_number - 1
                 
-                # Output paths
-                subject_dir = os.path.join(directory, "extracted", folder)
-                mask_output = os.path.join(subject_dir, f"{target_edit_base}.nii.mask.gz")
-                mask_lossy_output = self._lossy_mask_path_for_fullres_edit(subject_dir, target_edit_base)
+                    if previous_edit_number >= 0:
+                        edit_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}_edit_{previous_edit_number}*.nii.gz"))
+                        if edit_files:
+                            target_edit_base = os.path.basename(edit_files[0]).replace('.nii.gz', '')
+                            target_image_path = edit_files[0]
+                            target_lossy_image_path = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}_lossy_edit_{previous_edit_number}*.nii.gz"))[0]
+                        else:
+                            print(f"No edit file found for {folder}, skipping...")
+                            continue
+                    else:
+                        target_edit_base = folder
+                        target_image_path = os.path.join(directory, "extracted", folder, f"{folder}.nii.gz")
+                        target_lossy_image_path = os.path.join(directory, "extracted", folder, f"{folder}_lossy.nii.gz")
+
+                    # Load target image properties
+                    target_img = ants.image_read(target_image_path)
+                    target_spacing = target_img.spacing
+                    target_origin = target_img.origin
+                    target_direction = target_img.direction
+                    target_shape = target_img.numpy().shape
                 
-                # First apply reference mask through its elastic field
-                self.propagate_mask_with_field(
-                    mask_path=ref_mask_output,
-                    displacement_field_path=elastic_inv_file,
-                    source_image_path=reference_image_path,
-                    target_image_path=target_image_path,
-                    output_path=mask_output,
-                    target_lossy_image_path=target_lossy_image_path,
-                    lossy_output_path=mask_lossy_output,
-                    json_metadata=folder_metadata,
-                    selected_label=selected_label
-                )
-
-                # The elastic edit is registered to reference space, so the
-                # reference-space mask applies to it directly — copy without transform.
-                elastic_mask_path = os.path.join(
-                    directory, "extracted", folder,
-                    f"{folder}_edit_{edit_number}_elastic.nii.mask.gz"
-                )
-                elastic_mask_lossy_path = os.path.join(
-                    directory, "extracted", folder,
-                    f"{folder}_lossy_edit_{edit_number}_elastic.nii.mask.gz"
-                )
-                self._copy_mask_to_elastic_edit(
-                    source_mask_path=ref_mask_output,
-                    elastic_mask_path=elastic_mask_path,
-                    elastic_mask_lossy_path=elastic_mask_lossy_path,
-                    folder_metadata=folder_metadata,
-                    selected_label=selected_label,
-                )
-
-                try:
-                    from .pipeline_log import merge_mask_workflow_metadata
-                    from datetime import datetime, timezone
-                    merge_mask_workflow_metadata(directory, folder, {
-                        "propagated": True,
-                        "propagation": {
-                            "transfer_type": "atlas-to-subjects",
-                            "source": "atlas",
-                            "selected_label": selected_label,
-                            "do_ai": bool(do_ai),
-                            "do_threshold": bool(do_threshold),
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                        },
-                    })
-                except Exception as _mw_err:
-                    print(f"Warning: mask_workflow metadata update failed for {folder}: {_mw_err}")
-
-                # Post-processing: apply threshold
-                if do_threshold:
-                    subject_threshold = folder_metadata.get('threshold', 0)
-                    self._apply_threshold_to_mask(
-                        mask_path=mask_output,
-                        image_path=target_image_path,
-                        threshold=subject_threshold,
+                    # Load metadata
+                    with open(os.path.join(directory, "extracted", folder, f"{folder}.json"), 'r') as jf:
+                        folder_metadata = json.load(jf)
+                
+                    # Output paths
+                    subject_dir = os.path.join(directory, "extracted", folder)
+                    mask_output = os.path.join(subject_dir, f"{target_edit_base}.nii.mask.gz")
+                    mask_lossy_output = self._lossy_mask_path_for_fullres_edit(subject_dir, target_edit_base)
+                
+                    # First apply reference mask through its elastic field
+                    self.propagate_mask_with_field(
+                        mask_path=ref_mask_output,
+                        displacement_field_path=elastic_inv_file,
+                        source_image_path=reference_image_path,
+                        target_image_path=target_image_path,
+                        output_path=mask_output,
+                        target_lossy_image_path=target_lossy_image_path,
                         lossy_output_path=mask_lossy_output,
                         json_metadata=folder_metadata,
                         selected_label=selected_label
                     )
 
-                # Post-processing: run AI segmentation
-                if do_ai and ai_model:
-                    self._run_ai_segmentation_on_mask(
-                        directory=directory,
-                        subject=folder,
-                        edit=target_edit_base,
-                        model=ai_model,
-                        mask_path=mask_output,
-                        lossy_output_path=mask_lossy_output,
-                        json_metadata=folder_metadata,
-                        selected_label=selected_label
+                    # The elastic edit is registered to reference space, so the
+                    # reference-space mask applies to it directly — copy without transform.
+                    elastic_mask_path = os.path.join(
+                        directory, "extracted", folder,
+                        f"{folder}_edit_{edit_number}_elastic.nii.mask.gz"
                     )
+                    elastic_mask_lossy_path = os.path.join(
+                        directory, "extracted", folder,
+                        f"{folder}_lossy_edit_{edit_number}_elastic.nii.mask.gz"
+                    )
+                    self._copy_mask_to_elastic_edit(
+                        source_mask_path=ref_mask_output,
+                        elastic_mask_path=elastic_mask_path,
+                        elastic_mask_lossy_path=elastic_mask_lossy_path,
+                        folder_metadata=folder_metadata,
+                        selected_label=selected_label,
+                    )
+
+                    try:
+                        from .pipeline_log import merge_mask_workflow_metadata
+                        from datetime import datetime, timezone
+                        merge_mask_workflow_metadata(directory, folder, {
+                            "propagated": True,
+                            "propagation": {
+                                "transfer_type": "atlas-to-subjects",
+                                "source": "atlas",
+                                "selected_label": selected_label,
+                                "do_ai": bool(do_ai),
+                                "do_threshold": bool(do_threshold),
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                            },
+                        })
+                    except Exception as _mw_err:
+                        print(f"Warning: mask_workflow metadata update failed for {folder}: {_mw_err}")
+
+                    # Post-processing: apply threshold
+                    if do_threshold:
+                        subject_threshold = folder_metadata.get('threshold', 0)
+                        self._apply_threshold_to_mask(
+                            mask_path=mask_output,
+                            image_path=target_image_path,
+                            threshold=subject_threshold,
+                            lossy_output_path=mask_lossy_output,
+                            json_metadata=folder_metadata,
+                            selected_label=selected_label
+                        )
+
+                    # Post-processing: run AI segmentation
+                    if do_ai and ai_model:
+                        self._run_ai_segmentation_on_mask(
+                            directory=directory,
+                            subject=folder,
+                            edit=target_edit_base,
+                            model=ai_model,
+                            mask_path=mask_output,
+                            lossy_output_path=mask_lossy_output,
+                            json_metadata=folder_metadata,
+                            selected_label=selected_label
+                        )
                 
-                # Clean up
-                target_img = None
-                cleanup_memory()
+                    # Clean up
+                    target_img = None
+                    cleanup_memory()
             
             # Final progress update
             if channel_layer is not None:
@@ -18383,9 +18387,7 @@ class PropagateMaskView(APIView):
             
             # Make a list of faulty files
             faulty_files = []
-            for file in os.listdir(os.path.join(directory, "extracted")):
-                if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                    continue
+            for file in list_extracted_scan_names(directory, log_prefix="PropagateMask"):
                 if file != reference:
                     json_path = os.path.join(directory, "extracted", file, f"{file}.json")
                     with open(json_path, 'r') as jf:
@@ -18439,10 +18441,8 @@ class PropagateMaskView(APIView):
             print(f"Using reference image: {reference_image_path}")
             
             # Get all extracted folders
-            extracted_folders = [f for f in os.listdir(os.path.join(directory, "extracted"))
-                               if f != reference and f not in faulty_files
-                               and f != "project_settings.json"
-                               and os.path.isdir(os.path.join(directory, "extracted", f))]
+            extracted_folders = [f for f in list_extracted_scan_names(directory)
+                               if f != reference and f not in faulty_files]
             extracted_folders.sort()
             extracted_folders = self._filter_voxel_extracted_folders(directory, extracted_folders)
             if not extracted_folders:
@@ -18463,145 +18463,150 @@ class PropagateMaskView(APIView):
             # Propagate to each subject
             for idx, folder in enumerate(extracted_folders):
                 # Send progress update
-                channel_layer = get_channel_layer()
-                if channel_layer is not None:
-                    progress = idx / total_scans
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': folder,
-                            'custom_message': f'Propagating reference mask to {folder}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, folder, 'propagate_mask'):
+                    channel_layer = get_channel_layer()
+                    if channel_layer is not None:
+                        progress = idx / total_scans
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': folder,
+                                'custom_message': f'Propagating reference mask to {folder}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
                 
-                # Find elastic inverse deformation field (prefer highest _edit_N_)
-                elastic_inv_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}*elastic_inv.nii.gz"))
-                if len(elastic_inv_files) == 0:
-                    print(f"No elastic inverse deformation field found for {folder}, skipping...")
-                    continue
-                elif len(elastic_inv_files) > 1:
-                    elastic_inv_file = self._latest_elastic_inv_file(elastic_inv_files)
-                    print(
-                        f"Warning: Multiple elastic inverse fields found for {folder}, "
-                        f"using latest edit: {os.path.basename(elastic_inv_file)}"
-                    )
-                else:
-                    elastic_inv_file = elastic_inv_files[0]
-                
-                # Determine the edit number and target file
-                edit_number = int(os.path.basename(elastic_inv_file).split("_edit_")[1].split("_")[0])
-                previous_edit_number = edit_number - 1
-                
-                if previous_edit_number >= 0:
-                    edit_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}_edit_{previous_edit_number}*.nii.gz"))
-                    if edit_files:
-                        target_edit_base = os.path.basename(edit_files[0]).replace('.nii.gz', '')
-                        target_image_path = edit_files[0]
-                        target_lossy_image_path = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}_lossy_edit_{previous_edit_number}*.nii.gz"))[0]
-                    else:
-                        print(f"No edit file found for {folder}, skipping...")
+                    # Find elastic inverse deformation field (prefer highest _edit_N_)
+                    elastic_inv_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}*elastic_inv.nii.gz"))
+                    if len(elastic_inv_files) == 0:
+                        print(f"No elastic inverse deformation field found for {folder}, skipping...")
                         continue
-                else:
-                    target_edit_base = folder
-                    target_image_path = os.path.join(directory, "extracted", folder, f"{folder}.nii.gz")
-                    target_lossy_image_path = os.path.join(directory, "extracted", folder, f"{folder}_lossy.nii.gz")
+                    elif len(elastic_inv_files) > 1:
+                        elastic_inv_file = self._latest_elastic_inv_file(elastic_inv_files)
+                        print(
+                            f"Warning: Multiple elastic inverse fields found for {folder}, "
+                            f"using latest edit: {os.path.basename(elastic_inv_file)}"
+                        )
+                    else:
+                        elastic_inv_file = elastic_inv_files[0]
                 
-                # Load target image properties
-                target_img = ants.image_read(target_image_path)
-                target_spacing = target_img.spacing
-                target_origin = target_img.origin
-                target_direction = target_img.direction
-                target_shape = target_img.numpy().shape
+                    # Determine the edit number and target file
+                    edit_number = int(os.path.basename(elastic_inv_file).split("_edit_")[1].split("_")[0])
+                    previous_edit_number = edit_number - 1
                 
-                # Load metadata
-                with open(os.path.join(directory, "extracted", folder, f"{folder}.json"), 'r') as jf:
-                    folder_metadata = json.load(jf)
+                    if previous_edit_number >= 0:
+                        edit_files = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}_edit_{previous_edit_number}*.nii.gz"))
+                        if edit_files:
+                            target_edit_base = os.path.basename(edit_files[0]).replace('.nii.gz', '')
+                            target_image_path = edit_files[0]
+                            target_lossy_image_path = glob.glob(os.path.join(directory, "extracted", folder, f"{folder}_lossy_edit_{previous_edit_number}*.nii.gz"))[0]
+                        else:
+                            print(f"No edit file found for {folder}, skipping...")
+                            continue
+                    else:
+                        target_edit_base = folder
+                        target_image_path = os.path.join(directory, "extracted", folder, f"{folder}.nii.gz")
+                        target_lossy_image_path = os.path.join(directory, "extracted", folder, f"{folder}_lossy.nii.gz")
                 
-                # Output paths
-                subject_dir = os.path.join(directory, "extracted", folder)
-                mask_output = os.path.join(subject_dir, f"{target_edit_base}.nii.mask.gz")
-                mask_lossy_output = self._lossy_mask_path_for_fullres_edit(subject_dir, target_edit_base)
+                    # Load target image properties
+                    target_img = ants.image_read(target_image_path)
+                    target_spacing = target_img.spacing
+                    target_origin = target_img.origin
+                    target_direction = target_img.direction
+                    target_shape = target_img.numpy().shape
                 
-                # Propagate mask
-                self.propagate_mask_with_field(
-                    mask_path=reference_mask_path,
-                    displacement_field_path=elastic_inv_file,
-                    source_image_path=reference_image_path,
-                    target_image_path=target_image_path,
-                    output_path=mask_output,
-                    target_lossy_image_path=target_lossy_image_path,
-                    lossy_output_path=mask_lossy_output,
-                    json_metadata=folder_metadata,
-                    selected_label=selected_label
-                )
-
-                # The elastic edit is registered to reference space, so the
-                # reference-space mask applies to it directly — copy without transform.
-                elastic_mask_path = os.path.join(
-                    directory, "extracted", folder,
-                    f"{folder}_edit_{edit_number}_elastic.nii.mask.gz"
-                )
-                elastic_mask_lossy_path = os.path.join(
-                    directory, "extracted", folder,
-                    f"{folder}_lossy_edit_{edit_number}_elastic.nii.mask.gz"
-                )
-                self._copy_mask_to_elastic_edit(
-                    source_mask_path=reference_mask_path,
-                    elastic_mask_path=elastic_mask_path,
-                    elastic_mask_lossy_path=elastic_mask_lossy_path,
-                    folder_metadata=folder_metadata,
-                    selected_label=selected_label,
-                )
-
-                try:
-                    from .pipeline_log import merge_mask_workflow_metadata
-                    from datetime import datetime, timezone
-                    merge_mask_workflow_metadata(directory, folder, {
-                        "propagated": True,
-                        "propagation": {
-                            "transfer_type": "reference-to-subjects",
-                            "source": reference,
-                            "selected_label": selected_label,
-                            "do_ai": bool(do_ai),
-                            "do_threshold": bool(do_threshold),
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                        },
-                    })
-                except Exception as _mw_err:
-                    print(f"Warning: mask_workflow metadata update failed for {folder}: {_mw_err}")
-
-                # Post-processing: apply threshold 
-                if do_threshold:
-                    subject_threshold = folder_metadata.get('threshold', 0)
-                    self._apply_threshold_to_mask(
-                        mask_path=mask_output,
-                        image_path=target_image_path,
-                        threshold=subject_threshold,
+                    # Load metadata
+                    with open(os.path.join(directory, "extracted", folder, f"{folder}.json"), 'r') as jf:
+                        folder_metadata = json.load(jf)
+                
+                    # Output paths
+                    subject_dir = os.path.join(directory, "extracted", folder)
+                    mask_output = os.path.join(subject_dir, f"{target_edit_base}.nii.mask.gz")
+                    mask_lossy_output = self._lossy_mask_path_for_fullres_edit(subject_dir, target_edit_base)
+                
+                    # Propagate mask
+                    self.propagate_mask_with_field(
+                        mask_path=reference_mask_path,
+                        displacement_field_path=elastic_inv_file,
+                        source_image_path=reference_image_path,
+                        target_image_path=target_image_path,
+                        output_path=mask_output,
+                        target_lossy_image_path=target_lossy_image_path,
                         lossy_output_path=mask_lossy_output,
                         json_metadata=folder_metadata,
                         selected_label=selected_label
                     )
 
-                # Post-processing: run AI segmentation
-                if do_ai and ai_model:
-                    self._run_ai_segmentation_on_mask(
-                        directory=directory,
-                        subject=folder,
-                        edit=target_edit_base,
-                        model=ai_model,
-                        mask_path=mask_output,
-                        lossy_output_path=mask_lossy_output,
-                        json_metadata=folder_metadata,
-                        selected_label=selected_label
+                    # The elastic edit is registered to reference space, so the
+                    # reference-space mask applies to it directly — copy without transform.
+                    elastic_mask_path = os.path.join(
+                        directory, "extracted", folder,
+                        f"{folder}_edit_{edit_number}_elastic.nii.mask.gz"
                     )
+                    elastic_mask_lossy_path = os.path.join(
+                        directory, "extracted", folder,
+                        f"{folder}_lossy_edit_{edit_number}_elastic.nii.mask.gz"
+                    )
+                    self._copy_mask_to_elastic_edit(
+                        source_mask_path=reference_mask_path,
+                        elastic_mask_path=elastic_mask_path,
+                        elastic_mask_lossy_path=elastic_mask_lossy_path,
+                        folder_metadata=folder_metadata,
+                        selected_label=selected_label,
+                    )
+
+                    try:
+                        from .pipeline_log import merge_mask_workflow_metadata
+                        from datetime import datetime, timezone
+                        merge_mask_workflow_metadata(directory, folder, {
+                            "propagated": True,
+                            "propagation": {
+                                "transfer_type": "reference-to-subjects",
+                                "source": reference,
+                                "selected_label": selected_label,
+                                "do_ai": bool(do_ai),
+                                "do_threshold": bool(do_threshold),
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                            },
+                        })
+                    except Exception as _mw_err:
+                        print(f"Warning: mask_workflow metadata update failed for {folder}: {_mw_err}")
+
+                    # Post-processing: apply threshold 
+                    if do_threshold:
+                        subject_threshold = folder_metadata.get('threshold', 0)
+                        self._apply_threshold_to_mask(
+                            mask_path=mask_output,
+                            image_path=target_image_path,
+                            threshold=subject_threshold,
+                            lossy_output_path=mask_lossy_output,
+                            json_metadata=folder_metadata,
+                            selected_label=selected_label
+                        )
+
+                    # Post-processing: run AI segmentation
+                    if do_ai and ai_model:
+                        self._run_ai_segmentation_on_mask(
+                            directory=directory,
+                            subject=folder,
+                            edit=target_edit_base,
+                            model=ai_model,
+                            mask_path=mask_output,
+                            lossy_output_path=mask_lossy_output,
+                            json_metadata=folder_metadata,
+                            selected_label=selected_label
+                        )
                                 
-                # Clean up
-                target_img = None
-                cleanup_memory()
+                    # Clean up
+                    target_img = None
+                    cleanup_memory()
             
             # Final progress update
             channel_layer = get_channel_layer()
@@ -19026,6 +19031,10 @@ class PropagateMaskView(APIView):
 
 
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _apply_threshold_to_mask(self, mask_path, image_path, threshold, lossy_output_path=None, json_metadata=None, selected_label=None):
         """
         Apply threshold to full-resolution mask, optionally creating lossy version.
@@ -19039,12 +19048,8 @@ class PropagateMaskView(APIView):
         """
         mask_temp_path = None
         try:
-            # Temporarily rename mask for loading
-            mask_temp_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-            os.replace(mask_path, mask_temp_path)
-            
-            # Load mask
-            mask_img = nib.load(mask_temp_path)
+            # Read in place (crash-safe rule 2): the mask is never renamed to be read.
+            mask_img = load_nifti_readonly(mask_path)
             # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
             mask_data = np.round(mask_img.get_fdata()).astype(mask_img.get_data_dtype())
             
@@ -19066,8 +19071,7 @@ class PropagateMaskView(APIView):
             
             
             # Save thresholded full-res mask
-            nib.save(nib.Nifti1Image(thresholded_mask, mask_img.affine, mask_img.header), mask_temp_path)
-            os.replace(mask_temp_path, mask_path)
+            atomic_nib_save(nib.Nifti1Image(thresholded_mask, mask_img.affine, mask_img.header), mask_path)
             
             voxels_removed = np.sum(mask_data > 0) - np.sum(thresholded_mask > 0)
             print(f"Applied threshold {threshold}: removed {voxels_removed} voxels from mask")
@@ -19101,11 +19105,7 @@ class PropagateMaskView(APIView):
                     
                     target_lossy_nifti = nib.load(lossy_image_path)
                     lossy_mask_temp = lossy_output_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-                    nib.save(
-                        nib.Nifti1Image(lossy_mask, target_lossy_nifti.affine, target_lossy_nifti.header),
-                        lossy_mask_temp,
-                    )
-                    os.replace(lossy_mask_temp, lossy_output_path)
+                    atomic_nib_save(nib.Nifti1Image(lossy_mask, target_lossy_nifti.affine, target_lossy_nifti.header), lossy_output_path)
                     print(f"Saved thresholded lossy mask: {lossy_output_path}")
             
         except Exception as e:
@@ -19113,6 +19113,10 @@ class PropagateMaskView(APIView):
             if mask_temp_path and os.path.exists(mask_temp_path):
                 os.replace(mask_temp_path, mask_path)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _run_ai_segmentation_on_mask(self, directory, subject, edit, model, mask_path, lossy_output_path=None, json_metadata=None, selected_label=None):
         """
         Run AI segmentation on full-resolution mask.
@@ -19159,12 +19163,11 @@ class PropagateMaskView(APIView):
             image_nifti = nib.load(image_path)
             image_data_3d = image_nifti.get_fdata()
             
-            # Temporarily rename mask for loading
+            # Read in place (crash-safe rule 2): the mask is never renamed to be read.
             mask_temp_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-            os.replace(mask_path, mask_temp_path)
             
             # Load mask data
-            mask_nifti = nib.load(mask_temp_path)
+            mask_nifti = load_nifti_readonly(mask_path)
             # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
             mask_data_3d = np.round(mask_nifti.get_fdata()).astype(mask_nifti.get_data_dtype())
             
@@ -19185,7 +19188,6 @@ class PropagateMaskView(APIView):
                     labels = np.array([selected_label])
                 else:
                     print(f"Selected label {selected_label} not found in mask, skipping AI segmentation")
-                    os.replace(mask_temp_path, mask_path)
                     return
 
             if labels.size == 0:
@@ -19217,8 +19219,7 @@ class PropagateMaskView(APIView):
                 mask_data_3d = np.where(segmented_mask == label, label, mask_data_3d).astype(mask_nifti.get_data_dtype())
             
             # Save updated full-res mask
-            nib.save(nib.Nifti1Image(mask_data_3d, mask_nifti.affine, mask_nifti.header), mask_temp_path)
-            os.replace(mask_temp_path, mask_path)
+            atomic_nib_save(nib.Nifti1Image(mask_data_3d, mask_nifti.affine, mask_nifti.header), mask_path)
             
             print(f"AI segmentation completed for {subject}")
             
@@ -19251,11 +19252,7 @@ class PropagateMaskView(APIView):
                     
                     target_lossy_nifti = nib.load(lossy_image_path)
                     lossy_mask_temp = lossy_output_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-                    nib.save(
-                        nib.Nifti1Image(lossy_mask, target_lossy_nifti.affine, target_lossy_nifti.header),
-                        lossy_mask_temp,
-                    )
-                    os.replace(lossy_mask_temp, lossy_output_path)
+                    atomic_nib_save(nib.Nifti1Image(lossy_mask, target_lossy_nifti.affine, target_lossy_nifti.header), lossy_output_path)
                     print(f"Saved AI segmented lossy mask: {lossy_output_path}")
             
         except Exception as e:
@@ -19263,6 +19260,10 @@ class PropagateMaskView(APIView):
             if mask_temp_path and os.path.exists(mask_temp_path):
                 os.replace(mask_temp_path, mask_path)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _copy_mask_to_elastic_edit(self, source_mask_path, elastic_mask_path,
                                    elastic_mask_lossy_path, folder_metadata,
                                    selected_label=None):
@@ -19276,14 +19277,10 @@ class PropagateMaskView(APIView):
         """
         try:
             src_temp = source_mask_path.replace('.nii.mask.gz', '_ecopy_src_temp.nii.gz')
-            os.replace(source_mask_path, src_temp)
-            try:
-                src_img   = nib.load(src_temp)
-                mask_dtype = src_img.get_data_dtype()
-                # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-                src_data  = np.round(src_img.get_fdata()).astype(mask_dtype)
-            finally:
-                os.replace(src_temp, source_mask_path)
+            src_img   = load_nifti_readonly(source_mask_path)
+            mask_dtype = src_img.get_data_dtype()
+            # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
+            src_data  = np.round(src_img.get_fdata()).astype(mask_dtype)
 
             final_data = src_data
 
@@ -19291,16 +19288,12 @@ class PropagateMaskView(APIView):
             # being propagated, which is replaced by the incoming version.
             if selected_label is not None and selected_label > 0 and os.path.exists(elastic_mask_path):
                 dst_temp = elastic_mask_path.replace('.nii.mask.gz', '_ecopy_dst_temp.nii.gz')
-                os.replace(elastic_mask_path, dst_temp)
-                try:
-                    dst_img  = nib.load(dst_temp)
-                    # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-                    dst_data = np.round(dst_img.get_fdata()).astype(mask_dtype)
-                    # Remove old region for selected_label, then paint new region from src
-                    cleaned  = np.where(dst_data == selected_label, 0, dst_data).astype(mask_dtype)
-                    final_data = np.where(src_data == selected_label, selected_label, cleaned).astype(mask_dtype)
-                finally:
-                    os.replace(dst_temp, elastic_mask_path)
+                dst_img  = load_nifti_readonly(elastic_mask_path)
+                # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
+                dst_data = np.round(dst_img.get_fdata()).astype(mask_dtype)
+                # Remove old region for selected_label, then paint new region from src
+                cleaned  = np.where(dst_data == selected_label, 0, dst_data).astype(mask_dtype)
+                final_data = np.where(src_data == selected_label, selected_label, cleaned).astype(mask_dtype)
 
             # Derive affine/header from the elastic image if it exists
             elastic_img_path = elastic_mask_path.replace('.nii.mask.gz', '.nii.gz')
@@ -19311,8 +19304,7 @@ class PropagateMaskView(APIView):
                 affine, header = src_img.affine, src_img.header
 
             out_temp = elastic_mask_path.replace('.nii.mask.gz', '_ecopy_out_temp.nii.gz')
-            nib.save(nib.Nifti1Image(final_data, affine, header), out_temp)
-            os.replace(out_temp, elastic_mask_path)
+            atomic_nib_save(nib.Nifti1Image(final_data, affine, header), elastic_mask_path)
             print(f"Copied reference-space mask to elastic edit: {elastic_mask_path}")
 
             # Lossy version
@@ -19341,8 +19333,7 @@ class PropagateMaskView(APIView):
                     l_affine, l_header = affine, header
 
                 lossy_temp = elastic_mask_lossy_path.replace('.nii.mask.gz', '_ecopy_lossy_temp.nii.gz')
-                nib.save(nib.Nifti1Image(lossy_data, l_affine, l_header), lossy_temp)
-                os.replace(lossy_temp, elastic_mask_lossy_path)
+                atomic_nib_save(nib.Nifti1Image(lossy_data, l_affine, l_header), elastic_mask_lossy_path)
                 print(f"Copied reference-space lossy mask to elastic edit: {elastic_mask_lossy_path}")
 
         except Exception as _e:
@@ -19351,6 +19342,10 @@ class PropagateMaskView(APIView):
 
 class SnapToMeshView(APIView):
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def distance_analysis(self, directory, filename, edit, landmarks, vertices, faces, snap_distance):
 
         # Get the sub path
@@ -19405,8 +19400,7 @@ class SnapToMeshView(APIView):
 
         # Save the distances to a json file
         distances_path = os.path.join(directory, sub_path, edit + "_landmark_distances.json")
-        with open(distances_path, 'w') as jf:
-            json.dump(distances_dict, jf, indent=4)  # Convert ndarray to list for JSON compatibility
+        atomic_write_json(distances_path, distances_dict, indent=4)
 
         # Add metadata entry named landmarks, within it add the number of landmarks and the accuracy
         json_metadata['landmarks'] = {
@@ -19422,8 +19416,7 @@ class SnapToMeshView(APIView):
             'edit_name': edit
         }
         # Save the updated metadata to the json file
-        with open(json_path, 'w') as jf:
-            json.dump(json_metadata, jf, indent=4)
+        atomic_write_json(json_path, json_metadata, indent=4)
 
     
     def snap_landmarks_to_mesh(self, landmarks, vertices, faces, voxel_size):
@@ -19452,6 +19445,14 @@ class SnapToMeshView(APIView):
         
         return closest_points, distances
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('snap_to_mesh', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -19472,6 +19473,11 @@ class SnapToMeshView(APIView):
 
         sub_path = atlas_sub_path(directory) if filename == "atlas" else "extracted/"+filename
 
+        # Stages for the progress bar (see stepProgress.py).
+        steps = StepProgress(4, filename, 'Snapping landmarks to mesh')
+        steps.start()
+        steps(1, 'Loading scan')
+
         # Load the nifti data from edit
         nifti_path = os.path.join(directory, sub_path, edit)
         nifti_img = nib.load(nifti_path)
@@ -19490,20 +19496,18 @@ class SnapToMeshView(APIView):
             mask_path = nifti_path.replace('.nii.gz', '.nii.mask.gz')
             if os.path.exists(mask_path):
                 temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask_temp.nii.gz')
-                os.replace(mask_path, temp_mask_path)
                 try:
-                    mask_data = nib.load(temp_mask_path).get_fdata()
+                    mask_data = load_nifti_readonly(mask_path).get_fdata()
                     nifti_data = (mask_data == mask_label).astype(float)
                     threshold = 0.5
                     print(f"Using mask to snap")
                 except Exception as e:
                     print(f"Warning: Could not load mask for {filename}, proceeding without mask. Error: {e}")
-                finally:
-                    os.replace(temp_mask_path, mask_path)
             else:
                 print(f"Warning: Could not load mask for {filename}, proceeding without mask. Error: {e}")
 
         # Marching cubes to get the surface mesh
+        steps(2, 'Building surface mesh')
         volume = gaussian_filter(nifti_data, sigma=0.3)
 
         # Apply the Marching Cubes algorithm to extract the mesh's vertices and faces from the volume data
@@ -19536,6 +19540,7 @@ class SnapToMeshView(APIView):
                 landmarks_list = [{'position': list(pos), 'landmark_type': 'main'} for pos in landmarks_positions]
 
         # Snap the landmarks to the mesh with the closest point
+        steps(3, 'Snapping landmarks to the surface')
         snapped_landmarks_or_response, snap_distance = self.snap_landmarks_to_mesh(landmarks_positions, vertices, faces, snap_voxel_size)
 
          # Check if the snapping function returned an error response
@@ -19550,12 +19555,12 @@ class SnapToMeshView(APIView):
             lm['position'] = snapped_positions[i].tolist() if hasattr(snapped_positions[i], 'tolist') else list(snapped_positions[i])
 
         # recalculate the distance analysis
+        steps(4, 'Measuring landmark distances')
         self.distance_analysis(directory, filename, edit, snapped_positions, vertices, faces, snap_distance)
 
         # Save the landmarks
         landmarks_path = os.path.join(directory, sub_path, edit.replace(".nii.gz", "_landmarks.json"))
-        with open(landmarks_path, 'w') as jf:
-            json.dump(landmarks_list, jf, indent=4)
+        atomic_write_json(landmarks_path, landmarks_list, indent=4)
 
 
         return Response({'message': 'Landmarks snapped to mesh successfully'}, status=status.HTTP_200_OK)
@@ -19596,7 +19601,8 @@ class MemoryMonitorView(APIView):
 
                 # Get memory usage of the current app process
                 current_process = psutil.Process()
-                app_memory_usage = current_process.memory_info().rss
+                # Aurora's own memory includes its ANTs worker processes (antsWorker.py).
+                app_memory_usage = current_process.memory_info().rss + antsWorker.worker_memory_bytes()
 
                 # Get total system memory and used memory
                 system_memory_info = psutil.virtual_memory()
@@ -19686,6 +19692,14 @@ class SaveGuidepointsView(APIView):
         return closest_points.tolist()
 
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('save_guidepoints', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -19705,7 +19719,7 @@ class SaveGuidepointsView(APIView):
                 guidepoints_path = os.path.join(directory, root_path, edit + "_guidepoints.json")
             else:
                 guidepoints_path = os.path.join(directory, root_path, filename + "_guidepoints.json")
-            os.remove(guidepoints_path)
+            tracked_remove(guidepoints_path)
             return Response({'message': 'Guidepoints deleted successfully'}, status=status.HTTP_200_OK)
         # Restructure the guidepoints to be a list of [x, y, z] rows
         guidepoints = [[point['position']['x'], point['position']['y'], point['position']['z']] for point in guidepoints]
@@ -19727,8 +19741,7 @@ class SaveGuidepointsView(APIView):
         else:
             guidepoints_path = os.path.join(directory, root_path, filename + "_guidepoints.json")
 
-        with open(guidepoints_path, 'w') as jf:
-            json.dump(snapped_guidepoints, jf, indent=4)         
+        atomic_write_json(guidepoints_path, snapped_guidepoints, indent=4)
 
 
         return Response({'message': 'Guidepoints saved successfully'}, status=status.HTTP_200_OK)
@@ -20033,6 +20046,10 @@ class SaveLandmarkGuidepointsView(APIView):
                 count += 1
         return count
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def partial_distance_analysis(
         self,
         directory,
@@ -20116,8 +20133,7 @@ class SaveLandmarkGuidepointsView(APIView):
             'snap_distance': final_snap_distance,
             'distance_surface': distance_surface,
         }
-        with open(distances_path, 'w') as jf:
-            json.dump(distances_dict, jf, indent=4)
+        atomic_write_json(distances_path, distances_dict, indent=4)
 
         landmarks_meta = dict(existing_landmarks_meta)
         landmarks_meta['num_landmarks'] = int(num_landmarks)
@@ -20162,8 +20178,7 @@ class SaveLandmarkGuidepointsView(APIView):
             landmarks_meta['snapped_std_distance'] = None
 
         json_metadata['landmarks'] = landmarks_meta
-        with open(json_path, 'w') as jf:
-            json.dump(json_metadata, jf, indent=4)
+        atomic_write_json(json_path, json_metadata, indent=4)
 
     def snap_guidepoints_to_mesh(self, guidepoints, vertices, faces, voxel_size=None):
         print("Attempting: Snapping guidepoints to closest mesh point")
@@ -20193,6 +20208,10 @@ class SaveLandmarkGuidepointsView(APIView):
         return closest_points, distances
 
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def distance_analysis(self, directory, filename, edit, landmarks, snap_distance):
         # Get the sub path
         if filename == "atlas":
@@ -20273,8 +20292,7 @@ class SaveLandmarkGuidepointsView(APIView):
             distances_filename = filename + "_landmark_distances.json"
         
         distances_path = os.path.join(directory, sub_path, distances_filename)
-        with open(distances_path, 'w') as jf:
-            json.dump(distances_dict, jf, indent=4)  # Convert ndarray to list for JSON compatibility
+        atomic_write_json(distances_path, distances_dict, indent=4)
 
         # Add metadata entry named landmarks, within it add the number of landmarks and the accuracy
         json_metadata['landmarks'] = {
@@ -20290,10 +20308,17 @@ class SaveLandmarkGuidepointsView(APIView):
             'edit_name': edit
         }
         # Save the updated metadata to the json file
-        with open(json_path, 'w') as jf:
-            json.dump(json_metadata, jf, indent=4)
+        atomic_write_json(json_path, json_metadata, indent=4)
 
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('save_landmark_guidepoints', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -20327,11 +20352,11 @@ class SaveLandmarkGuidepointsView(APIView):
                 guidepoints_path = os.path.join(directory, root_path, filename + "_landmarks.json")
                 guidepoints_distances_path = os.path.join(directory, root_path, filename + "_landmark_distances.json")
             try:
-                os.remove(guidepoints_path)
+                tracked_remove(guidepoints_path)
             except Exception as e:
                 print(f"Error deleting guidepoints path: {e}")
             try:
-                os.remove(guidepoints_distances_path)
+                tracked_remove(guidepoints_distances_path)
             except Exception as e:
                 print(f"Error deleting guidepoints distances path: {e}")
 
@@ -20340,8 +20365,7 @@ class SaveLandmarkGuidepointsView(APIView):
             with open(json_path, 'r') as jf:
                 json_metadata = json.load(jf)
             json_metadata['landmarks'] = None
-            with open(json_path, 'w') as jf:
-                json.dump(json_metadata, jf, indent=4)
+            atomic_write_json(json_path, json_metadata, indent=4)
 
             return Response({'message': 'Landmark guidepoints deleted successfully'}, status=status.HTTP_200_OK)
         # Restructure the guidepoints to new format with position and landmark_type
@@ -20364,6 +20388,10 @@ class SaveLandmarkGuidepointsView(APIView):
             guidepoints_formatted.append(row)
 
         print(f"Saving landmark guidepoints for {filename} with edit {edit}")
+        # Steps: 1 compare with stored landmarks, 2 snap changed ones, 3 measure distances.
+        save_steps = 3
+        _send_step_progress(0, save_steps, 'Saving landmarks', filename)
+        _send_step_progress(1, save_steps, 'Checking landmark changes', filename)
 
         if edit is not None:
             guidepoints_path = os.path.join(directory, root_path, edit + "_landmarks.json")
@@ -20410,6 +20438,7 @@ class SaveLandmarkGuidepointsView(APIView):
                     f"No landmark changes for {filename} with edit {edit}; distance surface changed "
                     f"({stored_surface} -> {requested_surface}), recomputing all distances"
                 )
+                _send_step_progress(3, save_steps, 'Measuring landmark distances', filename)
                 try:
                     self.partial_distance_analysis(
                         directory,
@@ -20446,6 +20475,7 @@ class SaveLandmarkGuidepointsView(APIView):
         snap_distance_array = None
         if auto_snap and position_changed_indices:
             print(f"Auto-snapping {len(position_changed_indices)} position-changed landmark(s) to mesh (use_outer_shell={use_outer_shell})")
+            _send_step_progress(2, save_steps, 'Snapping changed landmarks to the surface', filename)
             try:
                 mesh_context = self._load_landmark_mesh_context(
                     directory, filename, edit, use_outer_shell=use_outer_shell
@@ -20480,8 +20510,7 @@ class SaveLandmarkGuidepointsView(APIView):
             except Exception as e:
                 print(f"Warning: Auto-snap after save failed: {str(e)}")
 
-        with open(guidepoints_path, 'w') as jf:
-            json.dump(merged_landmarks, jf, indent=4)
+        atomic_write_json(guidepoints_path, merged_landmarks, indent=4)
 
         print(f"Landmark guidepoints saved to {guidepoints_path}. Running distance analysis for changed landmarks...")
 
@@ -20495,6 +20524,7 @@ class SaveLandmarkGuidepointsView(APIView):
             and 0 < len(distance_indices) < len(merged_landmarks)
         )
 
+        _send_step_progress(3, save_steps, 'Measuring landmark distances', filename)
         try:
             self.partial_distance_analysis(
                 directory,
@@ -20618,6 +20648,10 @@ SEAT_BEHIND_MIN_TOL = 0.0048
 
 
 class GetSemiLandmarksView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _load_shell_mesh_context(self, directory, filename, edit):
         """Load outer shell mesh for semi-landmark / path operations (voxel lossy NIfTI or preserved PLY)."""
         if filename == "atlas":
@@ -20696,8 +20730,7 @@ class GetSemiLandmarksView(APIView):
                 lossy_params = [lossy_params]
                 if 'filename' not in lossy_params[0]:
                     lossy_params[0]['filename'] = os.path.basename(nifti_file)
-                with open(json_path, 'w') as json_file:
-                    json.dump(json_metadata, json_file, indent=4)
+                atomic_write_json(json_path, json_metadata, indent=4)
 
             lossy_filename = os.path.basename(nifti_file)
             matching_lossy_params = [p for p in lossy_params if p['filename'] == lossy_filename]
@@ -20773,6 +20806,10 @@ class GetSemiLandmarksView(APIView):
                 os.makedirs(self.debug_dir, exist_ok=True)
                 print(f"Debug directory: {self.debug_dir}")
 
+            # Stages for the progress bar (see stepProgress.py).
+            steps = StepProgress(3, filename, 'Calculating semi-landmarks')
+            steps.start()
+            steps(1, 'Loading surface mesh')
             mesh_ctx = self._load_shell_mesh_context(directory, filename, edit)
             shell_vertices = mesh_ctx['shell_vertices']
             shell_faces = mesh_ctx['shell_faces']
@@ -20784,6 +20821,7 @@ class GetSemiLandmarksView(APIView):
             end_pos = np.array([end_coordinates['x'], end_coordinates['y'], end_coordinates['z']])
 
             # Step 1: Find equally spaced points along straight line
+            steps(2, 'Tracing the surface path')
             straight_line_points = self.get_straight_line_points(start_pos, end_pos, num_semilandmarks=100)
             print(f"Straight line points: {straight_line_points}")
             if self.debug:
@@ -20844,6 +20882,7 @@ class GetSemiLandmarksView(APIView):
                 )
 
             # Step 5: Re-equalize semilandmarks along the path
+            steps(3, 'Distributing semi-landmarks')
             semilandmarks_equalized = self.distribute_semilandmarks_along_path(shell_path, num_semilandmarks)
             print(f"Semilandmarks: {semilandmarks_equalized.shape}")
             if self.debug:
@@ -21938,9 +21977,14 @@ class RebalanceLandmarksAlongPathView(GetSemiLandmarksView):
 
             landmarks = self.resolve_endpoint_order(landmarks)
 
+            # Stages for the progress bar (see stepProgress.py).
+            steps = StepProgress(2, filename, 'Redistributing semi-landmarks')
+            steps.start()
+            steps(1, 'Loading surface mesh')
             mesh_ctx = self._load_shell_mesh_context(directory, filename, edit)
             positions = np.array([[lm['x'], lm['y'], lm['z']] for lm in landmarks])
 
+            steps(2, 'Redistributing along the surface path')
             rebalanced = self.rebalance_landmarks_along_path(
                 positions,
                 mesh_ctx['shell_vertices'],
@@ -22053,6 +22097,26 @@ class GetProjectSettingsView(APIView):
         project_settings_path = os.path.join(directory, 'extracted', 'project_settings.json')
 
         print("project_settings_path: ", project_settings_path)
+
+        # Project open: drop uncommitted elastic outputs left by an interrupted run
+        # (skipped while this server is running elastic on the project).
+        try:
+            scrub_elastic_staging_dirs(directory)
+        except Exception as e:
+            print(f"Warning: could not scrub interrupted elastic outputs in {directory}: {e}")
+
+        # Project open: finish or undo any subject transaction a dead engine left behind
+        # (crash-safe protocol, see crashSafety.py); live ones of this engine are skipped.
+        try:
+            crashSafety.recover_project(directory)
+        except Exception as e:
+            print(f"Warning: crash-safe recovery failed for {directory}: {e}")
+        # ANTs worker temp folders left by an engine that was killed mid-registration
+        # (they hold GB-sized warps, in RAM where /tmp is tmpfs).
+        try:
+            antsWorker.sweep_stale_temp()
+        except Exception as e:
+            print(f"Warning: could not sweep stale ANTs temp folders: {e}")
 
         try:
             if os.path.exists(project_settings_path):
@@ -22306,6 +22370,10 @@ class SaveScientificReportView(APIView):
       - omitted / ``all``: legacy write of text + figures payload as given
     """
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def post(self, request):
         directory = request.data.get('directory')
         name = request.data.get('name', '')
@@ -22359,8 +22427,7 @@ class SaveScientificReportView(APIView):
                 return Response({'error': 'invalid figures path'}, status=400)
 
             if write_template:
-                with open(out_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
+                atomic_write_text(out_path, content)
 
             overrides_filename = None
             if write_template:
@@ -22371,8 +22438,7 @@ class SaveScientificReportView(APIView):
                         if isinstance(k, str) and k
                     }
                     if clean_overrides:
-                        with open(vars_path, 'w', encoding='utf-8') as jf:
-                            json.dump({'overrides': clean_overrides}, jf, indent=2)
+                        atomic_write_json(vars_path, {'overrides': clean_overrides}, indent=2, encoding='utf-8')
                         overrides_filename = f'{safe_name}.vars.json'
                 elif os.path.isfile(vars_path):
                     # No overrides left — remove stale sidecar if present
@@ -22388,12 +22454,10 @@ class SaveScientificReportView(APIView):
                         _load_figures_sidecar(figures_path),
                         figures,
                     )
-                    with open(figures_path, 'w', encoding='utf-8') as jf:
-                        json.dump({'figures': merged}, jf, indent=2)
+                    atomic_write_json(figures_path, {'figures': merged}, indent=2, encoding='utf-8')
                     figures_filename = f'{safe_name}.figures.json'
                 elif figures_mode == 'cache' or (figures_mode in ('all', '') and figures):
-                    with open(figures_path, 'w', encoding='utf-8') as jf:
-                        json.dump({'figures': figures}, jf, indent=2)
+                    atomic_write_json(figures_path, {'figures': figures}, indent=2, encoding='utf-8')
                     figures_filename = f'{safe_name}.figures.json'
                 # Empty figures payload no longer deletes an existing cache.
 
@@ -22709,6 +22773,36 @@ class DeleteScientificReportView(APIView):
             return Response({'error': str(e)}, status=400)
 
 
+def _dev_version_fields():
+    """Developer run (run_aurora.sh sets AURORA_DEV=1): the version the next package build
+    will get, as deploy.sh computes it (highest aurora-tools .deb + 1 patch, 9 rolls over)."""
+    import glob
+    import os
+    import re
+
+    if os.environ.get("AURORA_DEV") != "1":
+        return {}
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    folders = [os.path.join(repo, "deployment", "build"),
+               os.path.join(repo, "..", "BHTools", "frontend", "static", "software")]
+    versions = []
+    for folder in folders:
+        for deb in glob.glob(os.path.join(folder, "aurora-tools_*_amd64.deb")):
+            match = re.match(r"aurora-tools_(\d+)\.(\d+)\.(\d+)_amd64\.deb$", os.path.basename(deb))
+            if match:
+                versions.append(tuple(int(part) for part in match.groups()))
+    next_version = None
+    if versions:
+        major, minor, patch = max(versions)
+        patch += 1
+        if patch > 9:
+            patch, minor = 0, minor + 1
+            if minor > 9:
+                minor, major = 0, major + 1
+        next_version = f"{major}.{minor}.{patch}"
+    return {"dev": True, "next_version": next_version}
+
+
 class GetVersionView(APIView):
     def get(self, request):
         """
@@ -22744,14 +22838,18 @@ class GetVersionView(APIView):
                         if version:
                             return Response({
                                 'version': version,
-                                'status': 'installed'
+                                'status': 'installed',
+                                **engine_identity(),
+                                **_dev_version_fields(),
                             })
                     except Exception as read_error:
                         continue
             
             return Response({
                 'version': None,
-                'status': 'not_installed'
+                'status': 'not_installed',
+                **engine_identity(),
+                **_dev_version_fields(),
             })
             
         except Exception as e:
@@ -23109,15 +23207,119 @@ class ExportLandmarkDistancesView(APIView):
             )
 
 
+def landmark_export_alignment_scale(scan_dir, scan_name, metadata, landmarks_path):
+    """Centroid-size factor carried by the landmarks in landmarks_path (1.0 if none).
+
+    Rigid alignment with scaling zooms the subject by ``alignment_scale`` (subject
+    metadata) with the voxel spacing unchanged, so the aligned edit and every later edit
+    (elastic included) are that many times the specimen's real size. Raw landmarks
+    (``<scan>_landmarks.json``) and edits before the first ``_aligned`` edit are still at
+    native size. If no ``_aligned`` edit is left on disk (intermediates cleared keeps only
+    the last edits), edit landmarks are taken as post-alignment.
+    """
+    try:
+        scale = float(metadata.get('alignment_scale') or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+    if not np.isfinite(scale) or scale <= 0.0 or scale == 1.0:
+        return 1.0
+    base = os.path.basename(landmarks_path)
+    if base.startswith(scan_name):
+        base = base[len(scan_name):]
+    m = re.search(r'_edit_(\d+)', base)
+    if m is None:
+        return 1.0
+    first_aligned = first_aligned_edit_number(scan_dir, scan_name)
+    if first_aligned is not None and int(m.group(1)) < first_aligned:
+        return 1.0
+    return scale
+
+
+def rescale_landmarks_to_real_size(landmarks_dict, scale):
+    """Undo the alignment scale on exported landmarks: p' = c + (p - c) / scale.
+
+    c is the centroid of the subject's landmarks, so coordinates shrink (or grow) about
+    it and stay in the same place in the aligned frame; size and shape are those of
+    plain division by ``scale`` (centroid size becomes real size). Returns a new dict;
+    entries that are not [x, y, z] are copied unchanged.
+    """
+    keys = [k for k, v in landmarks_dict.items()
+            if isinstance(v, (list, tuple)) and len(v) >= 3]
+    if not keys or not scale or scale == 1.0:
+        return dict(landmarks_dict)
+    pts = np.asarray([[float(c) for c in landmarks_dict[k][:3]] for k in keys], dtype=np.float64)
+    centroid = pts.mean(axis=0)
+    scaled = centroid + (pts - centroid) / float(scale)
+    out = dict(landmarks_dict)
+    for k, p in zip(keys, scaled):
+        out[k] = [float(p[0]), float(p[1]), float(p[2])] + list(landmarks_dict[k][3:])
+    return out
+
+
+def rescale_distances_to_real_size(distances, scale):
+    """Divide landmark distance values by the alignment scale (non-numbers unchanged)."""
+    if distances is None or not scale or scale == 1.0:
+        return distances
+    out = []
+    for d in distances:
+        try:
+            out.append(float(d) / float(scale) if d is not None else d)
+        except (TypeError, ValueError):
+            out.append(d)
+    return out
+
+
+class LandmarkExportScaleInfoView(APIView):
+    """How many exportable subjects carry an alignment scale (for the export menu).
+
+    Counts the same subjects the landmark exports use (non-faulty, with a landmarks
+    file; latest file per subject) and reports how many of those are scaled:
+    {"scaled": x, "total": y, "scales": {scan_name: factor}}. Read-only.
+    """
+    def post(self, request, *args, **kwargs):
+        directory = request.data.get('directory')
+        extracted_dir = os.path.join(directory or '', "extracted")
+        if not directory or not os.path.isdir(extracted_dir):
+            return Response({'scaled': 0, 'total': 0, 'scales': {}})
+        scales = {}
+        total = 0
+        for scan_name in sorted(os.listdir(extracted_dir)):
+            sub_path = os.path.join(extracted_dir, scan_name)
+            metadata_path = os.path.join(sub_path, f"{scan_name}.json")
+            if not os.path.isdir(sub_path) or not os.path.exists(metadata_path):
+                continue
+            try:
+                with open(metadata_path, 'r') as jf:
+                    metadata = json.load(jf)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if metadata.get('faulty', False):
+                continue
+            landmarks_files = glob.glob(os.path.join(sub_path, f"{scan_name}*_landmarks.json"))
+            if not landmarks_files:
+                continue
+            total += 1
+            latest_landmarks_file = sorted(landmarks_files, key=os.path.getmtime)[-1]
+            scale = landmark_export_alignment_scale(sub_path, scan_name, metadata, latest_landmarks_file)
+            if scale != 1.0:
+                scales[scan_name] = scale
+        return Response({'scaled': len(scales), 'total': total, 'scales': scales})
+
+
 class ExportLandmarksBundleView(APIView):
     """
     Export all landmark data in a single ZIP: coordinates CSV plus surface and
     (if available) snap distance CSVs. One request, one download.
+
+    With ``rescale: true``, coordinates and distances of subjects that rigid alignment
+    scaled are brought back to real size on the fly (rescale_landmarks_to_real_size /
+    rescale_distances_to_real_size); the landmark files themselves are not changed.
     """
     def post(self, request, *args, **kwargs):
         try:
             directory = request.data.get('directory')
-            print(f"Exporting landmarks bundle from directory: {directory}")
+            rescale = bool(request.data.get('rescale', False))
+            print(f"Exporting landmarks bundle from directory: {directory} (rescale={rescale})")
 
             if not directory:
                 return Response(
@@ -23185,6 +23387,15 @@ class ExportLandmarksBundleView(APIView):
                     else:
                         landmarks_dict = landmarks
 
+                    export_scale = 1.0
+                    if landmarks_dict and rescale:
+                        export_scale = landmark_export_alignment_scale(
+                            sub_path, scan_name, metadata, latest_landmarks_file
+                        )
+                        if export_scale != 1.0:
+                            landmarks_dict = rescale_landmarks_to_real_size(landmarks_dict, export_scale)
+                            print(f"Rescaled {scan_name} landmarks to real size (/ {export_scale:.6f})")
+
                     if landmarks_dict:
                         row = {'Subject': scan_name}
                         for lm_name, coord in landmarks_dict.items():
@@ -23222,6 +23433,10 @@ class ExportLandmarksBundleView(APIView):
 
                 if not surface_dists:
                     continue
+
+                # Distances are lengths in the same scaled space as the coordinates.
+                surface_dists = rescale_distances_to_real_size(surface_dists, export_scale)
+                snap_dists = rescale_distances_to_real_size(snap_dists, export_scale)
 
                 n_lm = len(surface_dists)
                 max_landmarks = max(max_landmarks, n_lm)
@@ -23345,11 +23560,21 @@ class ExportLandmarksJsonView(APIView):
     }
 
     Skips faulty scans. Uses the most recently modified landmarks file per scan.
+
+    With ``rescale: true`` in the request, landmarks of subjects that rigid alignment
+    scaled are brought back to real size on the fly (see
+    rescale_landmarks_to_real_size); the landmark files themselves are not changed.
     """
+
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def post(self, request, *args, **kwargs):
         try:
             directory = request.data.get('directory')
-            print(f"Exporting landmarks as JSON from directory: {directory}")
+            rescale = bool(request.data.get('rescale', False))
+            print(f"Exporting landmarks as JSON from directory: {directory} (rescale={rescale})")
 
             if not directory:
                 return Response(
@@ -23420,6 +23645,14 @@ class ExportLandmarksJsonView(APIView):
                     else:
                         scan_landmarks = landmarks
 
+                    if scan_landmarks and rescale:
+                        scale = landmark_export_alignment_scale(
+                            sub_path, scan_name, metadata, latest_landmarks_file
+                        )
+                        if scale != 1.0:
+                            scan_landmarks = rescale_landmarks_to_real_size(scan_landmarks, scale)
+                            print(f"Rescaled {scan_name} landmarks to real size (/ {scale:.6f})")
+
                     if scan_landmarks:
                         export_data[scan_name] = scan_landmarks
                         print(f"Loaded {len(scan_landmarks)} landmarks from {scan_name}")
@@ -23442,8 +23675,7 @@ class ExportLandmarksJsonView(APIView):
             json_filename = f"{dir_basename}_landmarks_{ts}.json"
             json_path = os.path.join(temp_dir, json_filename)
 
-            with open(json_path, 'w') as jf:
-                json.dump(export_data, jf, indent=2)
+            atomic_write_json(json_path, export_data, indent=2)
 
             response = FileResponse(
                 open(json_path, 'rb'),
@@ -23520,178 +23752,182 @@ class ClearIntermediateFilesView(APIView):
             print(f"Processing {total_subjects} subjects...")
             
             for idx, subject in enumerate(subjects):
-                subject_path = os.path.join(extracted_path, subject)
-                json_path = os.path.join(subject_path, f"{subject}.json")
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, subject, 'clear_intermediate_files'):
+                    subject_path = os.path.join(extracted_path, subject)
+                    json_path = os.path.join(subject_path, f"{subject}.json")
                 
-                # Send progress update
-                if channel_layer is not None:
-                    async_to_sync(channel_layer.group_send)(
-                        "progress",
-                        {
-                            "type": "progress_update",
-                            "total": total_subjects,
-                            "current": idx + 1,
-                            "scan_name": subject,
-                            "progress": (idx + 1) / total_subjects,
-                            "custom_message": f"Processing subject {idx + 1}/{total_subjects}"
-                        }
-                    )
+                    # Send progress update
+                    if channel_layer is not None:
+                        async_to_sync(channel_layer.group_send)(
+                            "progress",
+                            {
+                                "type": "progress_update",
+                                "total": total_subjects,
+                                "current": idx + 1,
+                                "scan_name": subject,
+                                "progress": (idx + 1) / total_subjects,
+                                "custom_message": f"Processing subject {idx + 1}/{total_subjects}"
+                            }
+                        )
                 
-                # Load metadata
-                if not os.path.exists(json_path):
-                    print(f"No metadata found for {subject}, skipping...")
-                    skipped_count += 1
-                    continue
-                
-                try:
-                    with open(json_path, 'r') as jf:
-                        metadata = json.load(jf)
-                except json.JSONDecodeError:
-                    print(f"Corrupted metadata for {subject}, skipping...")
-                    skipped_count += 1
-                    continue
-                
-                # Check if subject is marked as faulty
-                if metadata.get('faulty', False):
-                    print(f"Deleting faulty subject: {subject}")
-                    
-                    # Calculate space before deletion
-                    subject_size = 0
-                    for root, dirs, files in os.walk(subject_path):
-                        for f in files:
-                            fp = os.path.join(root, f)
-                            if os.path.exists(fp):
-                                subject_size += os.path.getsize(fp)
-                    
-                    # Delete entire subject directory
-                    shutil.rmtree(subject_path)
-                    deleted_faulty_count += 1
-                    deleted_faulty_subjects.append(subject)
-                    total_space_freed += subject_size
-                    processed_count += 1
-                    continue
-                
-                # Find all edit files
-                all_files = os.listdir(subject_path)
-                
-                # Find the latest elastic edit number
-                elastic_edit_number = -1
-                for filename in all_files:
-                    if "_elastic" in filename and "_edit_" in filename:
-                        try:
-                            match = re.search(r'_edit_(\d+)_', filename)
-                            if match:
-                                edit_num = int(match.group(1))
-                                elastic_edit_number = max(elastic_edit_number, edit_num)
-                        except (IndexError, ValueError):
-                            continue
-                
-                # If no elastic transformation found, skip this subject
-                if elastic_edit_number == -1:
-                    print(f"No elastic transformation found for {subject}, skipping...")
-                    skipped_count += 1
-                    processed_count += 1
-                    continue
-                
-                print(f"Processing completed subject: {subject} (elastic edit: {elastic_edit_number})")
-                
-                # Determine which edits to keep (elastic and one before)
-                edits_to_keep = {elastic_edit_number}
-                if elastic_edit_number > 0:
-                    edits_to_keep.add(elastic_edit_number - 1)
-                
-                print(f"  Keeping edits: {sorted(edits_to_keep)}")
-                
-                # Find all files to potentially delete
-                files_to_delete = []
-                lossy_files_to_keep = set()
-                
-                for filename in all_files:
-                    # Skip metadata and original files
-                    if filename.endswith('.json') or filename == f"{subject}.nii.gz" or filename == f"{subject}_lossy.nii.gz":
+                    # Load metadata
+                    if not os.path.exists(json_path):
+                        print(f"No metadata found for {subject}, skipping...")
+                        skipped_count += 1
                         continue
+                
+                    try:
+                        with open(json_path, 'r') as jf:
+                            metadata = json.load(jf)
+                    except json.JSONDecodeError:
+                        print(f"Corrupted metadata for {subject}, skipping...")
+                        skipped_count += 1
+                        continue
+                
+                    # Check if subject is marked as faulty
+                    if metadata.get('faulty', False):
+                        print(f"Deleting faulty subject: {subject}")
                     
-                    # Check if it's an edit file
-                    if "_edit_" in filename:
-                        try:
-                            match = re.search(r'_edit_(\d+)_', filename)
-                            if match:
-                                edit_num = int(match.group(1))
-                                if edit_num not in edits_to_keep:
-                                    files_to_delete.append(filename)
-                                else:
-                                    # Track lossy files we're keeping
-                                    if "_lossy_edit_" in filename and filename.endswith('.nii.gz'):
-                                        lossy_files_to_keep.add(filename)
-                        except (IndexError, ValueError):
+                        # Calculate space before deletion
+                        subject_size = 0
+                        for root, dirs, files in os.walk(subject_path):
+                            for f in files:
+                                fp = os.path.join(root, f)
+                                if os.path.exists(fp):
+                                    subject_size += os.path.getsize(fp)
+                    
+                        # Delete entire subject directory
+                        remove_subject_folder(subject_path)
+                        deleted_faulty_count += 1
+                        deleted_faulty_subjects.append(subject)
+                        total_space_freed += subject_size
+                        processed_count += 1
+                        continue
+                
+                    # Find all edit files
+                    all_files = os.listdir(subject_path)
+                
+                    # Find the latest elastic edit number
+                    elastic_edit_number = -1
+                    for filename in all_files:
+                        if "_elastic" in filename and "_edit_" in filename:
+                            try:
+                                match = re.search(r'_edit_(\d+)_', filename)
+                                if match:
+                                    edit_num = int(match.group(1))
+                                    elastic_edit_number = max(elastic_edit_number, edit_num)
+                            except (IndexError, ValueError):
+                                continue
+                
+                    # If no elastic transformation found, skip this subject
+                    if elastic_edit_number == -1:
+                        print(f"No elastic transformation found for {subject}, skipping...")
+                        skipped_count += 1
+                        processed_count += 1
+                        continue
+                
+                    print(f"Processing completed subject: {subject} (elastic edit: {elastic_edit_number})")
+                
+                    # Determine which edits to keep (elastic and one before)
+                    edits_to_keep = {elastic_edit_number}
+                    if elastic_edit_number > 0:
+                        edits_to_keep.add(elastic_edit_number - 1)
+                
+                    print(f"  Keeping edits: {sorted(edits_to_keep)}")
+                
+                    # Find all files to potentially delete
+                    files_to_delete = []
+                    lossy_files_to_keep = set()
+                
+                    for filename in all_files:
+                        # Skip metadata and original files
+                        if filename.endswith('.json') or filename == f"{subject}.nii.gz" or filename == f"{subject}_lossy.nii.gz":
                             continue
+                    
+                        # Check if it's an edit file
+                        if "_edit_" in filename:
+                            try:
+                                match = re.search(r'_edit_(\d+)_', filename)
+                                if match:
+                                    edit_num = int(match.group(1))
+                                    if edit_num not in edits_to_keep:
+                                        files_to_delete.append(filename)
+                                    else:
+                                        # Track lossy files we're keeping
+                                        if "_lossy_edit_" in filename and filename.endswith('.nii.gz'):
+                                            lossy_files_to_keep.add(filename)
+                            except (IndexError, ValueError):
+                                continue
                 
-                # Delete the intermediate files
-                space_freed_subject = 0
-                for filename in files_to_delete:
-                    file_path = os.path.join(subject_path, filename)
-                    if os.path.exists(file_path):
-                        file_size = os.path.getsize(file_path)
-                        os.remove(file_path)
-                        space_freed_subject += file_size
-                        print(f"  Deleted: {filename} ({file_size / (1024*1024):.2f} MB)")
+                    # Delete the intermediate files
+                    space_freed_subject = 0
+                    for filename in files_to_delete:
+                        file_path = os.path.join(subject_path, filename)
+                        if os.path.exists(file_path):
+                            file_size = os.path.getsize(file_path)
+                            tracked_remove(file_path)
+                            space_freed_subject += file_size
+                            print(f"  Deleted: {filename} ({file_size / (1024*1024):.2f} MB)")
                 
-                total_space_freed += space_freed_subject
+                    total_space_freed += space_freed_subject
                 
-                # Update metadata - keep only lossy_compression entries for kept files
-                if 'lossy_compression' in metadata:
-                    lossy_compression = metadata['lossy_compression']
+                    # Update metadata - keep only lossy_compression entries for kept files
+                    if 'lossy_compression' in metadata:
+                        lossy_compression = metadata['lossy_compression']
                     
-                    # Normalize to list format
-                    if isinstance(lossy_compression, dict):
-                        lossy_compression = [lossy_compression]
+                        # Normalize to list format
+                        if isinstance(lossy_compression, dict):
+                            lossy_compression = [lossy_compression]
                     
-                    # Filter to keep only entries for files we're keeping
-                    updated_lossy_compression = []
+                        # Filter to keep only entries for files we're keeping
+                        updated_lossy_compression = []
                     
-                    # Always keep the base lossy file entry if it exists
-                    for entry in lossy_compression:
-                        entry_filename = entry.get('filename', '')
-                        if entry_filename == f"{subject}_lossy.nii.gz":
-                            updated_lossy_compression.append(entry)
-                            break
+                        # Always keep the base lossy file entry if it exists
+                        for entry in lossy_compression:
+                            entry_filename = entry.get('filename', '')
+                            if entry_filename == f"{subject}_lossy.nii.gz":
+                                updated_lossy_compression.append(entry)
+                                break
                     
-                    # Keep only the last two edit entries (elastic and one before)
-                    edit_entries = []
-                    for entry in lossy_compression:
-                        entry_filename = entry.get('filename', '')
-                        if "_lossy_edit_" in entry_filename and entry_filename in lossy_files_to_keep:
-                            edit_entries.append(entry)
+                        # Keep only the last two edit entries (elastic and one before)
+                        edit_entries = []
+                        for entry in lossy_compression:
+                            entry_filename = entry.get('filename', '')
+                            if "_lossy_edit_" in entry_filename and entry_filename in lossy_files_to_keep:
+                                edit_entries.append(entry)
                     
-                    # Sort by edit number and keep last two
-                    def extract_edit_num(entry):
-                        filename = entry.get('filename', '')
-                        match = re.search(r'_edit_(\d+)_', filename)
-                        return int(match.group(1)) if match else -1
+                        # Sort by edit number and keep last two
+                        def extract_edit_num(entry):
+                            filename = entry.get('filename', '')
+                            match = re.search(r'_edit_(\d+)_', filename)
+                            return int(match.group(1)) if match else -1
                     
-                    edit_entries.sort(key=extract_edit_num)
-                    updated_lossy_compression.extend(edit_entries[-2:])  # Keep last two
+                        edit_entries.sort(key=extract_edit_num)
+                        updated_lossy_compression.extend(edit_entries[-2:])  # Keep last two
                     
-                    metadata['lossy_compression'] = updated_lossy_compression
+                        metadata['lossy_compression'] = updated_lossy_compression
 
-                    # Drop reverse-map rows for the edit files just removed.
-                    # A legacy single dict has no per-edit rows.
-                    intensity_rows = metadata.get('intensity_value_mapping')
-                    if isinstance(intensity_rows, list):
-                        kept_map_names = {f"{subject}_lossy.nii.gz"} | lossy_files_to_keep
-                        metadata['intensity_value_mapping'] = [
-                            entry for entry in intensity_rows
-                            if isinstance(entry, dict) and entry.get('filename') in kept_map_names
-                        ]
+                        # Drop reverse-map rows for the edit files just removed.
+                        # A legacy single dict has no per-edit rows.
+                        intensity_rows = metadata.get('intensity_value_mapping')
+                        if isinstance(intensity_rows, list):
+                            kept_map_names = {f"{subject}_lossy.nii.gz"} | lossy_files_to_keep
+                            metadata['intensity_value_mapping'] = [
+                                entry for entry in intensity_rows
+                                if isinstance(entry, dict) and entry.get('filename') in kept_map_names
+                            ]
                     
-                    # Save updated metadata
-                    with open(json_path, 'w') as jf:
-                        json.dump(metadata, jf, indent=4)
+                        # Save updated metadata
+                        atomic_write_json(json_path, metadata, indent=4)
                     
-                    print(f"  Updated metadata: kept {len(updated_lossy_compression)} lossy_compression entries")
+                        print(f"  Updated metadata: kept {len(updated_lossy_compression)} lossy_compression entries")
                 
-                cleaned_count += 1
-                processed_count += 1
+                    cleaned_count += 1
+                    processed_count += 1
             
             # Move raw counterparts of deleted faulty subjects into faulty folder
             # Raw can be any file or folder whose name matches the subject (exact or at start)

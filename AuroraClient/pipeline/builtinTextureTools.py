@@ -15,6 +15,11 @@ import numpy as np
 import pygltflib
 import trimesh
 from scipy.spatial import cKDTree
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    atomic_copy,
+    atomic_np_savez,
+)
 
 BUILTIN_TEXTURE_SUFFIX = "_builtin_texture"
 BUILTIN_UV_SUFFIX = "_builtin_uv"
@@ -146,6 +151,10 @@ def extract_face_corner_uvs(mesh_obj):
     return uvs[faces]
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def save_uv_sidecar(ply_path, face_uvs):
     face_uvs = np.asarray(face_uvs, dtype=np.float32)
     if face_uvs.ndim != 3 or face_uvs.shape[1] != 3 or face_uvs.shape[2] != 2:
@@ -154,7 +163,7 @@ def save_uv_sidecar(ply_path, face_uvs):
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    np.savez(output_path, face_uv=face_uvs)
+    output_path = atomic_np_savez(output_path, face_uv=face_uvs)
     return output_path
 
 
@@ -190,6 +199,10 @@ def invalidate_display_mesh_cache(ply_path):
             print(f"Warning: could not remove display cache {pattern}: {exc}")
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def detect_and_extract_builtin_texture(mesh_path, output_dir, scan_name):
     """
     Detect a built-in diffuse texture on a source mesh and copy it into the extracted folder.
@@ -228,7 +241,7 @@ def detect_and_extract_builtin_texture(mesh_path, output_dir, scan_name):
     os.makedirs(output_dir, exist_ok=True)
     texture_filename = builtin_texture_filename(scan_name, texture_source)
     texture_dest = os.path.join(output_dir, texture_filename)
-    shutil.copy2(texture_source, texture_dest)
+    atomic_copy(texture_source, texture_dest)
 
     source_mtl = None
     source_format = None

@@ -21,6 +21,10 @@ import tempfile
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    atomic_ants_write,
+)
 
 FIREANTS_MIN_AXIS_VOXELS = 32
 DEFAULT_GPU_RIGID_SCALES = (8, 4, 2, 1)
@@ -365,6 +369,10 @@ def _rotation_degrees_from_matrix(R: np.ndarray) -> float:
     return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _ants_to_fireants_image(ants_image, device: str = "cuda", shift_minus1_to_unit: bool = False):
     import ants
     from fireants.io.image import Image
@@ -372,7 +380,7 @@ def _ants_to_fireants_image(ants_image, device: str = "cuda", shift_minus1_to_un
     fd, path = tempfile.mkstemp(suffix=".nii.gz")
     os.close(fd)
     try:
-        ants.image_write(ants_image, path)
+        atomic_ants_write(ants_image, path)
         image = Image.load_file(path, device=device)
         if shift_minus1_to_unit:
             image.array.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)

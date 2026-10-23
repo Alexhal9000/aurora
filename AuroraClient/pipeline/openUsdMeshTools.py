@@ -14,6 +14,7 @@ import zipfile
 import numpy as np
 import trimesh
 
+
 OPENUSD_ARCHIVE_EXTENSIONS = (".usdz",)
 OPENUSD_STAGE_EXTENSIONS = (".usdc", ".usd", ".usda")
 

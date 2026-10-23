@@ -29,6 +29,18 @@ from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 
 import matplotlib
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    crash_safe_view,
+    request_subjects,
+    subject_transaction,
+    tracked_rename,
+    tracked_remove,
+    atomic_nib_save,
+    atomic_write_json,
+    atomic_copy,
+    load_nifti_readonly,
+)
 matplotlib.use('Agg') # Use non-interactive backend suitable for web servers
 import matplotlib.pyplot as plt
 
@@ -37,6 +49,7 @@ from .batch_flag_filter import load_flagged_subject_names, apply_flag_filter, no
 from .linkedScans import filter_out_linked_children, get_same_shape_siblings, latest_edit_stem
 from .coordinateFrames import (
     is_preserved_mesh_metadata,
+    list_extracted_scan_names,
     load_extracted_scan_metadata,
     partition_voxel_and_preserved_mesh_scans,
     voxel_only_all_meshes_message,
@@ -197,6 +210,14 @@ def _resize_mask_between_lossy_and_full(arr, target_shape):
 
 
 class SaveMaskView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('save_mask', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -279,8 +300,7 @@ class SaveMaskView(APIView):
                             if 'filename' not in lossy_params[0]:
                                 lossy_params[0]['filename'] = filename_for_metadata
                             # save the updated metadata
-                            with open(metadata_path, 'w') as json_file:
-                                json.dump(metadata, json_file, indent=4)
+                            atomic_write_json(metadata_path, metadata, indent=4)
                         
                         # Handle case where edit is None
                         if edit is not None:
@@ -358,8 +378,7 @@ class SaveMaskView(APIView):
             source_temp_path = os.path.join(base_path, source_mask_temp_filename)
             
             source_mask_img = nib.Nifti1Image(source_mask_array, source_image.affine, header=source_image.header)
-            nib.save(source_mask_img, source_temp_path)
-            os.replace(source_temp_path, source_save_path)
+            atomic_nib_save(source_mask_img, source_save_path)
             
             # Now create the complementary resolution mask
             try:
@@ -378,8 +397,7 @@ class SaveMaskView(APIView):
                     target_temp_path = os.path.join(base_path, target_mask_temp_filename)
                     
                     target_mask_img = nib.Nifti1Image(scaled_mask, target_image.affine, header=target_image.header)
-                    nib.save(target_mask_img, target_temp_path)
-                    os.replace(target_temp_path, target_save_path)
+                    atomic_nib_save(target_mask_img, target_save_path)
                     
                     resolution_type = "full" if not full_res else "lossy"
                     print(f"Created complementary {resolution_type} resolution mask with resolution factor: {resolution_factor}")
@@ -476,32 +494,23 @@ class LoadMaskView(APIView):
                     status=status.HTTP_404_NOT_FOUND
                 )
             
-            # Temporarily rename to standard extension for nibabel
-            os.replace(file_path, temp_path)
-            print(f"Mask file renamed to: {temp_path}")
-            assert os.path.isfile(temp_path)
-
-            try:
-                # Load the mask using temp file
-                mask_img = nib.load(temp_path)
-                dims = mask_img.header.get_data_shape()
-                mask_data = mask_img.get_fdata()
-                width = dims[0]   # dims[1] in frontend
-                height = dims[1]  # dims[2] in frontend  
-                depth = dims[2]   # dims[3] in frontend
-                
-                # Convert 3D mask back to flat array using reverse of save indexing
-                # Z and Y axes are reversed in the frontend flat array, and Z is the slowest dimension (depth, height, width).
-                # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-                mask_flat = np.round(mask_data[:, ::-1, ::-1].transpose(2, 1, 0).flatten(order='C')).astype(np.uint8)
-                flat_size = mask_flat.size
-                
-                # Convert to list for JSON serialization (OLD - commented out)
-                # brush_data = mask_flat.tolist()
-
-            finally:
-                # Always rename back to original custom extension
-                os.replace(temp_path, file_path)
+            # Read in place (crash-safe rule 2): the mask is never renamed to be read,
+            # so a crash here cannot leave it under a temporary name.
+            mask_img = load_nifti_readonly(file_path)
+            dims = mask_img.header.get_data_shape()
+            mask_data = mask_img.get_fdata()
+            width = dims[0]   # dims[1] in frontend
+            height = dims[1]  # dims[2] in frontend  
+            depth = dims[2]   # dims[3] in frontend
+            
+            # Convert 3D mask back to flat array using reverse of save indexing
+            # Z and Y axes are reversed in the frontend flat array, and Z is the slowest dimension (depth, height, width).
+            # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
+            mask_flat = np.round(mask_data[:, ::-1, ::-1].transpose(2, 1, 0).flatten(order='C')).astype(np.uint8)
+            flat_size = mask_flat.size
+            
+            # Convert to list for JSON serialization (OLD - commented out)
+            # brush_data = mask_flat.tolist()
 
             # Return binary data instead of JSON for better performance with large masks
             response = HttpResponse(mask_flat.tobytes(), content_type='application/octet-stream')
@@ -523,6 +532,14 @@ class LoadMaskView(APIView):
             )
 
 class UploadMaskView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('upload_mask', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -587,8 +604,7 @@ class UploadMaskView(APIView):
                             if 'filename' not in lossy_params[0]:
                                 lossy_params[0]['filename'] = edit
                             # save the updated metadata
-                            with open(metadata_path, 'w') as json_file:
-                                json.dump(metadata, json_file, indent=4)
+                            atomic_write_json(metadata_path, metadata, indent=4)
                         
                         # Get the lossy parameters for the current lossy file
                         lossy_filename = edit
@@ -622,10 +638,7 @@ class UploadMaskView(APIView):
             try:
                 # Load and re-save as temp file with standard extension
                 mask_img = nib.load(temp_upload_path)
-                nib.save(mask_img, full_temp_path)
-                
-                # Rename to custom extension
-                os.replace(full_temp_path, full_save_path)
+                atomic_nib_save(mask_img, full_save_path)
                 
                 # Now create the lossy version
                 try:
@@ -649,8 +662,7 @@ class UploadMaskView(APIView):
                         lossy_temp_path = os.path.join(base_path, lossy_mask_temp_filename)
                         
                         lossy_mask_img = nib.Nifti1Image(scaled_mask, lossy_image.affine, header=lossy_image.header)
-                        nib.save(lossy_mask_img, lossy_temp_path)
-                        os.replace(lossy_temp_path, lossy_save_path)
+                        atomic_nib_save(lossy_mask_img, lossy_save_path)
                         print(f"Created complementary lossy mask with resolution factor: {resolution_factor}")
                         
                 except Exception as e:
@@ -716,21 +728,14 @@ class DownloadMaskView(APIView):
                     status=status.HTTP_404_NOT_FOUND
                 )
             
-            # Temporarily rename to standard extension for serving
-            os.replace(file_path, temp_path)
-            
-            try:
-                # Return the file for download
-                response = FileResponse(
-                    open(temp_path, 'rb'), 
-                    content_type='application/octet-stream'
-                )
-                response['Content-Disposition'] = f'attachment; filename="{mask_filename}"'
-                return response
-            finally:
-                # Always rename back to original custom extension
-                if os.path.isfile(temp_path):
-                    os.replace(temp_path, file_path)
+            # Served straight from its real name (crash-safe rule 2): renaming the mask to
+            # serve it left it under a temporary name if the engine stopped mid-download.
+            response = FileResponse(
+                open(file_path, 'rb'),
+                content_type='application/octet-stream'
+            )
+            response['Content-Disposition'] = f'attachment; filename="{mask_filename}"'
+            return response
             
         except FileNotFoundError:
             return Response(
@@ -750,6 +755,14 @@ class DownloadMaskView(APIView):
             )
 
 class DeleteMaskView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('delete_mask', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -787,13 +800,13 @@ class DeleteMaskView(APIView):
             
             # Delete full resolution mask if it exists
             if os.path.isfile(full_file_path):
-                os.remove(full_file_path)
+                tracked_remove(full_file_path)
                 deleted_files.append(full_mask_filename)
                 print(f"Deleted full resolution mask: {full_mask_filename}")
             
             # Delete lossy mask if it exists
             if os.path.isfile(lossy_file_path):
-                os.remove(lossy_file_path)
+                tracked_remove(lossy_file_path)
                 deleted_files.append(lossy_mask_filename)
                 print(f"Deleted lossy mask: {lossy_mask_filename}")
             
@@ -823,6 +836,14 @@ class DeleteMaskView(APIView):
 
 
 class CopyMaskToReferenceView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('copy_mask_to_reference', lambda request: request_subjects(request, 'selected_scan', 'reference_scan'))
     def post(self, request):
         directory = request.data.get('directory')
         selected_scan = request.data.get('selected_scan')
@@ -891,7 +912,7 @@ class CopyMaskToReferenceView(APIView):
                     temp_dest_path = dest_path + '.tmp'
                     
                     # Copy the file
-                    shutil.copy2(source_path, temp_dest_path)
+                    atomic_copy(source_path, temp_dest_path)
                     
                     # Verify the copy was successful
                     if not os.path.exists(temp_dest_path) or os.path.getsize(temp_dest_path) != os.path.getsize(source_path):
@@ -899,7 +920,7 @@ class CopyMaskToReferenceView(APIView):
                     
                     # Atomic rename to final destination
                     if os.path.exists(dest_path):
-                        os.remove(dest_path)  # Remove existing file
+                        tracked_remove(dest_path)  # Remove existing file
                         overwritten_masks.append(dest_name)
                     else:
                         copied_masks.append(dest_name)
@@ -1107,6 +1128,10 @@ def _elastic_files_for_slot(base_path, filename, edit_num):
     )
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _fix_lossy_compression_after_elastic_bump(metadata_path, old_elastic_num, new_elastic_num):
     """Rename stale elastic lossy_compression / intensity-mapping entries after a slot bump."""
     try:
@@ -1130,12 +1155,15 @@ def _fix_lossy_compression_after_elastic_bump(metadata_path, old_elastic_num, ne
 
         lc.sort(key=_lc_sort_key)
         meta['lossy_compression'] = lc
-        with open(metadata_path, 'w') as f:
-            json.dump(meta, f, indent=4)
+        atomic_write_json(metadata_path, meta, indent=4)
     except Exception as exc:
         print(f"Warning: could not fix lossy_compression after elastic bump: {exc}")
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _clean_masked_slot_metadata(metadata_path, masked_edit_number):
     """Strip stale lossy_compression / intensity-mapping rows for a masked slot before overwrite."""
     try:
@@ -1149,8 +1177,7 @@ def _clean_masked_slot_metadata(metadata_path, masked_edit_number):
         meta['lossy_compression'] = lc
         from .intensityMapping import drop_intensity_mappings_containing
         drop_intensity_mappings_containing(meta, token)
-        with open(metadata_path, 'w') as f:
-            json.dump(meta, f, indent=4)
+        atomic_write_json(metadata_path, meta, indent=4)
     except Exception as exc:
         print(f"Warning: could not clean lossy_compression before masked overwrite: {exc}")
 
@@ -1211,6 +1238,10 @@ def _transfer_mask_to_elastic_via_field(
     return elastic_mask_path, elastic_mask_lossy_path if lossy_img else None
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def _backup_and_apply_mask_to_elastic(
     base_path,
     filename,
@@ -1239,19 +1270,15 @@ def _backup_and_apply_mask_to_elastic(
             if os.path.isfile(backup_path):
                 os.replace(backup_path, img_path)
                 print(f"Restored elastic from backup before re-masking: {stem}")
-            shutil.copy2(img_path, backup_path)
+            atomic_copy(img_path, backup_path)
 
             if not os.path.isfile(mask_path):
                 print(f"Backed up elastic ({stem}); no mask present — image unchanged")
                 continue
 
             mask_temp = mask_path.replace('.nii.mask.gz', '_mask.nii.gz')
-            os.replace(mask_path, mask_temp)
-            try:
-                mask_img = nib.load(mask_temp)
-                mask_arr = np.round(mask_img.get_fdata()).astype(np.uint8)
-            finally:
-                os.replace(mask_temp, mask_path)
+            mask_img = load_nifti_readonly(mask_path)
+            mask_arr = np.round(mask_img.get_fdata()).astype(np.uint8)
 
             combined = np.zeros(mask_arr.shape, dtype=bool)
             for label in labels:
@@ -1272,7 +1299,7 @@ def _backup_and_apply_mask_to_elastic(
                 edata[~combined] = 0
             else:
                 edata[combined] = 0
-            nib.save(nib.Nifti1Image(edata, ei.affine, header=ei.header), img_path)
+            atomic_nib_save(nib.Nifti1Image(edata, ei.affine, header=ei.header), img_path)
             print(f"Backed up and masked elastic ({stem})")
         except Exception as exc:
             print(f"Warning: could not backup/mask elastic ({stem}): {exc}")
@@ -1309,6 +1336,14 @@ class ApplyMaskToImageView(APIView):
         }
     """
     
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_mask_to_image', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -1375,7 +1410,7 @@ class ApplyMaskToImageView(APIView):
                 
                 if os.path.exists(project_settings_source) and not os.path.exists(project_settings_target):
                     os.makedirs(project_settings_target_dir, exist_ok=True)
-                    shutil.copy2(project_settings_source, project_settings_target)
+                    atomic_copy(project_settings_source, project_settings_target)
                     print(f"Copied project_settings.json to: {project_settings_target}")
 
             # ===== CHECK FOR ELASTIC TRANSFORMATIONS =====
@@ -1408,13 +1443,13 @@ class ApplyMaskToImageView(APIView):
                     elastic_inv_dst = os.path.join(target_subject_dir, f"{filename}_edit_1_elastic_inv.nii.gz")
                     
                     if os.path.exists(elastic_fwd_src):
-                        shutil.copy2(elastic_fwd_src, elastic_fwd_dst)
+                        atomic_copy(elastic_fwd_src, elastic_fwd_dst)
                         print(f"Copied elastic forward transformation to: {elastic_fwd_dst}")
                     else:
                         print(f"Warning: Elastic forward transformation not found at: {elastic_fwd_src}")
                     
                     if os.path.exists(elastic_inv_src):
-                        shutil.copy2(elastic_inv_src, elastic_inv_dst)
+                        atomic_copy(elastic_inv_src, elastic_inv_dst)
                         print(f"Copied elastic inverse transformation to: {elastic_inv_dst}")
                     else:
                         print(f"Warning: Elastic inverse transformation not found at: {elastic_inv_src}")
@@ -1432,7 +1467,7 @@ class ApplyMaskToImageView(APIView):
             # This follows the platform convention of having a raw file at the top level
             empty_header = nib.Nifti1Header()
             empty_img = nib.Nifti1Image(np.zeros((1, 1, 1), dtype=np.uint8), np.eye(4), header=empty_header)
-            nib.save(empty_img, empty_raw_path)
+            atomic_nib_save(empty_img, empty_raw_path)
 
             print(f"Created empty raw file: {empty_raw_path}")
             saved_files = [empty_raw_filename]
@@ -1453,8 +1488,7 @@ class ApplyMaskToImageView(APIView):
                 else:
                     target_metadata_path = os.path.join(target_subject_dir, f"{filename}.json")
                 
-                with open(target_metadata_path, 'w') as f:
-                    json.dump(metadata_copy, f, indent=4)
+                atomic_write_json(target_metadata_path, metadata_copy, indent=4)
                 
                 print(f"Copied metadata to: {target_metadata_path}")
             else:
@@ -1476,15 +1510,10 @@ class ApplyMaskToImageView(APIView):
                 )
             
             # Load mask with temporary rename
-            os.replace(full_mask_path, full_mask_temp_path)
             
-            try:
-                mask_img = nib.load(full_mask_temp_path)
-                # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-                mask_data_3d = np.round(mask_img.get_fdata()).astype(np.uint8)
-            finally:
-                # Always rename back
-                os.replace(full_mask_temp_path, full_mask_path)
+            mask_img = load_nifti_readonly(full_mask_path)
+            # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
+            mask_data_3d = np.round(mask_img.get_fdata()).astype(np.uint8)
             
             # ===== LOAD AND APPLY MASK TO FULL RESOLUTION IMAGE =====
             full_image_filename = f"{full_edit}.nii.gz"
@@ -1533,7 +1562,7 @@ class ApplyMaskToImageView(APIView):
                 full_image_img.affine, 
                 header=full_image_img.header
             )
-            nib.save(full_masked_img, full_output_path)
+            atomic_nib_save(full_masked_img, full_output_path)
 
             print(f"Saved full resolution masked image: {full_output_path}")
             saved_files.append(full_output_filename)
@@ -1543,7 +1572,7 @@ class ApplyMaskToImageView(APIView):
             placeholder_full_path = os.path.join(target_subject_dir, placeholder_full_filename)
             empty_header = nib.Nifti1Header()
             empty_img = nib.Nifti1Image(np.zeros((1, 1, 1), dtype=np.uint8), np.eye(4), header=empty_header)
-            nib.save(empty_img, placeholder_full_path)
+            atomic_nib_save(empty_img, placeholder_full_path)
             print(f"Created empty placeholder: {placeholder_full_path}")
             saved_files.append(placeholder_full_filename)
 
@@ -1571,7 +1600,7 @@ class ApplyMaskToImageView(APIView):
                 # Create empty placeholder for {filename}_lossy.nii.gz for frontend compatibility
                 placeholder_lossy_filename = f"{filename}_lossy.nii.gz"
                 placeholder_lossy_path = os.path.join(target_subject_dir, placeholder_lossy_filename)
-                nib.save(empty_img, placeholder_lossy_path)
+                atomic_nib_save(empty_img, placeholder_lossy_path)
                 print(f"Created empty placeholder: {placeholder_lossy_path}")
                 saved_files.append(placeholder_lossy_filename)
                 
@@ -1607,7 +1636,7 @@ class ApplyMaskToImageView(APIView):
                             lossy_image.affine,
                             header=lossy_image.header
                         )
-                        nib.save(lossy_masked_img, lossy_output_path)
+                        atomic_nib_save(lossy_masked_img, lossy_output_path)
                         print(f"Saved lossy resolution masked image (uncompressed fallback): {lossy_output_path}")
                         saved_files.append(lossy_output_filename)
                 except Exception as fallback_error:
@@ -1719,10 +1748,8 @@ class BatchApplyMaskToScansView(APIView):
                 )
             
             # Get all subject directories
-            subject_dirs = [
-                d for d in os.listdir(extracted_dir)
-                if os.path.isdir(os.path.join(extracted_dir, d)) and d != "project_settings.json"
-            ]
+            # Only real subject folders (holding <name>.json); cache folders such as figures_cache are skipped
+            subject_dirs = list_extracted_scan_names(directory, log_prefix="BatchApplyMaskToScans")
 
             # Check if atlas directory exists alongside extracted
             atlas_dir = os.path.join(directory, "atlas")
@@ -1790,211 +1817,209 @@ class BatchApplyMaskToScansView(APIView):
             
             if os.path.exists(project_settings_source) and not os.path.exists(project_settings_target):
                 os.makedirs(project_settings_target_dir, exist_ok=True)
-                shutil.copy2(project_settings_source, project_settings_target)
+                atomic_copy(project_settings_source, project_settings_target)
                 print(f"Copied project_settings.json to mask folder")
             
             # Process each subject
             for idx, subject_name in enumerate(subject_dirs):
                 try:
                     # Send progress update
-                    progress = int((idx / len(subject_dirs)))
-                    if channel_layer is not None:
-                        async_to_sync(channel_layer.group_send)(
-                            'progress_group',
-                            {
-                                'type': 'send_progress',
-                                'progress': progress,
-                                'scan_name': subject_name,
-                                'total': len(subject_dirs),
-                                'custom_message': f'Processing {subject_name}...',
-                                'current': idx + 1,
-                            }
-                        )
-                    if subject_name == "atlas":
-                        subject_path = os.path.join(directory, "atlas")
-                    else:
-                        subject_path = os.path.join(extracted_dir, subject_name)
+                    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                    # subject is one transaction. A crash or an exception rolls back only this subject;
+                    # the subjects already finished stay done. New derivative files go inside this
+                    # block, written with the atomic_* helpers.
+                    with subject_transaction(directory, subject_name, 'batch_apply_mask', linked=propagate_linked):
+                        progress = int((idx / len(subject_dirs)))
+                        if channel_layer is not None:
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': subject_name,
+                                    'total': len(subject_dirs),
+                                    'custom_message': f'Processing {subject_name}...',
+                                    'current': idx + 1,
+                                }
+                            )
+                        if subject_name == "atlas":
+                            subject_path = os.path.join(directory, "atlas")
+                        else:
+                            subject_path = os.path.join(extracted_dir, subject_name)
 
-                    if not os.path.isdir(subject_path):
-                        skipped_subjects.append({
-                            "subject": subject_name,
-                            "reason": f"Subject directory not found: {subject_path}"
-                        })
-                        print(f"Skipping {subject_name}: directory not found")
-                        continue
+                        if not os.path.isdir(subject_path):
+                            skipped_subjects.append({
+                                "subject": subject_name,
+                                "reason": f"Subject directory not found: {subject_path}"
+                            })
+                            print(f"Skipping {subject_name}: directory not found")
+                            continue
                     
-                    # Find the latest edit with a mask
-                    # Look for files matching pattern: {subject_name}_edit_*.nii.mask.gz (full resolution only)
-                    # Filter out lossy masks to ensure we work with full resolution masks
-                    mask_files = [
-                        f for f in os.listdir(subject_path)
-                        if f.endswith('.nii.mask.gz') and f.startswith(subject_name) and '_lossy' not in f
-                    ]
+                        # Find the latest edit with a mask
+                        # Look for files matching pattern: {subject_name}_edit_*.nii.mask.gz (full resolution only)
+                        # Filter out lossy masks to ensure we work with full resolution masks
+                        mask_files = [
+                            f for f in os.listdir(subject_path)
+                            if f.endswith('.nii.mask.gz') and f.startswith(subject_name) and '_lossy' not in f
+                        ]
                     
-                    if not mask_files:
-                        skipped_subjects.append({
-                            "subject": subject_name,
-                            "reason": "No mask found"
-                        })
-                        print(f"Skipping {subject_name}: No mask found")
-                        continue
+                        if not mask_files:
+                            skipped_subjects.append({
+                                "subject": subject_name,
+                                "reason": "No mask found"
+                            })
+                            print(f"Skipping {subject_name}: No mask found")
+                            continue
                     
-                    # Sort to get the latest edit (assumes edit numbers are sequential)
-                    mask_files.sort()
-                    latest_mask_file = mask_files[-1]
+                        # Sort to get the latest edit (assumes edit numbers are sequential)
+                        mask_files.sort()
+                        latest_mask_file = mask_files[-1]
                     
-                    # Extract edit name from mask file
-                    # Pattern: {subject_name}_edit_X_suffix.nii.mask.gz -> {subject_name}_edit_X_suffix
-                    edit_name = latest_mask_file.replace('.nii.mask.gz', '')
+                        # Extract edit name from mask file
+                        # Pattern: {subject_name}_edit_X_suffix.nii.mask.gz -> {subject_name}_edit_X_suffix
+                        edit_name = latest_mask_file.replace('.nii.mask.gz', '')
                     
-                    # Load mask temporarily
-                    mask_path = os.path.join(subject_path, latest_mask_file)
-                    temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask.nii.gz')
+                        # Load mask temporarily
+                        mask_path = os.path.join(subject_path, latest_mask_file)
+                        temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask.nii.gz')
                     
-                    os.replace(mask_path, temp_mask_path)
                     
-                    try:
-                        mask_img = nib.load(temp_mask_path)
+                        mask_img = load_nifti_readonly(mask_path)
                         # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
                         mask_data = np.round(mask_img.get_fdata()).astype(np.uint8)
-                    finally:
-                        os.replace(temp_mask_path, mask_path)
                     
-                    # Check if the mask contains the specified label
-                    unique_labels = np.unique(mask_data)
-                    if label not in unique_labels:
-                        skipped_subjects.append({
-                            "subject": subject_name,
-                            "reason": f"Label {label} not found in mask (available: {unique_labels.tolist()})"
-                        })
-                        print(f"Skipping {subject_name}: Label {label} not found")
-                        continue
+                        # Check if the mask contains the specified label
+                        unique_labels = np.unique(mask_data)
+                        if label not in unique_labels:
+                            skipped_subjects.append({
+                                "subject": subject_name,
+                                "reason": f"Label {label} not found in mask (available: {unique_labels.tolist()})"
+                            })
+                            print(f"Skipping {subject_name}: Label {label} not found")
+                            continue
                     
-                    # Create binary mask for only this label, then optional dilation
-                    label_mask_bool = mask_data == label
-                    if dilation > 0:
-                        label_mask_bool = _dilate_binary_mask(label_mask_bool, dilation)
-                    label_mask = label_mask_bool.astype(np.uint8)
+                        # Create binary mask for only this label, then optional dilation
+                        label_mask_bool = mask_data == label
+                        if dilation > 0:
+                            label_mask_bool = _dilate_binary_mask(label_mask_bool, dilation)
+                        label_mask = label_mask_bool.astype(np.uint8)
                     
-                    # Load the corresponding image
-                    image_file = f"{edit_name}.nii.gz"
-                    image_path = os.path.join(subject_path, image_file)
+                        # Load the corresponding image
+                        image_file = f"{edit_name}.nii.gz"
+                        image_path = os.path.join(subject_path, image_file)
                     
-                    if not os.path.exists(image_path):
-                        skipped_subjects.append({
-                            "subject": subject_name,
-                            "reason": f"Image file not found: {image_file}"
-                        })
-                        print(f"Skipping {subject_name}: Image file not found")
-                        continue
+                        if not os.path.exists(image_path):
+                            skipped_subjects.append({
+                                "subject": subject_name,
+                                "reason": f"Image file not found: {image_file}"
+                            })
+                            print(f"Skipping {subject_name}: Image file not found")
+                            continue
                     
-                    image_img = nib.load(image_path)
-                    image_data = image_img.get_fdata()
+                        image_img = nib.load(image_path)
+                        image_data = image_img.get_fdata()
                     
-                    # Apply label-specific mask
-                    masked_image_data = image_data * label_mask
+                        # Apply label-specific mask
+                        masked_image_data = image_data * label_mask
                     
-                    # Create output directory for this subject
-                    if subject_name == "atlas":
-                        target_subject_dir = os.path.join(masks_base_dir, "atlas")
-                    else:
-                        target_subject_dir = os.path.join(masks_base_dir, "extracted", subject_name)
-                    os.makedirs(target_subject_dir, exist_ok=True)
+                        # Create output directory for this subject
+                        if subject_name == "atlas":
+                            target_subject_dir = os.path.join(masks_base_dir, "atlas")
+                        else:
+                            target_subject_dir = os.path.join(masks_base_dir, "extracted", subject_name)
+                        os.makedirs(target_subject_dir, exist_ok=True)
                     
-                    # Extract suffix from edit name
-                    suffix = ""
-                    suffix_pattern = f"{subject_name}_edit_\\d+(.*)$"
-                    match = re.match(suffix_pattern, edit_name)
-                    if match:
-                        suffix = match.group(1)
+                        # Extract suffix from edit name
+                        suffix = ""
+                        suffix_pattern = f"{subject_name}_edit_\\d+(.*)$"
+                        match = re.match(suffix_pattern, edit_name)
+                        if match:
+                            suffix = match.group(1)
                     
-                    # Save as edit_0
-                    output_filename = f"{subject_name}_edit_0{suffix}.nii.gz"
-                    output_path = os.path.join(target_subject_dir, output_filename)
+                        # Save as edit_0
+                        output_filename = f"{subject_name}_edit_0{suffix}.nii.gz"
+                        output_path = os.path.join(target_subject_dir, output_filename)
                     
-                    masked_img = nib.Nifti1Image(
-                        masked_image_data,
-                        image_img.affine,
-                        header=image_img.header
-                    )
-                    nib.save(masked_img, output_path)
-                    
-                    # Copy metadata (without lossy_compression)
-                    metadata_source = os.path.join(subject_path, f"{subject_name}.json")
-                    metadata_copy = {}
-                    if os.path.exists(metadata_source):
-                        with open(metadata_source, 'r') as f:
-                            metadata = json.load(f)
-                        
-                        metadata_copy = metadata.copy()
-                        if 'lossy_compression' in metadata_copy:
-                            del metadata_copy['lossy_compression']
-                        
-                        metadata_target = os.path.join(target_subject_dir, f"{subject_name}.json")
-                        with open(metadata_target, 'w') as f:
-                            json.dump(metadata_copy, f, indent=4)
-                    
-                    # Create empty placeholder files
-                    empty_header = nib.Nifti1Header()
-                    empty_img = nib.Nifti1Image(np.zeros((1, 1, 1), dtype=np.uint8), np.eye(4), header=empty_header)
-                    
-                    placeholder_path = os.path.join(target_subject_dir, f"{subject_name}.nii.gz")
-                    nib.save(empty_img, placeholder_path)
-                    
-                    # Try to create lossy version with compression
-                    try:
-                        lossy_filename = f"{subject_name}_lossy_edit_0{suffix}.nii.gz"
-                        lossy_path = os.path.join(target_subject_dir, lossy_filename)
-                        
-                        voxel_size = metadata_copy.get('voxel_size', 1.0)
-                        registration_tools = RegistrationTools()
-                        registration_tools.save_as_lossy_nifti(
+                        masked_img = nib.Nifti1Image(
                             masked_image_data,
-                            voxel_size,
-                            metadata_target,
-                            lossy_path
+                            image_img.affine,
+                            header=image_img.header
                         )
-                        
-                        placeholder_lossy_path = os.path.join(target_subject_dir, f"{subject_name}_lossy.nii.gz")
-                        nib.save(empty_img, placeholder_lossy_path)
-                    except Exception as e:
-                        print(f"Warning: Could not create lossy version for {subject_name}: {str(e)}")
+                        atomic_nib_save(masked_img, output_path)
                     
-                    # Copy elastic transformations if they exist (atlas has no elastic transfer path)
-                    edit_number = None
-                    if subject_name != "atlas" and '_edit_' in edit_name:
+                        # Copy metadata (without lossy_compression)
+                        metadata_source = os.path.join(subject_path, f"{subject_name}.json")
+                        metadata_copy = {}
+                        if os.path.exists(metadata_source):
+                            with open(metadata_source, 'r') as f:
+                                metadata = json.load(f)
+                        
+                            metadata_copy = metadata.copy()
+                            if 'lossy_compression' in metadata_copy:
+                                del metadata_copy['lossy_compression']
+                        
+                            metadata_target = os.path.join(target_subject_dir, f"{subject_name}.json")
+                            atomic_write_json(metadata_target, metadata_copy, indent=4)
+                    
+                        # Create empty placeholder files
+                        empty_header = nib.Nifti1Header()
+                        empty_img = nib.Nifti1Image(np.zeros((1, 1, 1), dtype=np.uint8), np.eye(4), header=empty_header)
+                    
+                        placeholder_path = os.path.join(target_subject_dir, f"{subject_name}.nii.gz")
+                        atomic_nib_save(empty_img, placeholder_path)
+                    
+                        # Try to create lossy version with compression
                         try:
-                            edit_number = int(edit_name.split('_edit_')[-1].split('_')[0])
-                        except (ValueError, IndexError):
-                            pass
-                    
-                    if edit_number is not None:
-                        next_edit = edit_number + 1
-                        elastic_fwd_src = os.path.join(subject_path, f"{subject_name}_edit_{next_edit}_elastic_fwd.nii.gz")
-                        elastic_inv_src = os.path.join(subject_path, f"{subject_name}_edit_{next_edit}_elastic_inv.nii.gz")
+                            lossy_filename = f"{subject_name}_lossy_edit_0{suffix}.nii.gz"
+                            lossy_path = os.path.join(target_subject_dir, lossy_filename)
                         
-                        if os.path.exists(elastic_fwd_src) or os.path.exists(elastic_inv_src):
-                            elastic_fwd_dst = os.path.join(target_subject_dir, f"{subject_name}_edit_1_elastic_fwd.nii.gz")
-                            elastic_inv_dst = os.path.join(target_subject_dir, f"{subject_name}_edit_1_elastic_inv.nii.gz")
+                            voxel_size = metadata_copy.get('voxel_size', 1.0)
+                            registration_tools = RegistrationTools()
+                            registration_tools.save_as_lossy_nifti(
+                                masked_image_data,
+                                voxel_size,
+                                metadata_target,
+                                lossy_path
+                            )
+                        
+                            placeholder_lossy_path = os.path.join(target_subject_dir, f"{subject_name}_lossy.nii.gz")
+                            atomic_nib_save(empty_img, placeholder_lossy_path)
+                        except Exception as e:
+                            print(f"Warning: Could not create lossy version for {subject_name}: {str(e)}")
+                    
+                        # Copy elastic transformations if they exist (atlas has no elastic transfer path)
+                        edit_number = None
+                        if subject_name != "atlas" and '_edit_' in edit_name:
+                            try:
+                                edit_number = int(edit_name.split('_edit_')[-1].split('_')[0])
+                            except (ValueError, IndexError):
+                                pass
+                    
+                        if edit_number is not None:
+                            next_edit = edit_number + 1
+                            elastic_fwd_src = os.path.join(subject_path, f"{subject_name}_edit_{next_edit}_elastic_fwd.nii.gz")
+                            elastic_inv_src = os.path.join(subject_path, f"{subject_name}_edit_{next_edit}_elastic_inv.nii.gz")
+                        
+                            if os.path.exists(elastic_fwd_src) or os.path.exists(elastic_inv_src):
+                                elastic_fwd_dst = os.path.join(target_subject_dir, f"{subject_name}_edit_1_elastic_fwd.nii.gz")
+                                elastic_inv_dst = os.path.join(target_subject_dir, f"{subject_name}_edit_1_elastic_inv.nii.gz")
                             
-                            if os.path.exists(elastic_fwd_src):
-                                shutil.copy2(elastic_fwd_src, elastic_fwd_dst)
-                            if os.path.exists(elastic_inv_src):
-                                shutil.copy2(elastic_inv_src, elastic_inv_dst)
+                                if os.path.exists(elastic_fwd_src):
+                                    atomic_copy(elastic_fwd_src, elastic_fwd_dst)
+                                if os.path.exists(elastic_inv_src):
+                                    atomic_copy(elastic_inv_src, elastic_inv_dst)
 
-                            # The elastic edit is already in reference space, so save a
-                            # masked copy directly (no transform) into the mask folder.
-                            _e_img_src  = os.path.join(subject_path, f"{subject_name}_edit_{next_edit}_elastic.nii.gz")
-                            _e_mask_src = os.path.join(subject_path, f"{subject_name}_edit_{next_edit}_elastic.nii.mask.gz")
-                            if os.path.exists(_e_img_src):
-                                try:
-                                    _ei = nib.load(_e_img_src)
-                                    _edata = _ei.get_fdata().copy()
-                                    if os.path.exists(_e_mask_src):
-                                        _e_mask_temp = _e_mask_src.replace('.nii.mask.gz', '_mask.nii.gz')
-                                        os.replace(_e_mask_src, _e_mask_temp)
-                                        try:
-                                            _em = nib.load(_e_mask_temp)
+                                # The elastic edit is already in reference space, so save a
+                                # masked copy directly (no transform) into the mask folder.
+                                _e_img_src  = os.path.join(subject_path, f"{subject_name}_edit_{next_edit}_elastic.nii.gz")
+                                _e_mask_src = os.path.join(subject_path, f"{subject_name}_edit_{next_edit}_elastic.nii.mask.gz")
+                                if os.path.exists(_e_img_src):
+                                    try:
+                                        _ei = nib.load(_e_img_src)
+                                        _edata = _ei.get_fdata().copy()
+                                        if os.path.exists(_e_mask_src):
+                                            _e_mask_temp = _e_mask_src.replace('.nii.mask.gz', '_mask.nii.gz')
+                                            _em = load_nifti_readonly(_e_mask_src)
                                             # Round before astype to avoid truncating floats
                                             _emdata = np.round(_em.get_fdata()).astype(np.uint8)
                                             if label in np.unique(_emdata):
@@ -2004,139 +2029,136 @@ class BatchApplyMaskToScansView(APIView):
                                                         _e_lmask.astype(bool), dilation
                                                     ).astype(np.uint8)
                                                 _edata = _edata * _e_lmask
-                                        finally:
-                                            os.replace(_e_mask_temp, _e_mask_src)
-                                    _e_img_dst = os.path.join(target_subject_dir, f"{subject_name}_edit_1_elastic.nii.gz")
-                                    nib.save(nib.Nifti1Image(_edata, _ei.affine, header=_ei.header), _e_img_dst)
-                                    print(f"Saved masked elastic copy to mask folder: {subject_name}")
-                                except Exception as _ce:
-                                    print(f"Warning: could not save elastic copy for {subject_name}: {_ce}")
+                                        _e_img_dst = os.path.join(target_subject_dir, f"{subject_name}_edit_1_elastic.nii.gz")
+                                        atomic_nib_save(nib.Nifti1Image(_edata, _ei.affine, header=_ei.header), _e_img_dst)
+                                        print(f"Saved masked elastic copy to mask folder: {subject_name}")
+                                    except Exception as _ce:
+                                        print(f"Warning: could not save elastic copy for {subject_name}: {_ce}")
 
-                    processed_subjects.append(subject_name)
-                    print(f"Successfully processed {subject_name} with label {label}")
+                        processed_subjects.append(subject_name)
+                        print(f"Successfully processed {subject_name} with label {label}")
                     
-                    # Propagate to same-shape linked siblings
-                    if propagate_linked and subject_name != "atlas":
-                        try:
-                            siblings, sib_err = get_same_shape_siblings(directory, subject_name)
-                            if sib_err:
-                                print(f"Could not resolve siblings for {subject_name}: {sib_err}")
-                            elif siblings:
-                                print(f"Propagating mask from {subject_name} to {len(siblings)} siblings: {siblings}")
-                                for sibling_name in siblings:
-                                    try:
-                                        # Always reuse the main's final (already dilated) label mask.
-                                        # Segmenting the same label in the sibling's own mask would
-                                        # keep a different set of voxels per channel.
-                                        sib_label_mask = label_mask
-
-                                        sib_edit_name = latest_edit_stem(directory, sibling_name)
-                                        if sib_edit_name is None:
-                                            linked_propagation_results.append({
-                                                'scan_name': sibling_name,
-                                                'status': 'skipped',
-                                                'reason': 'latest edit is elastic'
-                                            })
-                                            continue
-                                        
-                                        # Load sibling image
-                                        sib_image_file = f"{sib_edit_name}.nii.gz"
-                                        sib_image_path = os.path.join(extracted_dir, sibling_name, sib_image_file)
-                                        if not os.path.exists(sib_image_path):
-                                            linked_propagation_results.append({
-                                                'scan_name': sibling_name,
-                                                'status': 'skipped',
-                                                'reason': f'image file not found: {sib_image_file}'
-                                            })
-                                            print(f"  Sibling {sibling_name} image not found, skipping")
-                                            continue
-                                        
-                                        sib_image_img = nib.load(sib_image_path)
-                                        sib_image_data = sib_image_img.get_fdata()
-
-                                        if sib_image_data.shape != sib_label_mask.shape:
-                                            linked_propagation_results.append({
-                                                'scan_name': sibling_name,
-                                                'status': 'skipped',
-                                                'reason': f'shape mismatch: {sib_image_data.shape} vs {sib_label_mask.shape}'
-                                            })
-                                            continue
-                                        
-                                        # Apply label mask
-                                        sib_masked_data = sib_image_data * sib_label_mask
-                                        
-                                        # Create output directory
-                                        sib_target_dir = os.path.join(masks_base_dir, "extracted", sibling_name)
-                                        os.makedirs(sib_target_dir, exist_ok=True)
-                                        
-                                        # Extract suffix from edit name
-                                        sib_suffix = ""
-                                        sib_suffix_pattern = f"{sibling_name}_edit_\\d+(.*)$"
-                                        sib_match = re.match(sib_suffix_pattern, sib_edit_name)
-                                        if sib_match:
-                                            sib_suffix = sib_match.group(1)
-                                        
-                                        # Save as edit_0
-                                        sib_output_filename = f"{sibling_name}_edit_0{sib_suffix}.nii.gz"
-                                        sib_output_path = os.path.join(sib_target_dir, sib_output_filename)
-                                        sib_masked_img = nib.Nifti1Image(
-                                            sib_masked_data,
-                                            sib_image_img.affine,
-                                            header=sib_image_img.header
-                                        )
-                                        nib.save(sib_masked_img, sib_output_path)
-                                        
-                                        # Copy metadata
-                                        sib_metadata_source = os.path.join(extracted_dir, sibling_name, f"{sibling_name}.json")
-                                        sib_metadata_copy = {}
-                                        if os.path.exists(sib_metadata_source):
-                                            with open(sib_metadata_source, 'r') as f:
-                                                sib_metadata = json.load(f)
-                                            sib_metadata_copy = sib_metadata.copy()
-                                            if 'lossy_compression' in sib_metadata_copy:
-                                                del sib_metadata_copy['lossy_compression']
-                                            sib_metadata_target = os.path.join(sib_target_dir, f"{sibling_name}.json")
-                                            with open(sib_metadata_target, 'w') as f:
-                                                json.dump(sib_metadata_copy, f, indent=4)
-                                        
-                                        # Create empty placeholder files
-                                        empty_header = nib.Nifti1Header()
-                                        empty_img = nib.Nifti1Image(np.zeros((1, 1, 1), dtype=np.uint8), np.eye(4), header=empty_header)
-                                        sib_placeholder_path = os.path.join(sib_target_dir, f"{sibling_name}.nii.gz")
-                                        nib.save(empty_img, sib_placeholder_path)
-                                        
-                                        # Try to create lossy version
+                        # Propagate to same-shape linked siblings
+                        if propagate_linked and subject_name != "atlas":
+                            try:
+                                siblings, sib_err = get_same_shape_siblings(directory, subject_name)
+                                if sib_err:
+                                    print(f"Could not resolve siblings for {subject_name}: {sib_err}")
+                                elif siblings:
+                                    print(f"Propagating mask from {subject_name} to {len(siblings)} siblings: {siblings}")
+                                    for sibling_name in siblings:
                                         try:
-                                            sib_lossy_filename = f"{sibling_name}_lossy_edit_0{sib_suffix}.nii.gz"
-                                            sib_lossy_path = os.path.join(sib_target_dir, sib_lossy_filename)
-                                            sib_voxel_size = sib_metadata_copy.get('voxel_size', 1.0)
-                                            registration_tools = RegistrationTools()
-                                            registration_tools.save_as_lossy_nifti(
-                                                sib_masked_data,
-                                                sib_voxel_size,
-                                                sib_metadata_target if os.path.exists(sib_metadata_source) else None,
-                                                sib_lossy_path
-                                            )
-                                            sib_placeholder_lossy_path = os.path.join(sib_target_dir, f"{sibling_name}_lossy.nii.gz")
-                                            nib.save(empty_img, sib_placeholder_lossy_path)
-                                        except Exception as e:
-                                            print(f"  Warning: Could not create lossy version for sibling {sibling_name}: {str(e)}")
+                                            # Always reuse the main's final (already dilated) label mask.
+                                            # Segmenting the same label in the sibling's own mask would
+                                            # keep a different set of voxels per channel.
+                                            sib_label_mask = label_mask
 
-                                        linked_propagation_results.append({
-                                            'scan_name': sibling_name,
-                                            'status': 'success'
-                                        })
-                                        print(f"  Successfully propagated mask to sibling {sibling_name}")
+                                            sib_edit_name = latest_edit_stem(directory, sibling_name)
+                                            if sib_edit_name is None:
+                                                linked_propagation_results.append({
+                                                    'scan_name': sibling_name,
+                                                    'status': 'skipped',
+                                                    'reason': 'latest edit is elastic'
+                                                })
+                                                continue
                                         
-                                    except Exception as sib_e:
-                                        linked_propagation_results.append({
-                                            'scan_name': sibling_name,
-                                            'status': 'failed',
-                                            'reason': str(sib_e)
-                                        })
-                                        print(f"  Error propagating to sibling {sibling_name}: {sib_e}")
-                        except Exception as prop_e:
-                            print(f"Error in linked propagation for {subject_name}: {prop_e}")
+                                            # Load sibling image
+                                            sib_image_file = f"{sib_edit_name}.nii.gz"
+                                            sib_image_path = os.path.join(extracted_dir, sibling_name, sib_image_file)
+                                            if not os.path.exists(sib_image_path):
+                                                linked_propagation_results.append({
+                                                    'scan_name': sibling_name,
+                                                    'status': 'skipped',
+                                                    'reason': f'image file not found: {sib_image_file}'
+                                                })
+                                                print(f"  Sibling {sibling_name} image not found, skipping")
+                                                continue
+                                        
+                                            sib_image_img = nib.load(sib_image_path)
+                                            sib_image_data = sib_image_img.get_fdata()
+
+                                            if sib_image_data.shape != sib_label_mask.shape:
+                                                linked_propagation_results.append({
+                                                    'scan_name': sibling_name,
+                                                    'status': 'skipped',
+                                                    'reason': f'shape mismatch: {sib_image_data.shape} vs {sib_label_mask.shape}'
+                                                })
+                                                continue
+                                        
+                                            # Apply label mask
+                                            sib_masked_data = sib_image_data * sib_label_mask
+                                        
+                                            # Create output directory
+                                            sib_target_dir = os.path.join(masks_base_dir, "extracted", sibling_name)
+                                            os.makedirs(sib_target_dir, exist_ok=True)
+                                        
+                                            # Extract suffix from edit name
+                                            sib_suffix = ""
+                                            sib_suffix_pattern = f"{sibling_name}_edit_\\d+(.*)$"
+                                            sib_match = re.match(sib_suffix_pattern, sib_edit_name)
+                                            if sib_match:
+                                                sib_suffix = sib_match.group(1)
+                                        
+                                            # Save as edit_0
+                                            sib_output_filename = f"{sibling_name}_edit_0{sib_suffix}.nii.gz"
+                                            sib_output_path = os.path.join(sib_target_dir, sib_output_filename)
+                                            sib_masked_img = nib.Nifti1Image(
+                                                sib_masked_data,
+                                                sib_image_img.affine,
+                                                header=sib_image_img.header
+                                            )
+                                            atomic_nib_save(sib_masked_img, sib_output_path)
+                                        
+                                            # Copy metadata
+                                            sib_metadata_source = os.path.join(extracted_dir, sibling_name, f"{sibling_name}.json")
+                                            sib_metadata_copy = {}
+                                            if os.path.exists(sib_metadata_source):
+                                                with open(sib_metadata_source, 'r') as f:
+                                                    sib_metadata = json.load(f)
+                                                sib_metadata_copy = sib_metadata.copy()
+                                                if 'lossy_compression' in sib_metadata_copy:
+                                                    del sib_metadata_copy['lossy_compression']
+                                                sib_metadata_target = os.path.join(sib_target_dir, f"{sibling_name}.json")
+                                                atomic_write_json(sib_metadata_target, sib_metadata_copy, indent=4)
+                                        
+                                            # Create empty placeholder files
+                                            empty_header = nib.Nifti1Header()
+                                            empty_img = nib.Nifti1Image(np.zeros((1, 1, 1), dtype=np.uint8), np.eye(4), header=empty_header)
+                                            sib_placeholder_path = os.path.join(sib_target_dir, f"{sibling_name}.nii.gz")
+                                            atomic_nib_save(empty_img, sib_placeholder_path)
+                                        
+                                            # Try to create lossy version
+                                            try:
+                                                sib_lossy_filename = f"{sibling_name}_lossy_edit_0{sib_suffix}.nii.gz"
+                                                sib_lossy_path = os.path.join(sib_target_dir, sib_lossy_filename)
+                                                sib_voxel_size = sib_metadata_copy.get('voxel_size', 1.0)
+                                                registration_tools = RegistrationTools()
+                                                registration_tools.save_as_lossy_nifti(
+                                                    sib_masked_data,
+                                                    sib_voxel_size,
+                                                    sib_metadata_target if os.path.exists(sib_metadata_source) else None,
+                                                    sib_lossy_path
+                                                )
+                                                sib_placeholder_lossy_path = os.path.join(sib_target_dir, f"{sibling_name}_lossy.nii.gz")
+                                                atomic_nib_save(empty_img, sib_placeholder_lossy_path)
+                                            except Exception as e:
+                                                print(f"  Warning: Could not create lossy version for sibling {sibling_name}: {str(e)}")
+
+                                            linked_propagation_results.append({
+                                                'scan_name': sibling_name,
+                                                'status': 'success'
+                                            })
+                                            print(f"  Successfully propagated mask to sibling {sibling_name}")
+                                        
+                                        except Exception as sib_e:
+                                            linked_propagation_results.append({
+                                                'scan_name': sibling_name,
+                                                'status': 'failed',
+                                                'reason': str(sib_e)
+                                            })
+                                            print(f"  Error propagating to sibling {sibling_name}: {sib_e}")
+                            except Exception as prop_e:
+                                print(f"Error in linked propagation for {subject_name}: {prop_e}")
                     
                 except Exception as e:
                     skipped_subjects.append({
@@ -2152,7 +2174,7 @@ class BatchApplyMaskToScansView(APIView):
                 if not os.path.exists(empty_raw_path):
                     empty_header = nib.Nifti1Header()
                     empty_img = nib.Nifti1Image(np.zeros((1, 1, 1), dtype=np.uint8), np.eye(4), header=empty_header)
-                    nib.save(empty_img, empty_raw_path)
+                    atomic_nib_save(empty_img, empty_raw_path)
             
             # Send final progress update
             if channel_layer is not None:
@@ -2234,6 +2256,14 @@ class MaskOutLabelsView(APIView):
         }
     """
     
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('mask_out_labels', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get('directory')
         filename = request.data.get('filename')
@@ -2354,16 +2384,12 @@ class MaskOutLabelsView(APIView):
             
             # Load mask with temp rename. Keep affine/header so we can rewrite the mask
             # after an overwrite wipe removes the on-disk source under the masked slot.
-            os.replace(full_mask_path, full_mask_temp_path)
-            try:
-                mask_img = nib.load(full_mask_temp_path)
-                mask_affine = mask_img.affine
-                mask_header = mask_img.header.copy()
-                mask_dtype = mask_img.get_data_dtype()
-                # Round before astype to avoid truncating floats
-                mask_data = np.round(mask_img.get_fdata()).astype(np.uint8)
-            finally:
-                os.replace(full_mask_temp_path, full_mask_path)
+            mask_img = load_nifti_readonly(full_mask_path)
+            mask_affine = mask_img.affine
+            mask_header = mask_img.header.copy()
+            mask_dtype = mask_img.get_data_dtype()
+            # Round before astype to avoid truncating floats
+            mask_data = np.round(mask_img.get_fdata()).astype(np.uint8)
 
             # ===== Detect insert-before-elastic (segmentation on edit immediately before elastic) =====
             current_edit_num = _parse_edit_slot_number(full_edit, filename)
@@ -2472,7 +2498,7 @@ class MaskOutLabelsView(APIView):
                     glob.glob(os.path.join(base_path, f"{filename}_lossy_edit_{masked_edit_number}_masked*"))
                 ):
                     try:
-                        os.remove(old_f)
+                        tracked_remove(old_f)
                     except OSError as rm_err:
                         print(f"Warning: could not remove {old_f}: {rm_err}")
                 print(
@@ -2487,7 +2513,7 @@ class MaskOutLabelsView(APIView):
                         f"_edit_{next_edit_num}_elastic",
                         f"_edit_{next_edit_num + 1}_elastic",
                     )
-                    os.rename(src, dst)
+                    tracked_rename(src, dst)
                 masked_edit_number = next_edit_num
                 elastic_edit_num_after = next_edit_num + 1
                 bumped_elastic = True
@@ -2509,7 +2535,7 @@ class MaskOutLabelsView(APIView):
                 full_image_img.affine,
                 header=full_image_img.header
             )
-            nib.save(full_masked_img, full_output_path)
+            atomic_nib_save(full_masked_img, full_output_path)
             print(f"Saved full resolution masked image: {full_output_path}")
             
             # Create lossy version from full resolution masked data
@@ -2545,11 +2571,7 @@ class MaskOutLabelsView(APIView):
             dst_mask_lossy = os.path.join(base_path, f"{lossy_output_name}.nii.mask.gz")
             try:
                 mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
-                nib.save(
-                    nib.Nifti1Image(mask_data.astype(mask_dtype, copy=False), mask_affine, header=mask_header),
-                    mask_temp,
-                )
-                os.replace(mask_temp, dst_mask_full)
+                atomic_nib_save(nib.Nifti1Image(mask_data.astype(mask_dtype, copy=False), mask_affine, header=mask_header), dst_mask_full)
                 print(f"Wrote mask to: {dst_mask_full}")
 
                 # Downsample mask for lossy version
@@ -2572,8 +2594,7 @@ class MaskOutLabelsView(APIView):
                     slices = [slice(None, None, resolution_factor) for _ in range(3)]
                     lossy_mask_arr = mask_data[slices[0], slices[1], slices[2]].astype(mask_dtype)
                     lossy_mask_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
-                    nib.save(nib.Nifti1Image(lossy_mask_arr, lossy_affine), lossy_mask_temp)
-                    os.replace(lossy_mask_temp, dst_mask_lossy)
+                    atomic_nib_save(nib.Nifti1Image(lossy_mask_arr, lossy_affine), dst_mask_lossy)
                     print(f"Created lossy mask: {dst_mask_lossy}")
             except Exception as e:
                 print(f"Warning: Could not write/downsample mask: {str(e)}")
@@ -2631,7 +2652,7 @@ class MaskOutLabelsView(APIView):
 
                 if os.path.isfile(source_landmarks_path):
                     dest_landmarks_path = os.path.join(base_path, f"{full_output_name}_landmarks.json")
-                    shutil.copy2(source_landmarks_path, dest_landmarks_path)
+                    atomic_copy(source_landmarks_path, dest_landmarks_path)
                     print(f"Copied landmarks to: {dest_landmarks_path}")
                     landmarks_copied = True
                 else:
@@ -2644,7 +2665,7 @@ class MaskOutLabelsView(APIView):
                     dest_landmark_distances_path = os.path.join(
                         base_path, f"{full_output_name}_landmark_distances.json"
                     )
-                    shutil.copy2(source_landmark_distances_path, dest_landmark_distances_path)
+                    atomic_copy(source_landmark_distances_path, dest_landmark_distances_path)
                     print(f"Copied landmark distances to: {dest_landmark_distances_path}")
                 else:
                     print(f"No landmark distances found: {source_landmark_distances_path}")
@@ -2778,10 +2799,8 @@ class BatchMaskOutScansView(APIView):
                 )
             
             # Get all subject directories
-            subject_dirs = [
-                d for d in os.listdir(extracted_dir)
-                if os.path.isdir(os.path.join(extracted_dir, d)) and d != "project_settings.json"
-            ]
+            # Only real subject folders (holding <name>.json); cache folders such as figures_cache are skipped
+            subject_dirs = list_extracted_scan_names(directory, log_prefix="BatchMaskOutScans")
 
             # Check if atlas directory exists alongside extracted
             atlas_dir = os.path.join(directory, "atlas")
@@ -2839,429 +2858,419 @@ class BatchMaskOutScansView(APIView):
             for idx, subject_name in enumerate(subject_dirs):
                 try:
                     # Send progress update
-                    progress = idx / len(subject_dirs)
-                    if channel_layer is not None:
-                        async_to_sync(channel_layer.group_send)(
-                            'progress_group',
-                            {
-                                'type': 'send_progress',
-                                'progress': progress,
-                                'scan_name': subject_name,
-                                'total': len(subject_dirs),
-                                'custom_message': f'Processing {subject_name}...',
-                                'current': idx + 1,
-                            }
-                        )
+                    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                    # subject is one transaction. A crash or an exception rolls back only this subject;
+                    # the subjects already finished stay done. New derivative files go inside this
+                    # block, written with the atomic_* helpers.
+                    with subject_transaction(directory, subject_name, 'batch_mask_out'):
+                        progress = idx / len(subject_dirs)
+                        if channel_layer is not None:
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': subject_name,
+                                    'total': len(subject_dirs),
+                                    'custom_message': f'Processing {subject_name}...',
+                                    'current': idx + 1,
+                                }
+                            )
                     
-                    # Determine paths
-                    if subject_name == "atlas":
-                        subject_path = os.path.join(directory, "atlas")
-                        metadata_path = os.path.join(subject_path, "atlas.json")
-                    else:
-                        subject_path = os.path.join(extracted_dir, subject_name)
-                        metadata_path = os.path.join(subject_path, f"{subject_name}.json")
+                        # Determine paths
+                        if subject_name == "atlas":
+                            subject_path = os.path.join(directory, "atlas")
+                            metadata_path = os.path.join(subject_path, "atlas.json")
+                        else:
+                            subject_path = os.path.join(extracted_dir, subject_name)
+                            metadata_path = os.path.join(subject_path, f"{subject_name}.json")
                     
-                    # Load metadata
-                    if not os.path.exists(metadata_path):
-                        skipped_subjects.append({
-                            "subject": subject_name,
-                            "reason": "Metadata not found"
-                        })
-                        print(f"Skipping {subject_name}: Metadata not found")
-                        continue
-                    
-                    with open(metadata_path, 'r') as f:
-                        metadata = json.load(f)
-                    
-                    # --- Step 1: Determine next free edit slot ---
-                    edit_number = 0
-                    while glob.glob(os.path.join(subject_path, f"{subject_name}_edit_{edit_number}_*.nii.gz")):
-                        edit_number += 1
-
-                    # --- Step 2: Detect if latest edit is elastic ---
-                    elastic_edit_num = edit_number - 1
-                    elastic_files_to_bump = (
-                        glob.glob(os.path.join(subject_path, f"{subject_name}_edit_{elastic_edit_num}_elastic*")) +
-                        glob.glob(os.path.join(subject_path, f"{subject_name}_lossy_edit_{elastic_edit_num}_elastic*"))
-                    ) if elastic_edit_num >= 0 else []
-
-                    # --- Step 3: Detect if a masked insertion already exists before the elastic ---
-                    # After a previous run the layout is: ..._edit_{E-1}_*, _edit_{E}_masked, _edit_{E+1}_elastic
-                    # so pre_masked_edit_num == E and source_for_overwrite == E-1.
-                    # The elastic backup marks a real insert; a masked edit the elastic was run
-                    # on has none and is treated as an ordinary edit before elastic.
-                    already_inserted = False
-                    pre_masked_edit_num = elastic_edit_num - 1
-                    if elastic_files_to_bump and pre_masked_edit_num >= 0:
-                        already_inserted = bool(glob.glob(
-                            os.path.join(subject_path, f"{subject_name}_edit_{pre_masked_edit_num}_*masked*.nii.gz")
-                        )) and os.path.isfile(
-                            os.path.join(subject_path, f"{subject_name}_edit_{elastic_edit_num}_elastic.nii.backup.gz")
-                        )
-
-                    # Also detect when the last edit is already masked with no elastic following it.
-                    last_edit_is_masked = (
-                        not elastic_files_to_bump and edit_number > 0 and
-                        bool(glob.glob(
-                            os.path.join(subject_path, f"{subject_name}_edit_{edit_number - 1}_*masked*.nii.gz")
-                        ))
-                    )
-
-                    # --- Step 4: Skip or redirect based on insertion state ---
-                    if not overwrite and (already_inserted or last_edit_is_masked):
-                        reason = (
-                            "Masked edit already inserted before elastic (pass overwrite=True to replace)"
-                            if already_inserted
-                            else "Last edit is already masked (pass overwrite=True to replace)"
-                        )
-                        skipped_subjects.append({"subject": subject_name, "reason": reason})
-                        print(f"Skipping {subject_name}: {reason}")
-                        continue
-
-                    # --- Step 5: Determine source mask file ---
-                    def _source_mask_candidates(source_edit_num):
-                        if source_edit_num < 0:
-                            raw_mask = f"{subject_name}.nii.mask.gz"
-                            return [raw_mask] if os.path.exists(os.path.join(subject_path, raw_mask)) else []
-                        return sorted([
-                            f for f in os.listdir(subject_path)
-                            if f.endswith('.nii.mask.gz') and f.startswith(subject_name)
-                            and '_lossy' not in f and f'_edit_{source_edit_num}_' in f
-                        ])
-
-                    if already_inserted:
-                        # Overwrite path: source is the edit immediately before the existing masked slot
-                        source_edit_num = pre_masked_edit_num - 1
-                        source_mask_candidates = _source_mask_candidates(source_edit_num)
-                        if not source_mask_candidates:
+                        # Load metadata
+                        if not os.path.exists(metadata_path):
                             skipped_subjects.append({
                                 "subject": subject_name,
-                                "reason": f"Source mask not found at edit {source_edit_num} for overwrite"
+                                "reason": "Metadata not found"
                             })
-                            print(f"Skipping {subject_name}: source mask not found at edit {source_edit_num}")
+                            print(f"Skipping {subject_name}: Metadata not found")
                             continue
-                        latest_mask_file = source_mask_candidates[-1]
-                        masked_edit_number = pre_masked_edit_num
-                    elif elastic_files_to_bump:
-                        # First insertion before elastic: source must be the edit immediately
-                        # before the elastic, not the current elastic mask that sorts latest.
-                        source_edit_num = elastic_edit_num - 1
-                        source_mask_candidates = _source_mask_candidates(source_edit_num)
-                        if not source_mask_candidates:
-                            skipped_subjects.append({
-                                "subject": subject_name,
-                                "reason": f"Source mask not found at edit {source_edit_num} before elastic"
-                            })
-                            print(f"Skipping {subject_name}: source mask not found at edit {source_edit_num} before elastic")
+                    
+                        with open(metadata_path, 'r') as f:
+                            metadata = json.load(f)
+                    
+                        # --- Step 1: Determine next free edit slot ---
+                        edit_number = 0
+                        while glob.glob(os.path.join(subject_path, f"{subject_name}_edit_{edit_number}_*.nii.gz")):
+                            edit_number += 1
+
+                        # --- Step 2: Detect if latest edit is elastic ---
+                        elastic_edit_num = edit_number - 1
+                        elastic_files_to_bump = (
+                            glob.glob(os.path.join(subject_path, f"{subject_name}_edit_{elastic_edit_num}_elastic*")) +
+                            glob.glob(os.path.join(subject_path, f"{subject_name}_lossy_edit_{elastic_edit_num}_elastic*"))
+                        ) if elastic_edit_num >= 0 else []
+
+                        # --- Step 3: Detect if a masked insertion already exists before the elastic ---
+                        # After a previous run the layout is: ..._edit_{E-1}_*, _edit_{E}_masked, _edit_{E+1}_elastic
+                        # so pre_masked_edit_num == E and source_for_overwrite == E-1.
+                        # The elastic backup marks a real insert; a masked edit the elastic was run
+                        # on has none and is treated as an ordinary edit before elastic.
+                        already_inserted = False
+                        pre_masked_edit_num = elastic_edit_num - 1
+                        if elastic_files_to_bump and pre_masked_edit_num >= 0:
+                            already_inserted = bool(glob.glob(
+                                os.path.join(subject_path, f"{subject_name}_edit_{pre_masked_edit_num}_*masked*.nii.gz")
+                            )) and os.path.isfile(
+                                os.path.join(subject_path, f"{subject_name}_edit_{elastic_edit_num}_elastic.nii.backup.gz")
+                            )
+
+                        # Also detect when the last edit is already masked with no elastic following it.
+                        last_edit_is_masked = (
+                            not elastic_files_to_bump and edit_number > 0 and
+                            bool(glob.glob(
+                                os.path.join(subject_path, f"{subject_name}_edit_{edit_number - 1}_*masked*.nii.gz")
+                            ))
+                        )
+
+                        # --- Step 4: Skip or redirect based on insertion state ---
+                        if not overwrite and (already_inserted or last_edit_is_masked):
+                            reason = (
+                                "Masked edit already inserted before elastic (pass overwrite=True to replace)"
+                                if already_inserted
+                                else "Last edit is already masked (pass overwrite=True to replace)"
+                            )
+                            skipped_subjects.append({"subject": subject_name, "reason": reason})
+                            print(f"Skipping {subject_name}: {reason}")
                             continue
-                        latest_mask_file = source_mask_candidates[-1]
-                        masked_edit_number = None  # resolved after bumping below
-                    else:
-                        # Normal path: use the latest mask in the directory
-                        mask_files = [
-                            f for f in os.listdir(subject_path)
-                            if f.endswith('.nii.mask.gz') and f.startswith(subject_name) and '_lossy' not in f
-                        ]
-                        if not mask_files:
-                            skipped_subjects.append({
-                                "subject": subject_name,
-                                "reason": "No mask found"
-                            })
-                            print(f"Skipping {subject_name}: No mask found")
-                            continue
-                        mask_files.sort()
-                        latest_mask_file = mask_files[-1]
-                        masked_edit_number = None  # resolved after bumping below
 
-                    # Extract source edit name from the chosen mask file
-                    edit_name = latest_mask_file.replace('.nii.mask.gz', '')
+                        # --- Step 5: Determine source mask file ---
+                        def _source_mask_candidates(source_edit_num):
+                            if source_edit_num < 0:
+                                raw_mask = f"{subject_name}.nii.mask.gz"
+                                return [raw_mask] if os.path.exists(os.path.join(subject_path, raw_mask)) else []
+                            return sorted([
+                                f for f in os.listdir(subject_path)
+                                if f.endswith('.nii.mask.gz') and f.startswith(subject_name)
+                                and '_lossy' not in f and f'_edit_{source_edit_num}_' in f
+                            ])
 
-                    # --- Step 6: Load mask temporarily ---
-                    mask_path = os.path.join(subject_path, latest_mask_file)
-                    temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask.nii.gz')
+                        if already_inserted:
+                            # Overwrite path: source is the edit immediately before the existing masked slot
+                            source_edit_num = pre_masked_edit_num - 1
+                            source_mask_candidates = _source_mask_candidates(source_edit_num)
+                            if not source_mask_candidates:
+                                skipped_subjects.append({
+                                    "subject": subject_name,
+                                    "reason": f"Source mask not found at edit {source_edit_num} for overwrite"
+                                })
+                                print(f"Skipping {subject_name}: source mask not found at edit {source_edit_num}")
+                                continue
+                            latest_mask_file = source_mask_candidates[-1]
+                            masked_edit_number = pre_masked_edit_num
+                        elif elastic_files_to_bump:
+                            # First insertion before elastic: source must be the edit immediately
+                            # before the elastic, not the current elastic mask that sorts latest.
+                            source_edit_num = elastic_edit_num - 1
+                            source_mask_candidates = _source_mask_candidates(source_edit_num)
+                            if not source_mask_candidates:
+                                skipped_subjects.append({
+                                    "subject": subject_name,
+                                    "reason": f"Source mask not found at edit {source_edit_num} before elastic"
+                                })
+                                print(f"Skipping {subject_name}: source mask not found at edit {source_edit_num} before elastic")
+                                continue
+                            latest_mask_file = source_mask_candidates[-1]
+                            masked_edit_number = None  # resolved after bumping below
+                        else:
+                            # Normal path: use the latest mask in the directory
+                            mask_files = [
+                                f for f in os.listdir(subject_path)
+                                if f.endswith('.nii.mask.gz') and f.startswith(subject_name) and '_lossy' not in f
+                            ]
+                            if not mask_files:
+                                skipped_subjects.append({
+                                    "subject": subject_name,
+                                    "reason": "No mask found"
+                                })
+                                print(f"Skipping {subject_name}: No mask found")
+                                continue
+                            mask_files.sort()
+                            latest_mask_file = mask_files[-1]
+                            masked_edit_number = None  # resolved after bumping below
 
-                    os.replace(mask_path, temp_mask_path)
-                    try:
-                        mask_img = nib.load(temp_mask_path)
+                        # Extract source edit name from the chosen mask file
+                        edit_name = latest_mask_file.replace('.nii.mask.gz', '')
+
+                        # --- Step 6: Load mask temporarily ---
+                        mask_path = os.path.join(subject_path, latest_mask_file)
+                        temp_mask_path = mask_path.replace('.nii.mask.gz', '_mask.nii.gz')
+
+                        mask_img = load_nifti_readonly(mask_path)
                         # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
                         mask_data = np.round(mask_img.get_fdata()).astype(np.uint8)
-                    finally:
-                        os.replace(temp_mask_path, mask_path)
 
-                    # Check if the mask contains the specified label
-                    unique_labels = np.unique(mask_data)
-                    if label not in unique_labels:
-                        skipped_subjects.append({
-                            "subject": subject_name,
-                            "reason": f"Label {label} not found in mask"
-                        })
-                        print(f"Skipping {subject_name}: Label {label} not found")
-                        continue
+                        # Check if the mask contains the specified label
+                        unique_labels = np.unique(mask_data)
+                        if label not in unique_labels:
+                            skipped_subjects.append({
+                                "subject": subject_name,
+                                "reason": f"Label {label} not found in mask"
+                            })
+                            print(f"Skipping {subject_name}: Label {label} not found")
+                            continue
 
-                    # Create combined mask for this label, then optional dilation
-                    combined_mask = (mask_data == label).astype(bool)
-                    if dilation > 0:
-                        combined_mask = _dilate_binary_mask(combined_mask, dilation)
-                    voxels_affected = int(np.sum(combined_mask))
+                        # Create combined mask for this label, then optional dilation
+                        combined_mask = (mask_data == label).astype(bool)
+                        if dilation > 0:
+                            combined_mask = _dilate_binary_mask(combined_mask, dilation)
+                        voxels_affected = int(np.sum(combined_mask))
 
-                    # --- Step 7: Load source image (full resolution) ---
-                    image_file = f"{edit_name}.nii.gz"
-                    image_path = os.path.join(subject_path, image_file)
+                        # --- Step 7: Load source image (full resolution) ---
+                        image_file = f"{edit_name}.nii.gz"
+                        image_path = os.path.join(subject_path, image_file)
 
-                    if not os.path.exists(image_path):
-                        skipped_subjects.append({
-                            "subject": subject_name,
-                            "reason": f"Image file not found: {image_file}"
-                        })
-                        print(f"Skipping {subject_name}: Image file not found")
-                        continue
+                        if not os.path.exists(image_path):
+                            skipped_subjects.append({
+                                "subject": subject_name,
+                                "reason": f"Image file not found: {image_file}"
+                            })
+                            print(f"Skipping {subject_name}: Image file not found")
+                            continue
 
-                    image_img = nib.load(image_path)
-                    image_data = image_img.get_fdata()
+                        image_img = nib.load(image_path)
+                        image_data = image_img.get_fdata()
 
-                    # Apply mask based on invert flag
-                    masked_image_data = image_data.copy()
-                    if invert:
-                        masked_image_data[~combined_mask] = 0
-                    else:
-                        masked_image_data[combined_mask] = 0
+                        # Apply mask based on invert flag
+                        masked_image_data = image_data.copy()
+                        if invert:
+                            masked_image_data[~combined_mask] = 0
+                        else:
+                            masked_image_data[combined_mask] = 0
 
-                    # --- Step 8: Resolve output slot and prepare filesystem ---
-                    if already_inserted:
-                        # Overwrite: strip stale lossy_compression entries for the old masked
-                        # files before removing them (mirrors DeleteEditView behaviour).
-                        try:
-                            with open(metadata_path, 'r') as f:
-                                _meta = json.load(f)
-                            _lc = _meta.get('lossy_compression', [])
-                            if isinstance(_lc, dict):
-                                _lc = [_lc]
-                            _lc = [e for e in _lc
-                                   if f'_edit_{masked_edit_number}_masked' not in e.get('filename', '')]
-                            _meta['lossy_compression'] = _lc
-                            from .intensityMapping import drop_intensity_mappings_containing
-                            drop_intensity_mappings_containing(
-                                _meta,
-                                f'_edit_{masked_edit_number}_masked',
-                            )
-                            with open(metadata_path, 'w') as f:
-                                json.dump(_meta, f, indent=4)
-                        except Exception as _e:
-                            print(f"Warning: could not clean lossy_compression before overwrite for {subject_name}: {_e}")
-
-                        # Remove all existing masked files at the insertion slot
-                        for old_f in (
-                            glob.glob(os.path.join(subject_path, f"{subject_name}_edit_{masked_edit_number}_masked*")) +
-                            glob.glob(os.path.join(subject_path, f"{subject_name}_lossy_edit_{masked_edit_number}_masked*"))
-                        ):
+                        # --- Step 8: Resolve output slot and prepare filesystem ---
+                        if already_inserted:
+                            # Overwrite: strip stale lossy_compression entries for the old masked
+                            # files before removing them (mirrors DeleteEditView behaviour).
                             try:
-                                os.remove(old_f)
-                            except OSError as rm_err:
-                                print(f"Warning: could not remove {old_f}: {rm_err}")
-                        print(f"Overwriting masked edit at slot {masked_edit_number} for {subject_name}")
-                    elif elastic_files_to_bump:
-                        # First insertion: bump elastic files from E to E+1, occupy slot E
-                        for src in elastic_files_to_bump:
-                            dst = src.replace(
-                                f"_edit_{elastic_edit_num}_elastic",
-                                f"_edit_{elastic_edit_num + 1}_elastic",
-                            )
-                            os.rename(src, dst)
-                        masked_edit_number = elastic_edit_num
-                        print(f"Inserted masked edit before elastic for {subject_name}: "
-                              f"elastic bumped {elastic_edit_num} → {elastic_edit_num + 1}")
+                                with open(metadata_path, 'r') as f:
+                                    _meta = json.load(f)
+                                _lc = _meta.get('lossy_compression', [])
+                                if isinstance(_lc, dict):
+                                    _lc = [_lc]
+                                _lc = [e for e in _lc
+                                       if f'_edit_{masked_edit_number}_masked' not in e.get('filename', '')]
+                                _meta['lossy_compression'] = _lc
+                                from .intensityMapping import drop_intensity_mappings_containing
+                                drop_intensity_mappings_containing(
+                                    _meta,
+                                    f'_edit_{masked_edit_number}_masked',
+                                )
+                                atomic_write_json(metadata_path, _meta, indent=4)
+                            except Exception as _e:
+                                print(f"Warning: could not clean lossy_compression before overwrite for {subject_name}: {_e}")
 
-                        # Backup the bumped elastic images (full-res and lossy) and apply the
-                        # same mask operation in-place using the elastic's own mask, so the
-                        # elastic edit stays consistent with the masked pre-elastic edit.
-                        new_elastic_num = elastic_edit_num + 1
-                        for _e_stem in [
-                            f"{subject_name}_edit_{new_elastic_num}_elastic",
-                            f"{subject_name}_lossy_edit_{new_elastic_num}_elastic",
-                        ]:
-                            _e_img_path    = os.path.join(subject_path, f"{_e_stem}.nii.gz")
-                            _e_backup_path = os.path.join(subject_path, f"{_e_stem}.nii.backup.gz")
-                            _e_mask_path   = os.path.join(subject_path, f"{_e_stem}.nii.mask.gz")
-                            if not os.path.exists(_e_img_path):
-                                continue
-                            try:
-                                shutil.copy2(_e_img_path, _e_backup_path)
-                                # Load the elastic's own mask and check for the label
-                                _e_combined = None
-                                if os.path.exists(_e_mask_path):
-                                    _e_mask_temp = _e_mask_path.replace('.nii.mask.gz', '_mask.nii.gz')
-                                    os.replace(_e_mask_path, _e_mask_temp)
-                                    try:
-                                        _em = nib.load(_e_mask_temp)
+                            # Remove all existing masked files at the insertion slot
+                            for old_f in (
+                                glob.glob(os.path.join(subject_path, f"{subject_name}_edit_{masked_edit_number}_masked*")) +
+                                glob.glob(os.path.join(subject_path, f"{subject_name}_lossy_edit_{masked_edit_number}_masked*"))
+                            ):
+                                try:
+                                    tracked_remove(old_f)
+                                except OSError as rm_err:
+                                    print(f"Warning: could not remove {old_f}: {rm_err}")
+                            print(f"Overwriting masked edit at slot {masked_edit_number} for {subject_name}")
+                        elif elastic_files_to_bump:
+                            # First insertion: bump elastic files from E to E+1, occupy slot E
+                            for src in elastic_files_to_bump:
+                                dst = src.replace(
+                                    f"_edit_{elastic_edit_num}_elastic",
+                                    f"_edit_{elastic_edit_num + 1}_elastic",
+                                )
+                                tracked_rename(src, dst)
+                            masked_edit_number = elastic_edit_num
+                            print(f"Inserted masked edit before elastic for {subject_name}: "
+                                  f"elastic bumped {elastic_edit_num} → {elastic_edit_num + 1}")
+
+                            # Backup the bumped elastic images (full-res and lossy) and apply the
+                            # same mask operation in-place using the elastic's own mask, so the
+                            # elastic edit stays consistent with the masked pre-elastic edit.
+                            new_elastic_num = elastic_edit_num + 1
+                            for _e_stem in [
+                                f"{subject_name}_edit_{new_elastic_num}_elastic",
+                                f"{subject_name}_lossy_edit_{new_elastic_num}_elastic",
+                            ]:
+                                _e_img_path    = os.path.join(subject_path, f"{_e_stem}.nii.gz")
+                                _e_backup_path = os.path.join(subject_path, f"{_e_stem}.nii.backup.gz")
+                                _e_mask_path   = os.path.join(subject_path, f"{_e_stem}.nii.mask.gz")
+                                if not os.path.exists(_e_img_path):
+                                    continue
+                                try:
+                                    atomic_copy(_e_img_path, _e_backup_path)
+                                    # Load the elastic's own mask and check for the label
+                                    _e_combined = None
+                                    if os.path.exists(_e_mask_path):
+                                        _e_mask_temp = _e_mask_path.replace('.nii.mask.gz', '_mask.nii.gz')
+                                        _em = load_nifti_readonly(_e_mask_path)
                                         # Round before astype to avoid truncating floats
                                         _ed = np.round(_em.get_fdata()).astype(np.uint8)
                                         if label in np.unique(_ed):
                                             _e_combined = (_ed == label).astype(bool)
                                             if dilation > 0:
                                                 _e_combined = _dilate_binary_mask(_e_combined, dilation)
-                                    finally:
-                                        os.replace(_e_mask_temp, _e_mask_path)
-                                if _e_combined is not None:
-                                    _ei = nib.load(_e_img_path)
-                                    _edata = _ei.get_fdata().copy()
-                                    if invert:
-                                        _edata[~_e_combined] = 0
+                                    if _e_combined is not None:
+                                        _ei = nib.load(_e_img_path)
+                                        _edata = _ei.get_fdata().copy()
+                                        if invert:
+                                            _edata[~_e_combined] = 0
+                                        else:
+                                            _edata[_e_combined] = 0
+                                        atomic_nib_save(
+                                            nib.Nifti1Image(_edata, _ei.affine, header=_ei.header),
+                                            _e_img_path,
+                                        )
+                                        print(f"Backed up and masked elastic ({_e_stem}) for {subject_name}")
                                     else:
-                                        _edata[_e_combined] = 0
-                                    nib.save(
-                                        nib.Nifti1Image(_edata, _ei.affine, header=_ei.header),
-                                        _e_img_path,
-                                    )
-                                    print(f"Backed up and masked elastic ({_e_stem}) for {subject_name}")
-                                else:
-                                    print(f"Backed up elastic ({_e_stem}); label not in elastic mask — image unchanged")
-                            except Exception as _be:
-                                print(f"Warning: could not backup/mask elastic ({_e_stem}) for {subject_name}: {_be}")
-                    else:
-                        masked_edit_number = edit_number
+                                        print(f"Backed up elastic ({_e_stem}); label not in elastic mask — image unchanged")
+                                except Exception as _be:
+                                    print(f"Warning: could not backup/mask elastic ({_e_stem}) for {subject_name}: {_be}")
+                        else:
+                            masked_edit_number = edit_number
 
-                    # Save full resolution version
-                    full_output_name = f"{subject_name}_edit_{masked_edit_number}_masked"
-                    full_output_path = os.path.join(subject_path, f"{full_output_name}.nii.gz")
+                        # Save full resolution version
+                        full_output_name = f"{subject_name}_edit_{masked_edit_number}_masked"
+                        full_output_path = os.path.join(subject_path, f"{full_output_name}.nii.gz")
                     
-                    full_masked_img = nib.Nifti1Image(
-                        masked_image_data,
-                        image_img.affine,
-                        header=image_img.header
-                    )
-                    nib.save(full_masked_img, full_output_path)
-                    print(f"Saved masked image for {subject_name}: {full_output_path}")
-                    
-                    # Create lossy version from full resolution masked data
-                    lossy_output_name = f"{subject_name}_lossy_edit_{masked_edit_number}_masked"
-                    lossy_output_path = os.path.join(subject_path, f"{lossy_output_name}.nii.gz")
-                    
-                    try:
-                        voxel_size = metadata.get('voxel_size', 1.0)
-                        registration_tools = RegistrationTools()
-                        registration_tools.save_as_lossy_nifti(
+                        full_masked_img = nib.Nifti1Image(
                             masked_image_data,
-                            voxel_size,
-                            metadata_path,
-                            lossy_output_path
+                            image_img.affine,
+                            header=image_img.header
                         )
-                        print(f"Saved lossy masked image for {subject_name}")
-                    except Exception as e:
-                        print(f"Warning: Could not create lossy version for {subject_name}: {str(e)}")
-
-                    # After save_as_lossy_nifti has appended the masked entry, fix the elastic
-                    # lossy_compression entry (stale name from the bump) and re-sort by edit
-                    # number so the list order matches the physical file sequence.
-                    if elastic_files_to_bump and not already_inserted:
+                        atomic_nib_save(full_masked_img, full_output_path)
+                        print(f"Saved masked image for {subject_name}: {full_output_path}")
+                    
+                        # Create lossy version from full resolution masked data
+                        lossy_output_name = f"{subject_name}_lossy_edit_{masked_edit_number}_masked"
+                        lossy_output_path = os.path.join(subject_path, f"{lossy_output_name}.nii.gz")
+                    
                         try:
-                            with open(metadata_path, 'r') as f:
-                                _meta = json.load(f)
-                            _lc = _meta.get('lossy_compression', [])
-                            if isinstance(_lc, dict):
-                                _lc = [_lc]
-                            for _entry in _lc:
-                                _fn = _entry.get('filename', '')
-                                if f'_edit_{elastic_edit_num}_elastic' in _fn:
-                                    _entry['filename'] = _fn.replace(
-                                        f'_edit_{elastic_edit_num}_elastic',
-                                        f'_edit_{elastic_edit_num + 1}_elastic',
-                                    )
-                            from .intensityMapping import rename_intensity_mapping_filenames
-                            rename_intensity_mapping_filenames(
-                                _meta,
-                                f'_edit_{elastic_edit_num}_elastic',
-                                f'_edit_{elastic_edit_num + 1}_elastic',
+                            voxel_size = metadata.get('voxel_size', 1.0)
+                            registration_tools = RegistrationTools()
+                            registration_tools.save_as_lossy_nifti(
+                                masked_image_data,
+                                voxel_size,
+                                metadata_path,
+                                lossy_output_path
                             )
-                            def _lc_sort_key(e):
-                                m = re.search(r'_edit_(\d+)_', e.get('filename', ''))
-                                return int(m.group(1)) if m else 0
-                            _lc.sort(key=_lc_sort_key)
-                            _meta['lossy_compression'] = _lc
-                            with open(metadata_path, 'w') as f:
-                                json.dump(_meta, f, indent=4)
-                        except Exception as _e:
-                            print(f"Warning: could not fix lossy_compression after elastic bump for {subject_name}: {_e}")
+                            print(f"Saved lossy masked image for {subject_name}")
+                        except Exception as e:
+                            print(f"Warning: Could not create lossy version for {subject_name}: {str(e)}")
 
-                    # Copy and downsample mask to new edit
-                    try:
-                        src_mask = os.path.join(subject_path, f"{edit_name}.nii.mask.gz")
-                        dst_mask_full = os.path.join(subject_path, f"{full_output_name}.nii.mask.gz")
-                        dst_mask_lossy = os.path.join(subject_path, f"{lossy_output_name}.nii.mask.gz")
-                        
-                        if os.path.exists(src_mask):
-                            shutil.copy2(src_mask, dst_mask_full)
-                            
-                            # Downsample mask for lossy version
-                            resolution_factor = 2
-                            lc = metadata.get('lossy_compression', None)
-                            if isinstance(lc, list) and len(lc) > 0:
-                                try:
-                                    resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
-                                except Exception:
-                                    pass
-                            elif isinstance(lc, dict) and lc:
-                                try:
-                                    resolution_factor = int(lc.get('resolution_factor', resolution_factor))
-                                except Exception:
-                                    pass
-                            
-                            # Load lossy image to get affine
-                            lossy_img = nib.load(lossy_output_path)
-                            lossy_affine = lossy_img.affine
-                            
-                            # Downsample mask
-                            mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
-                            lossy_mask_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
-                            os.replace(dst_mask_full, mask_temp)
+                        # After save_as_lossy_nifti has appended the masked entry, fix the elastic
+                        # lossy_compression entry (stale name from the bump) and re-sort by edit
+                        # number so the list order matches the physical file sequence.
+                        if elastic_files_to_bump and not already_inserted:
                             try:
-                                mask_img = nib.load(mask_temp)
+                                with open(metadata_path, 'r') as f:
+                                    _meta = json.load(f)
+                                _lc = _meta.get('lossy_compression', [])
+                                if isinstance(_lc, dict):
+                                    _lc = [_lc]
+                                for _entry in _lc:
+                                    _fn = _entry.get('filename', '')
+                                    if f'_edit_{elastic_edit_num}_elastic' in _fn:
+                                        _entry['filename'] = _fn.replace(
+                                            f'_edit_{elastic_edit_num}_elastic',
+                                            f'_edit_{elastic_edit_num + 1}_elastic',
+                                        )
+                                from .intensityMapping import rename_intensity_mapping_filenames
+                                rename_intensity_mapping_filenames(
+                                    _meta,
+                                    f'_edit_{elastic_edit_num}_elastic',
+                                    f'_edit_{elastic_edit_num + 1}_elastic',
+                                )
+                                def _lc_sort_key(e):
+                                    m = re.search(r'_edit_(\d+)_', e.get('filename', ''))
+                                    return int(m.group(1)) if m else 0
+                                _lc.sort(key=_lc_sort_key)
+                                _meta['lossy_compression'] = _lc
+                                atomic_write_json(metadata_path, _meta, indent=4)
+                            except Exception as _e:
+                                print(f"Warning: could not fix lossy_compression after elastic bump for {subject_name}: {_e}")
+
+                        # Copy and downsample mask to new edit
+                        try:
+                            src_mask = os.path.join(subject_path, f"{edit_name}.nii.mask.gz")
+                            dst_mask_full = os.path.join(subject_path, f"{full_output_name}.nii.mask.gz")
+                            dst_mask_lossy = os.path.join(subject_path, f"{lossy_output_name}.nii.mask.gz")
+                        
+                            if os.path.exists(src_mask):
+                                atomic_copy(src_mask, dst_mask_full)
+                            
+                                # Downsample mask for lossy version
+                                resolution_factor = 2
+                                lc = metadata.get('lossy_compression', None)
+                                if isinstance(lc, list) and len(lc) > 0:
+                                    try:
+                                        resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
+                                    except Exception:
+                                        pass
+                                elif isinstance(lc, dict) and lc:
+                                    try:
+                                        resolution_factor = int(lc.get('resolution_factor', resolution_factor))
+                                    except Exception:
+                                        pass
+                            
+                                # Load lossy image to get affine
+                                lossy_img = nib.load(lossy_output_path)
+                                lossy_affine = lossy_img.affine
+                            
+                                # Downsample mask
+                                mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
+                                lossy_mask_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
+                                mask_img = load_nifti_readonly(dst_mask_full)
                                 mask_dtype = mask_img.get_data_dtype()
                                 # Round before astype to avoid truncating floats
                                 mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
                                 slices = [slice(None, None, resolution_factor) for _ in range(3)]
                                 lossy_mask_arr = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype)
-                                nib.save(nib.Nifti1Image(lossy_mask_arr, lossy_affine), lossy_mask_temp)
-                                os.replace(lossy_mask_temp, dst_mask_lossy)
-                            finally:
-                                os.replace(mask_temp, dst_mask_full)
-                    except Exception as e:
-                        print(f"Warning: Could not copy/downsample mask for {subject_name}: {str(e)}")
+                                atomic_nib_save(nib.Nifti1Image(lossy_mask_arr, lossy_affine), dst_mask_lossy)
+                        except Exception as e:
+                            print(f"Warning: Could not copy/downsample mask for {subject_name}: {str(e)}")
                     
-                    # Copy landmarks if they exist
-                    try:
-                        source_landmark_base = edit_name
-                        source_landmarks_path = os.path.join(subject_path, f"{source_landmark_base}_landmarks.json")
-                        if os.path.isfile(source_landmarks_path):
-                            dest_landmarks_path = os.path.join(subject_path, f"{full_output_name}_landmarks.json")
-                            shutil.copy2(source_landmarks_path, dest_landmarks_path)
-                            print(f"Copied landmarks for {subject_name}")
+                        # Copy landmarks if they exist
+                        try:
+                            source_landmark_base = edit_name
+                            source_landmarks_path = os.path.join(subject_path, f"{source_landmark_base}_landmarks.json")
+                            if os.path.isfile(source_landmarks_path):
+                                dest_landmarks_path = os.path.join(subject_path, f"{full_output_name}_landmarks.json")
+                                atomic_copy(source_landmarks_path, dest_landmarks_path)
+                                print(f"Copied landmarks for {subject_name}")
                         
-                        source_landmark_distances_path = os.path.join(subject_path, f"{source_landmark_base}_landmark_distances.json")
-                        if os.path.isfile(source_landmark_distances_path):
-                            dest_landmark_distances_path = os.path.join(subject_path, f"{full_output_name}_landmark_distances.json")
-                            shutil.copy2(source_landmark_distances_path, dest_landmark_distances_path)
-                    except Exception as e:
-                        print(f"Warning: Could not copy landmarks for {subject_name}: {str(e)}")
+                            source_landmark_distances_path = os.path.join(subject_path, f"{source_landmark_base}_landmark_distances.json")
+                            if os.path.isfile(source_landmark_distances_path):
+                                dest_landmark_distances_path = os.path.join(subject_path, f"{full_output_name}_landmark_distances.json")
+                                atomic_copy(source_landmark_distances_path, dest_landmark_distances_path)
+                        except Exception as e:
+                            print(f"Warning: Could not copy landmarks for {subject_name}: {str(e)}")
                     
-                    processed_subjects.append(subject_name)
-                    print(f"Successfully masked {subject_name} with label {label}")
+                        processed_subjects.append(subject_name)
+                        print(f"Successfully masked {subject_name} with label {label}")
 
-                    try:
-                        from .pipeline_log import merge_mask_workflow_metadata
-                        from datetime import datetime, timezone
-                        inserted = bool(elastic_files_to_bump) or bool(already_inserted)
-                        merge_mask_workflow_metadata(directory, subject_name, {
-                            "application": {
-                                "operation": "isolated" if invert else "masked_out",
-                                "label": label,
-                                "labels": [label],
-                                "inserted_before_elastic": inserted,
-                                "dilation": int(dilation) if dilation else 0,
-                                "ts": datetime.now(timezone.utc).isoformat(),
-                            },
-                        })
-                    except Exception as _mw_err:
-                        print(f"Warning: mask_workflow metadata update failed for {subject_name}: {_mw_err}")
+                        try:
+                            from .pipeline_log import merge_mask_workflow_metadata
+                            from datetime import datetime, timezone
+                            inserted = bool(elastic_files_to_bump) or bool(already_inserted)
+                            merge_mask_workflow_metadata(directory, subject_name, {
+                                "application": {
+                                    "operation": "isolated" if invert else "masked_out",
+                                    "label": label,
+                                    "labels": [label],
+                                    "inserted_before_elastic": inserted,
+                                    "dilation": int(dilation) if dilation else 0,
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                },
+                            })
+                        except Exception as _mw_err:
+                            print(f"Warning: mask_workflow metadata update failed for {subject_name}: {_mw_err}")
                     
                 except Exception as e:
                     skipped_subjects.append({

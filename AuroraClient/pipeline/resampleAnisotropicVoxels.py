@@ -1,5 +1,9 @@
 import numpy as np
 import ants
+try:
+    from .antsWorker import remove_registration_outputs
+except ImportError:  # imported as a top-level module (documentation figure scripts)
+    from antsWorker import remove_registration_outputs
 from scipy import ndimage
 from scipy.interpolate import RegularGridInterpolator
 from typing import Tuple, Optional
@@ -308,6 +312,10 @@ class DeformationBasedMRIInterpolator:
         
         deform_A_to_B = self._extract_deformation_field(reg_A_to_B)
         deform_B_to_A = self._extract_deformation_field(reg_B_to_A)
+        # The fields are in memory now; ANTs left their files in the temp folder (one
+        # Warp/InverseWarp pair per slice pair, thousands per scan): remove them here.
+        remove_registration_outputs(reg_A_to_B)
+        remove_registration_outputs(reg_B_to_A)
         
         return deform_A_to_B, deform_B_to_A
     

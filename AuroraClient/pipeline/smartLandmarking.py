@@ -41,8 +41,15 @@ from skimage.filters import threshold_otsu
 import skimage.morphology
 from scipy.signal import convolve
 from .ALPACA import ALPACA
+from .coordinateFrames import list_extracted_scan_names
 from skimage import exposure
 import os
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    crash_safe_view,
+    request_subjects,
+    atomic_write_json,
+)
 # Set the number of threads for ITK to utilize
 os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(psutil.cpu_count(logical=True))
 import ants
@@ -54,6 +61,14 @@ from scipy.spatial import cKDTree
 alpaca = ALPACA()
 
 class SmartLandmarkingView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('smart_landmarking', lambda request: request_subjects(request, 'target'))
     def post(self, request):
         print("Applying smart landmarking")
         directory = request.data['directory']
@@ -275,8 +290,7 @@ class SmartLandmarkingView(APIView):
         # STEP 4: Save the landmarks as the reference subject latest edit landmarks
         if target == "reference":
             landmarks_path = os.path.join(directory, "extracted", reference_subject, reference_latest_edit.replace(".nii.gz", "_landmarks.json"))
-            with open(landmarks_path, 'w') as jf:
-                json.dump(final_landmarks.tolist(), jf, indent=4)
+            atomic_write_json(landmarks_path, final_landmarks.tolist(), indent=4)
 
             # Distance analysis
             self.distance_analysis(directory, "extracted", reference_subject.replace(".nii.gz", ""), final_landmarks)
@@ -309,8 +323,7 @@ class SmartLandmarkingView(APIView):
             # Save the landmarks
             landmarks_path = os.path.join(directory, "atlas", atlas_latest_edit.replace(".nii.gz", "_landmarks.json"))
             print(f"Saving landmarks to {landmarks_path}")
-            with open(landmarks_path, 'w') as jf:
-                json.dump(final_landmarks.tolist(), jf, indent=4)
+            atomic_write_json(landmarks_path, final_landmarks.tolist(), indent=4)
 
         # Send progress update before each scan is processed
         channel_layer = get_channel_layer()
@@ -332,6 +345,10 @@ class SmartLandmarkingView(APIView):
         return Response({'message': 'Smart landmarking applied successfully'}, status=status.HTTP_200_OK)
 
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def distance_analysis(self, directory, filename, edit, landmarks):
 
         # Get the sub path
@@ -371,8 +388,7 @@ class SmartLandmarkingView(APIView):
 
         # Save the distances to a json file
         distances_path = os.path.join(directory, sub_path, edit + "_landmark_distances.json")
-        with open(distances_path, 'w') as jf:
-            json.dump(distances.tolist(), jf, indent=4)  # Convert ndarray to list for JSON compatibility
+        atomic_write_json(distances_path, distances.tolist(), indent=4)
 
         # Add metadata entry named landmarks, within it add the number of landmarks and the accuracy
         json_metadata['landmarks'] = {
@@ -383,8 +399,7 @@ class SmartLandmarkingView(APIView):
             'outliers_six': int(outliers_six),
         }
         # Save the updated metadata to the json file
-        with open(json_path, 'w') as jf:
-            json.dump(json_metadata, jf, indent=4)
+        atomic_write_json(json_path, json_metadata, indent=4)
 
     
     def create_pseudo_landmarks_from_mesh_intersection(self, nifti_data, vertices, faces, voxel_size, threshold, directory):
@@ -438,7 +453,7 @@ class SmartLandmarkingView(APIView):
         """
 
         # For each folder in the extracted folder (except the reference), load the deformation field *_elastic_fwd.nii.gz
-        extracted_folders = os.listdir(os.path.join(directory, "extracted"))
+        extracted_folders = list_extracted_scan_names(directory)
         extracted_folders = [os.path.basename(f) for f in extracted_folders 
                            if f != reference_subject 
                            and f != "project_settings.json" 

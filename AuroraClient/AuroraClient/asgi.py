@@ -14,8 +14,10 @@ import time
 from django.core.asgi import get_asgi_application
 from channels.routing import ProtocolTypeRouter, URLRouter
 from channels.auth import AuthMiddlewareStack
+from channels.security.websocket import AllowedHostsOriginValidator
 from AuroraClient import routing
 from AuroraClient import compactAccessLog
+from AuroraClient import engineConfig
 
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'AuroraClient.settings')
@@ -25,6 +27,42 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'AuroraClient.settings')
 compactAccessLog.install()
 
 django_asgi_app = get_asgi_application()
+
+# Imported after Django setup: engineAuth pulls in DRF.
+from pipeline.engineAuth import EngineSessionWebsocketMiddleware  # noqa: E402
+from pipeline import networkMode  # noqa: E402
+
+# Paired computers report status to the lab and fetch their group every few minutes
+# (no-op until "aurora-tools pair" has been run). Never on a request path.
+networkMode.start_check_in_thread()
+
+
+def _observe_progress_messages():
+    """Let engineActivity see every progress_group message (job label and percentage for
+    the lab's "In use by" line). Wraps the in-memory channel layer's group_send once;
+    every tool already sends progress through it, so no tool code changes."""
+    from channels.layers import get_channel_layer
+    from pipeline import engineActivity
+
+    layer = get_channel_layer()
+    if layer is None or getattr(layer, "_aurora_activity_wrapped", False):
+        return
+    original_group_send = layer.group_send
+
+    async def group_send(group, message):
+        if group == "progress_group":
+            engineActivity.observe_progress(message)
+        return await original_group_send(group, message)
+
+    layer.group_send = group_send
+    layer._aurora_activity_wrapped = True
+
+
+_observe_progress_messages()
+
+# Job history: read it once now, so jobs cut off by the last shutdown show as interrupted.
+from pipeline import engineJobs  # noqa: E402
+engineJobs.load()
 
 
 def _ensure_django_schema():
@@ -51,8 +89,14 @@ def print_startup_message():
     print("    https://hallgrimssonlab.ca/MainAurora")
     print()
     print("[📍] Packaged UI (same origin as this engine, after handoff):")
-    print("    http://127.0.0.1:8020/local_aurora/")
+    print(f"    http://127.0.0.1:{engineConfig.engine_port()}/local_aurora/")
     print()
+    if networkMode.network_ready():
+        config = engineConfig.load_config()
+        print("[🔒] Shared on the local network (HTTPS, self-signed certificate):")
+        print(f"    https://{networkMode._lan_address() or '<this computer>'}:{config['network_port']}/local_aurora/")
+        print("    Group members open it from hallgrimssonlab.ca/MainAurora/servers")
+        print()
     print("[💡] We suggest opening the link in a Chrome browser to use the tools.")
     print("[⏳] First use may take some time to load.")
     print()
@@ -66,9 +110,15 @@ threading.Thread(target=print_startup_message, daemon=True).start()
 application = ProtocolTypeRouter({
     # Heartbeat bookkeeping for long requests (compact access log); transparent otherwise.
     "http": compactAccessLog.RequestHeartbeatMiddleware(django_asgi_app),
-    "websocket": AuthMiddlewareStack(
-        URLRouter(
-            routing.websocket_urlpatterns
+    # Browser WebSockets must come from an allowed Host origin (no cross-site socket
+    # reads) and carry the engine session cookie set by /engine-auth/start/.
+    "websocket": AllowedHostsOriginValidator(
+        EngineSessionWebsocketMiddleware(
+            AuthMiddlewareStack(
+                URLRouter(
+                    routing.websocket_urlpatterns
+                )
+            )
         )
     ),
 })

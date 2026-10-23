@@ -47,7 +47,18 @@ SECRET_KEY = _aurora_secret_key()
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
 
-ALLOWED_HOSTS = ['*']
+# Engine exposure (local vs network mode, port) lives in ~/.aurora/engine.json; see
+# engineConfig.py. Local mode only answers to loopback Host headers, which blocks DNS
+# rebinding (a web page re-pointing its own hostname at 127.0.0.1 to read this API).
+from AuroraClient import engineConfig  # noqa: E402
+
+ALLOWED_HOSTS = list(engineConfig.LOCAL_ALLOWED_HOSTS)
+if engineConfig.is_network_mode():
+    # Visitors reach the engine by its LAN address, which DHCP may change, and Django
+    # cannot express "any IP literal". EngineSessionMiddleware enforces that rule instead
+    # (IP literals, localhost and this computer's own name only), keeping the rebinding
+    # guard: a rebinding attack needs a domain name in the Host header.
+    ALLOWED_HOSTS = ["*"]
 
 # Configure CORS to allow specific origins
 CORS_ALLOWED_ORIGINS = [
@@ -100,6 +111,9 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'corsheaders.middleware.CorsMiddleware',
+    # Every engine route except the SPA shell, media, docs and /get-version/ needs an
+    # engine session created from a lab-signed handoff pass (pipeline/engineAuth.py).
+    'pipeline.engineAuth.EngineSessionMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -107,6 +121,12 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# People opening a shared server from another computer stay inside its shared folders
+# (pipeline/networkFolders.py). A no-op in local mode and for this computer's own user.
+REST_FRAMEWORK = {
+    'DEFAULT_PERMISSION_CLASSES': ['pipeline.networkFolders.NetworkPathPermission'],
+}
 
 ROOT_URLCONF = 'AuroraClient.urls'
 

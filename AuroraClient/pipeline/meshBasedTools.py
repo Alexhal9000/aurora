@@ -30,7 +30,18 @@ from asgiref.sync import async_to_sync
 from .ALPACA import ALPACA
 from .atlas_paths import resolve_atlas_dir
 from .batch_flag_filter import apply_flag_filter, load_flagged_subject_names, normalize_flag_filter_value
-from .linkedScans import filter_out_linked_children
+from .linkedScans import filter_out_linked_children, has_link_partners
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    crash_safe_view,
+    request_subjects,
+    subject_transaction,
+    atomic_nib_save,
+    atomic_write_json,
+    atomic_np_savez,
+    atomic_copy,
+    load_nifti_readonly,
+)
 from .coordinateFrames import (
     build_mesh_reference_prism,
     derive_mesh_reference_voxel_size,
@@ -58,6 +69,7 @@ from .meshGridTools import (
     strip_ephemeral_scan_metadata,
 )
 from .registrationTools import RegistrationTools
+from .stepProgress import StepProgress
 
 
 alpaca = ALPACA()
@@ -538,10 +550,13 @@ class MeshEditMixin:
 
         return landmarks_path, []
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _write_landmarks_for_edit(self, subject_dir, edit_stem, landmarks, mesh):
         landmarks_path = os.path.join(subject_dir, f"{edit_stem}_landmarks.json")
-        with open(landmarks_path, "w") as jf:
-            json.dump(landmarks, jf, indent=4)
+        atomic_write_json(landmarks_path, landmarks, indent=4)
 
         if not landmarks:
             return landmarks_path, None
@@ -553,20 +568,26 @@ class MeshEditMixin:
             np.asarray(mesh.faces, dtype=np.int64),
         )
         distances_path = os.path.join(subject_dir, f"{edit_stem}_landmark_distances.json")
-        with open(distances_path, "w") as jf:
-            json.dump({
+        atomic_write_json(distances_path, {
                 "distances": distances.tolist(),
                 "snap_distance": None,
-            }, jf, indent=4)
+            }, indent=4)
 
         return landmarks_path, distances_path
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _write_landmark_rows_for_edit(self, subject_dir, edit_stem, landmarks):
         landmarks_path = os.path.join(subject_dir, f"{edit_stem}_landmarks.json")
-        with open(landmarks_path, "w") as jf:
-            json.dump(landmarks, jf, indent=4)
+        atomic_write_json(landmarks_path, landmarks, indent=4)
         return landmarks_path
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _copy_landmark_distances_for_edit(self, subject_dir, source_stem, edit_stem, kept_indices=None):
         source_path = os.path.join(subject_dir, f"{source_stem}_landmark_distances.json")
         if not os.path.isfile(source_path):
@@ -574,7 +595,7 @@ class MeshEditMixin:
 
         destination_path = os.path.join(subject_dir, f"{edit_stem}_landmark_distances.json")
         if kept_indices is None:
-            shutil.copy(source_path, destination_path)
+            atomic_copy(source_path, destination_path)
             return destination_path
 
         with open(source_path, "r") as jf:
@@ -598,8 +619,7 @@ class MeshEditMixin:
         else:
             filtered_distances = distances_data
 
-        with open(destination_path, "w") as jf:
-            json.dump(filtered_distances, jf, indent=4)
+        atomic_write_json(destination_path, filtered_distances, indent=4)
         return destination_path
 
     def _mesh_cleanup_skip_reason(self, subject_dir, filename):
@@ -1629,27 +1649,25 @@ class MeshEditMixin:
             "max": float(np.max(volume)),
         }
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _propagate_sliced_mask(self, subject_dir, source_mask_edit_base, edit_number, filename, operations, voxel_size, nifti_affine):
         mask_src_path = os.path.join(subject_dir, f"{source_mask_edit_base}.nii.mask.gz")
         if not os.path.isfile(mask_src_path):
             return None
 
-        mask_src_temp = os.path.join(subject_dir, f"{source_mask_edit_base}_mask.nii.gz")
-        os.replace(mask_src_path, mask_src_temp)
-        try:
-            mask_img = nib.load(mask_src_temp)
-            mask_dtype = mask_img.get_data_dtype()
-            mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
-            sliced_mask = self._apply_slice_operations_to_mask(mask_data, voxel_size, operations)
-        finally:
-            if os.path.exists(mask_src_temp):
-                os.replace(mask_src_temp, mask_src_path)
+        # Read in place (crash-safe rule 2): the source mask is never renamed to be read.
+        mask_img = load_nifti_readonly(mask_src_path)
+        mask_dtype = mask_img.get_data_dtype()
+        mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+        sliced_mask = self._apply_slice_operations_to_mask(mask_data, voxel_size, operations)
 
         new_mask_edit_base = f"{filename}_edit_{edit_number}_sliced"
         mask_dest_path = os.path.join(subject_dir, f"{new_mask_edit_base}.nii.mask.gz")
         mask_dest_temp = os.path.join(subject_dir, f"{new_mask_edit_base}_mask.nii.gz")
-        nib.save(nib.Nifti1Image(sliced_mask, nifti_affine), mask_dest_temp)
-        os.replace(mask_dest_temp, mask_dest_path)
+        atomic_nib_save(nib.Nifti1Image(sliced_mask, nifti_affine), mask_dest_path)
 
         lc = None
         json_path = os.path.join(subject_dir, f"{filename}.json")
@@ -1675,8 +1693,7 @@ class MeshEditMixin:
         lossy_mask_edit_base = f"{filename}_lossy_edit_{edit_number}_sliced"
         lossy_mask_dest_path = os.path.join(subject_dir, f"{lossy_mask_edit_base}.nii.mask.gz")
         lossy_mask_temp = os.path.join(subject_dir, f"{lossy_mask_edit_base}_mask.nii.gz")
-        nib.save(nib.Nifti1Image(lossy_mask, nifti_affine), lossy_mask_temp)
-        os.replace(lossy_mask_temp, lossy_mask_dest_path)
+        atomic_nib_save(nib.Nifti1Image(lossy_mask, nifti_affine), lossy_mask_dest_path)
         return os.path.basename(mask_dest_path)
 
     def _lossy_mask_resolution_factor(self, json_path):
@@ -1698,32 +1715,30 @@ class MeshEditMixin:
                 pass
         return resolution_factor
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _propagate_shell_mask(self, subject_dir, source_mask_edit_base, edit_number, filename, shell_mask, nifti_affine, json_path):
         mask_src_path = os.path.join(subject_dir, f"{source_mask_edit_base}.nii.mask.gz")
         if not os.path.isfile(mask_src_path):
             return None
 
-        mask_src_temp = os.path.join(subject_dir, f"{source_mask_edit_base}_mask.nii.gz")
-        os.replace(mask_src_path, mask_src_temp)
-        try:
-            mask_img = nib.load(mask_src_temp)
-            mask_dtype = mask_img.get_data_dtype()
-            mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
-            shell_mask = np.asarray(shell_mask, dtype=bool)
-            if shell_mask.shape != mask_data.shape:
-                raise ValueError(
-                    f"Shell mask shape {shell_mask.shape} does not match segmentation mask shape {mask_data.shape}"
-                )
-            shelled_mask = np.where(shell_mask, mask_data, 0).astype(mask_dtype)
-        finally:
-            if os.path.exists(mask_src_temp):
-                os.replace(mask_src_temp, mask_src_path)
+        # Read in place (crash-safe rule 2): the source mask is never renamed to be read.
+        mask_img = load_nifti_readonly(mask_src_path)
+        mask_dtype = mask_img.get_data_dtype()
+        mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+        shell_mask = np.asarray(shell_mask, dtype=bool)
+        if shell_mask.shape != mask_data.shape:
+            raise ValueError(
+                f"Shell mask shape {shell_mask.shape} does not match segmentation mask shape {mask_data.shape}"
+            )
+        shelled_mask = np.where(shell_mask, mask_data, 0).astype(mask_dtype)
 
         new_mask_edit_base = f"{filename}_edit_{edit_number}_shell"
         mask_dest_path = os.path.join(subject_dir, f"{new_mask_edit_base}.nii.mask.gz")
         mask_dest_temp = os.path.join(subject_dir, f"{new_mask_edit_base}_mask.nii.gz")
-        nib.save(nib.Nifti1Image(shelled_mask, nifti_affine), mask_dest_temp)
-        os.replace(mask_dest_temp, mask_dest_path)
+        atomic_nib_save(nib.Nifti1Image(shelled_mask, nifti_affine), mask_dest_path)
 
         resolution_factor = self._lossy_mask_resolution_factor(json_path)
         slices = [slice(None, None, resolution_factor) for _ in range(3)]
@@ -1731,8 +1746,7 @@ class MeshEditMixin:
         lossy_mask_edit_base = f"{filename}_lossy_edit_{edit_number}_shell"
         lossy_mask_dest_path = os.path.join(subject_dir, f"{lossy_mask_edit_base}.nii.mask.gz")
         lossy_mask_temp = os.path.join(subject_dir, f"{lossy_mask_edit_base}_mask.nii.gz")
-        nib.save(nib.Nifti1Image(lossy_mask, nifti_affine), lossy_mask_temp)
-        os.replace(lossy_mask_temp, lossy_mask_dest_path)
+        atomic_nib_save(nib.Nifti1Image(lossy_mask, nifti_affine), lossy_mask_dest_path)
         return os.path.basename(mask_dest_path)
 
     def _resolve_fullres_volume_threshold(self, metadata, nifti_data, request_threshold=None):
@@ -1935,6 +1949,10 @@ def try_load_cached_preserved_mesh_display_geometry(ply_path, vertex_cap):
     return None
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def build_and_cache_preserved_mesh_display_geometry(
     ply_path,
     full_vertices,
@@ -1972,8 +1990,8 @@ def build_and_cache_preserved_mesh_display_geometry(
         }
         if display_face_uv is not None:
             cache_payload['face_uv'] = np.asarray(display_face_uv, dtype=np.float32)
-        np.savez(vertices_npz, **cache_payload)
-        np.savez(faces_npz, faces=np.asarray(faces, dtype=np.uint32))
+        atomic_np_savez(vertices_npz, **cache_payload)
+        atomic_np_savez(faces_npz, faces=np.asarray(faces, dtype=np.uint32))
     except OSError as exc:
         print(f"Warning: could not save preserved mesh display cache to {vertices_npz}: {exc}")
     return vertices, faces, display_face_uv
@@ -2028,6 +2046,10 @@ def _decimate_trimesh_to_vertex_cap(mesh, vertex_cap):
     return fast_simplification.simplify(vertices, faces, decimation_factor)
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def prepare_heatmap_reference_mesh(directory, reference, vertex_cap):
     """
     Reference surface for subject→reference heatmap distances, capped like the display mesh.
@@ -2116,8 +2138,8 @@ def prepare_heatmap_reference_mesh(directory, reference, vertex_cap):
         }
         if source_mtime is not None:
             save_kwargs["source_mtime"] = float(source_mtime)
-        np.savez(vertices_npz, **save_kwargs)
-        np.savez(faces_npz, faces=np.asarray(faces, dtype=np.uint32))
+        atomic_np_savez(vertices_npz, **save_kwargs)
+        atomic_np_savez(faces_npz, faces=np.asarray(faces, dtype=np.uint32))
     except OSError as exc:
         print(f"Warning: could not save heatmap reference cache to {vertices_npz}: {exc}")
 
@@ -2985,6 +3007,10 @@ class MeshElasticRegistrationMixin(MeshEditMixin):
                 )
         return float(voxel_size) * 6.0
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _persist_mesh_elastic_reference_surface(self, directory, reference, reference_mesh, ref_metadata):
         """
         Record the exact reference surface used for NR-ICP so later heatmap/metric reloads use the
@@ -3011,8 +3037,7 @@ class MeshElasticRegistrationMixin(MeshEditMixin):
                 f"({len(reference_mesh.vertices):,} vertices)"
             )
 
-        with open(ref_json_path, "w") as jf:
-            json.dump(ref_metadata, jf, indent=4)
+        atomic_write_json(ref_json_path, ref_metadata, indent=4)
         return ref_metadata
 
     def _load_mesh_elastic_reference_surface(self, directory, reference, ref_metadata=None):
@@ -3792,6 +3817,10 @@ class MeshElasticRegistrationMixin(MeshEditMixin):
         distances, nearest_vertex = tree.query(query_positions)
         return np.asarray(nearest_vertex, dtype=np.int64), np.asarray(distances, dtype=np.float64)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def transfer_reference_landmarks_to_mesh_subject(
         self, directory, filename, reference, reference_landmarks, overwrite_existing=True,
     ):
@@ -3889,17 +3918,12 @@ class MeshElasticRegistrationMixin(MeshEditMixin):
             self._write_landmark_rows_for_edit(subject_dir, elastic_stem, elastic_landmarks)
 
         distances_path = os.path.join(subject_dir, f"{edit_stem}_landmark_distances.json")
-        with open(distances_path, "w") as jf:
-            json.dump(
-                {
+        atomic_write_json(distances_path, {
                     "distances": transfer_distances.tolist(),
                     "snap_distance": None,
                     "transfer_query_mean_mm": mean_transfer_dist,
                     "transfer_query_max_mm": max_transfer_dist,
-                },
-                jf,
-                indent=4,
-            )
+                }, indent=4)
 
         return edit_stem
 
@@ -4141,204 +4165,209 @@ class MeshElasticRegistrationView(MeshElasticRegistrationMixin, APIView):
         registered_count = 0
         errors = []
         for i, filename in enumerate(subjects):
-            subject_t0 = time.perf_counter()
-            _mesh_elastic_log(f"--- subject {i + 1}/{total_scans}: {filename} ---")
-            self._send_progress(total_scans, filename, f"Loading mesh for {filename}...", i)
-            try:
-                subject_dir = self._subject_dir(directory, filename)
-                json_path, metadata = self._load_metadata(directory, filename)
-                source_path = self._source_mesh_path(directory, filename, "latest", metadata)
-                _mesh_elastic_log(f"{filename}: loading subject mesh from {source_path}")
-                subject_mesh = self._load_mesh(source_path)
-                _mesh_elastic_log(_mesh_elastic_mesh_summary(subject_mesh, f"{filename} subject"))
+            # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+            # subject is one transaction. A crash or an exception rolls back only this subject;
+            # the subjects already finished stay done. New derivative files go inside this
+            # block, written with the atomic_* helpers.
+            with subject_transaction(directory, filename, 'mesh_elastic_registration'):
+                subject_t0 = time.perf_counter()
+                _mesh_elastic_log(f"--- subject {i + 1}/{total_scans}: {filename} ---")
+                self._send_progress(total_scans, filename, f"Loading mesh for {filename}...", i)
+                try:
+                    subject_dir = self._subject_dir(directory, filename)
+                    json_path, metadata = self._load_metadata(directory, filename)
+                    source_path = self._source_mesh_path(directory, filename, "latest", metadata)
+                    _mesh_elastic_log(f"{filename}: loading subject mesh from {source_path}")
+                    subject_mesh = self._load_mesh(source_path)
+                    _mesh_elastic_log(_mesh_elastic_mesh_summary(subject_mesh, f"{filename} subject"))
 
-                registration_subject = subject_mesh
-                registration_source_path = source_path
-                shell_edit_filename = None
-                # --- Complex mesh volume: optional persisted shell edit ---
-                if settings.get("outer_shell_only") and settings.get("auto_extract_subject_outer_shell"):
-                    self._send_progress(
-                        total_scans, filename,
-                        f"Extracting outer shell edit for {filename}...", i,
-                    )
-                    registration_subject, shell_edit_filename, json_path, metadata = (
-                        self._create_subject_outer_shell_edit(
-                            directory, filename, subject_dir, json_path, metadata,
-                            subject_label=filename,
+                    registration_subject = subject_mesh
+                    registration_source_path = source_path
+                    shell_edit_filename = None
+                    # --- Complex mesh volume: optional persisted shell edit ---
+                    if settings.get("outer_shell_only") and settings.get("auto_extract_subject_outer_shell"):
+                        self._send_progress(
+                            total_scans, filename,
+                            f"Extracting outer shell edit for {filename}...", i,
                         )
-                    )
-                    registration_source_path = os.path.join(subject_dir, shell_edit_filename)
-                elif settings.get("outer_shell_only"):
-                    _mesh_elastic_log(
-                        f"{filename}: outer-shell-only — using latest subject mesh as the "
-                        f"registration surface (must already be an outer shell)"
-                    )
+                        registration_subject, shell_edit_filename, json_path, metadata = (
+                            self._create_subject_outer_shell_edit(
+                                directory, filename, subject_dir, json_path, metadata,
+                                subject_label=filename,
+                            )
+                        )
+                        registration_source_path = os.path.join(subject_dir, shell_edit_filename)
+                    elif settings.get("outer_shell_only"):
+                        _mesh_elastic_log(
+                            f"{filename}: outer-shell-only — using latest subject mesh as the "
+                            f"registration surface (must already be an outer shell)"
+                        )
 
-                init_ref_gp, init_subj_gp, gp_origin = self._gather_mesh_elastic_guidepoints_for_init(
-                    directory, filename, reference, metadata,
-                )
-                if init_ref_gp is not None:
-                    _mesh_elastic_log(
-                        f"{filename}: found {len(init_ref_gp)} manual guidepoints "
-                        f"({gp_origin}) for optional Procrustes init"
+                    init_ref_gp, init_subj_gp, gp_origin = self._gather_mesh_elastic_guidepoints_for_init(
+                        directory, filename, reference, metadata,
                     )
-                else:
-                    _mesh_elastic_log(
-                        f"{filename}: no project guidepoints — proceeding without Procrustes init"
-                    )
+                    if init_ref_gp is not None:
+                        _mesh_elastic_log(
+                            f"{filename}: found {len(init_ref_gp)} manual guidepoints "
+                            f"({gp_origin}) for optional Procrustes init"
+                        )
+                    else:
+                        _mesh_elastic_log(
+                            f"{filename}: no project guidepoints — proceeding without Procrustes init"
+                        )
 
-                mask_details = None
-                if settings.get("mask_subject_with_template"):
-                    self._send_progress(
-                        total_scans, filename,
-                        f"Masking {filename} with warped reference template...", i,
-                    )
-                    pre_mask_subject = registration_subject
-                    pre_mask_source_path = registration_source_path
-                    registration_subject, mask_details = self._mask_subject_with_warped_template(
-                        registration_subject,
-                        reference_mesh,
-                        settings,
+                    mask_details = None
+                    if settings.get("mask_subject_with_template"):
+                        self._send_progress(
+                            total_scans, filename,
+                            f"Masking {filename} with warped reference template...", i,
+                        )
+                        pre_mask_subject = registration_subject
+                        pre_mask_source_path = registration_source_path
+                        registration_subject, mask_details = self._mask_subject_with_warped_template(
+                            registration_subject,
+                            reference_mesh,
+                            settings,
+                            subject_label=filename,
+                            init_reference_guidepoints=init_ref_gp,
+                            init_subject_guidepoints=init_subj_gp,
+                        )
+                        mask_edit_number = self._next_edit_number(subject_dir, filename)
+                        mask_edit_filename = f"{filename}_edit_{mask_edit_number}_masked.ply"
+                        mask_output_path = os.path.join(subject_dir, mask_edit_filename)
+                        _mesh_elastic_log(f"{filename}: saving template-masked edit to {mask_output_path}")
+                        self._save_mesh_edit(registration_subject, mask_output_path)
+                        registration_source_path = mask_output_path
+
+                        source_stem = self._mesh_stem(pre_mask_source_path)
+                        mask_stem = self._mesh_stem(mask_edit_filename)
+                        _, source_landmarks = self._load_landmark_rows_for_stem(subject_dir, source_stem)
+                        if source_landmarks is not None:
+                            # Keep landmarks whose nearest pre-mask vertex survived the crop.
+                            pre_mask_vertices = np.asarray(pre_mask_subject.vertices, dtype=np.float64)
+                            orig_tree = cKDTree(pre_mask_vertices)
+                            crop_tree = cKDTree(np.asarray(registration_subject.vertices, dtype=np.float64))
+                            kept_landmarks = []
+                            for landmark in source_landmarks:
+                                position = np.asarray(landmark.get("position"), dtype=np.float64)
+                                if position.shape != (3,):
+                                    continue
+                                _, orig_idx = orig_tree.query(position)
+                                d_crop, _ = crop_tree.query(pre_mask_vertices[int(orig_idx)])
+                                if d_crop <= 1e-6:
+                                    kept_landmarks.append({
+                                        "position": position.tolist(),
+                                        "landmark_type": landmark.get("landmark_type", "main"),
+                                    })
+                            self._write_landmark_rows_for_edit(subject_dir, mask_stem, kept_landmarks)
+                            mask_details["landmark_count"] = len(kept_landmarks)
+                        else:
+                            mask_details["landmark_count"] = 0
+
+                        self._append_edit_metadata(json_path, metadata, mask_edit_filename, "masked", {
+                            "reference": reference,
+                            "mask_source": "warped_reference_template",
+                            "mesh_summary": self._mesh_summary(registration_subject),
+                            **mask_details,
+                        })
+                        # Reload metadata path state after append (edits list updated on disk).
+                        json_path, metadata = self._load_metadata(directory, filename)
+
+                    self._send_progress(total_scans, filename, f"Running NR-ICP on {filename}...", i)
+                    # Final elastic always deforms the (optionally masked) subject onto the reference.
+                    elastic_settings = {**settings, "homology_mode": False}
+                    elastic_mesh, subject_decimated_for_nricp = self._run_mesh_nricp(
+                        registration_subject, reference_mesh, elastic_settings,
                         subject_label=filename,
                         init_reference_guidepoints=init_ref_gp,
                         init_subject_guidepoints=init_subj_gp,
                     )
-                    mask_edit_number = self._next_edit_number(subject_dir, filename)
-                    mask_edit_filename = f"{filename}_edit_{mask_edit_number}_masked.ply"
-                    mask_output_path = os.path.join(subject_dir, mask_edit_filename)
-                    _mesh_elastic_log(f"{filename}: saving template-masked edit to {mask_output_path}")
-                    self._save_mesh_edit(registration_subject, mask_output_path)
-                    registration_source_path = mask_output_path
+                    _assert_elastic_preserves_source_topology(
+                        registration_subject, elastic_mesh, filename,
+                    )
 
-                    source_stem = self._mesh_stem(pre_mask_source_path)
-                    mask_stem = self._mesh_stem(mask_edit_filename)
-                    _, source_landmarks = self._load_landmark_rows_for_stem(subject_dir, source_stem)
-                    if source_landmarks is not None:
-                        # Keep landmarks whose nearest pre-mask vertex survived the crop.
-                        pre_mask_vertices = np.asarray(pre_mask_subject.vertices, dtype=np.float64)
-                        orig_tree = cKDTree(pre_mask_vertices)
-                        crop_tree = cKDTree(np.asarray(registration_subject.vertices, dtype=np.float64))
-                        kept_landmarks = []
-                        for landmark in source_landmarks:
-                            position = np.asarray(landmark.get("position"), dtype=np.float64)
-                            if position.shape != (3,):
-                                continue
-                            _, orig_idx = orig_tree.query(position)
-                            d_crop, _ = crop_tree.query(pre_mask_vertices[int(orig_idx)])
-                            if d_crop <= 1e-6:
-                                kept_landmarks.append({
-                                    "position": position.tolist(),
-                                    "landmark_type": landmark.get("landmark_type", "main"),
-                                })
-                        self._write_landmark_rows_for_edit(subject_dir, mask_stem, kept_landmarks)
-                        mask_details["landmark_count"] = len(kept_landmarks)
-                    else:
-                        mask_details["landmark_count"] = 0
+                    edit_number = self._next_edit_number(subject_dir, filename)
+                    edit_filename = f"{filename}_edit_{edit_number}_elastic.ply"
+                    output_path = os.path.join(subject_dir, edit_filename)
+                    self._send_progress(total_scans, filename, f"Saving elastic mesh edit for {filename}...", i + 1)
+                    _mesh_elastic_log(f"{filename}: saving elastic edit to {output_path}")
+                    save_t0 = time.perf_counter()
+                    self._save_mesh_edit(elastic_mesh, output_path)
+                    _mesh_elastic_log(f"{filename}: saved in {time.perf_counter() - save_t0:.1f}s")
 
-                    self._append_edit_metadata(json_path, metadata, mask_edit_filename, "masked", {
+                    metric_t0 = time.perf_counter()
+                    self._send_progress(total_scans, filename, f"Computing surface metric for {filename}...", i + 1)
+                    surface_metrics = self._compute_mesh_elastic_surface_metrics(
+                        elastic_mesh, reference_mesh, ref_metadata, filename, directory,
+                    )
+                    _mesh_elastic_log(
+                        f"{filename}: surface metrics finished in {time.perf_counter() - metric_t0:.1f}s"
+                    )
+
+                    metadata["elastic_to"] = reference
+                    metadata["elastic_surface_distance"] = surface_metrics["elastic_surface_distance"]
+                    if surface_metrics.get("elastic_surface_distance_1vox") is not None:
+                        metadata["elastic_surface_distance_1vox"] = surface_metrics[
+                            "elastic_surface_distance_1vox"
+                        ]
+                    if surface_metrics.get("surface_above_threshold_fraction") is not None:
+                        metadata["surface_above_threshold_fraction"] = surface_metrics[
+                            "surface_above_threshold_fraction"
+                        ]
+                    if surface_metrics.get("surface_above_1vox_fraction") is not None:
+                        metadata["surface_above_1vox_fraction"] = surface_metrics[
+                            "surface_above_1vox_fraction"
+                        ]
+                    metadata["elastic_error"] = surface_metrics["elastic_error"]
+                    self._append_edit_metadata(json_path, metadata, edit_filename, "elastic", {
                         "reference": reference,
-                        "mask_source": "warped_reference_template",
-                        "mesh_summary": self._mesh_summary(registration_subject),
-                        **mask_details,
+                        "registration_source_ply": os.path.basename(registration_source_path),
+                        "mesh_elastic_reference_ply": ref_metadata.get("mesh_elastic_reference_ply"),
+                        "mesh_elastic_settings": {
+                            "mode": settings["mode"],
+                            "steps": settings["steps"],
+                            "gamma": settings["gamma"],
+                            "eps": settings["eps"],
+                            "distance_threshold": settings["distance_threshold"],
+                            "use_vertex_normals": settings["use_vertex_normals"],
+                            "rigid_prealignment": settings["rigid_prealignment"],
+                            "use_outer_shell": bool(settings.get("use_outer_shell")),
+                            "outer_shell_only": bool(settings.get("outer_shell_only")),
+                            "auto_extract_subject_outer_shell": bool(
+                                settings.get("auto_extract_subject_outer_shell")
+                            ),
+                            "subject_shell_edit": shell_edit_filename,
+                            "tps_alpha_spacing_fraction": settings.get("tps_alpha_spacing_fraction"),
+                            "reference_smoothing_iterations": settings.get("reference_smoothing_iterations"),
+                            "mask_subject_with_template": bool(settings.get("mask_subject_with_template")),
+                            "mask_pad_centroid_fraction": settings.get("mask_pad_centroid_fraction"),
+                            "guidepoint_procrustes_init": bool(init_ref_gp is not None),
+                            "guidepoint_init_origin": gp_origin,
+                            "nricp_vertex_cap": MESH_ELASTIC_NRICP_VERTEX_CAP,
+                            "tps_alpha_spacing_fraction": MESH_ELASTIC_TPS_ALPHA_SPACING_FRACTION,
+                            "subject_decimated_for_nricp": subject_decimated_for_nricp,
+                            "displacement_propagation": (
+                                "none"
+                                if _meshes_share_topology(registration_subject, elastic_mesh)
+                                and not subject_decimated_for_nricp
+                                else (
+                                    "knn" if settings.get("outer_shell_only")
+                                    else ("tps" if subject_decimated_for_nricp else "tps")
+                                )
+                            ),
+                        },
+                        "mesh_summary": self._mesh_summary(elastic_mesh),
+                        **surface_metrics,
                     })
-                    # Reload metadata path state after append (edits list updated on disk).
-                    json_path, metadata = self._load_metadata(directory, filename)
-
-                self._send_progress(total_scans, filename, f"Running NR-ICP on {filename}...", i)
-                # Final elastic always deforms the (optionally masked) subject onto the reference.
-                elastic_settings = {**settings, "homology_mode": False}
-                elastic_mesh, subject_decimated_for_nricp = self._run_mesh_nricp(
-                    registration_subject, reference_mesh, elastic_settings,
-                    subject_label=filename,
-                    init_reference_guidepoints=init_ref_gp,
-                    init_subject_guidepoints=init_subj_gp,
-                )
-                _assert_elastic_preserves_source_topology(
-                    registration_subject, elastic_mesh, filename,
-                )
-
-                edit_number = self._next_edit_number(subject_dir, filename)
-                edit_filename = f"{filename}_edit_{edit_number}_elastic.ply"
-                output_path = os.path.join(subject_dir, edit_filename)
-                self._send_progress(total_scans, filename, f"Saving elastic mesh edit for {filename}...", i + 1)
-                _mesh_elastic_log(f"{filename}: saving elastic edit to {output_path}")
-                save_t0 = time.perf_counter()
-                self._save_mesh_edit(elastic_mesh, output_path)
-                _mesh_elastic_log(f"{filename}: saved in {time.perf_counter() - save_t0:.1f}s")
-
-                metric_t0 = time.perf_counter()
-                self._send_progress(total_scans, filename, f"Computing surface metric for {filename}...", i + 1)
-                surface_metrics = self._compute_mesh_elastic_surface_metrics(
-                    elastic_mesh, reference_mesh, ref_metadata, filename, directory,
-                )
-                _mesh_elastic_log(
-                    f"{filename}: surface metrics finished in {time.perf_counter() - metric_t0:.1f}s"
-                )
-
-                metadata["elastic_to"] = reference
-                metadata["elastic_surface_distance"] = surface_metrics["elastic_surface_distance"]
-                if surface_metrics.get("elastic_surface_distance_1vox") is not None:
-                    metadata["elastic_surface_distance_1vox"] = surface_metrics[
-                        "elastic_surface_distance_1vox"
-                    ]
-                if surface_metrics.get("surface_above_threshold_fraction") is not None:
-                    metadata["surface_above_threshold_fraction"] = surface_metrics[
-                        "surface_above_threshold_fraction"
-                    ]
-                if surface_metrics.get("surface_above_1vox_fraction") is not None:
-                    metadata["surface_above_1vox_fraction"] = surface_metrics[
-                        "surface_above_1vox_fraction"
-                    ]
-                metadata["elastic_error"] = surface_metrics["elastic_error"]
-                self._append_edit_metadata(json_path, metadata, edit_filename, "elastic", {
-                    "reference": reference,
-                    "registration_source_ply": os.path.basename(registration_source_path),
-                    "mesh_elastic_reference_ply": ref_metadata.get("mesh_elastic_reference_ply"),
-                    "mesh_elastic_settings": {
-                        "mode": settings["mode"],
-                        "steps": settings["steps"],
-                        "gamma": settings["gamma"],
-                        "eps": settings["eps"],
-                        "distance_threshold": settings["distance_threshold"],
-                        "use_vertex_normals": settings["use_vertex_normals"],
-                        "rigid_prealignment": settings["rigid_prealignment"],
-                        "use_outer_shell": bool(settings.get("use_outer_shell")),
-                        "outer_shell_only": bool(settings.get("outer_shell_only")),
-                        "auto_extract_subject_outer_shell": bool(
-                            settings.get("auto_extract_subject_outer_shell")
-                        ),
-                        "subject_shell_edit": shell_edit_filename,
-                        "tps_alpha_spacing_fraction": settings.get("tps_alpha_spacing_fraction"),
-                        "reference_smoothing_iterations": settings.get("reference_smoothing_iterations"),
-                        "mask_subject_with_template": bool(settings.get("mask_subject_with_template")),
-                        "mask_pad_centroid_fraction": settings.get("mask_pad_centroid_fraction"),
-                        "guidepoint_procrustes_init": bool(init_ref_gp is not None),
-                        "guidepoint_init_origin": gp_origin,
-                        "nricp_vertex_cap": MESH_ELASTIC_NRICP_VERTEX_CAP,
-                        "tps_alpha_spacing_fraction": MESH_ELASTIC_TPS_ALPHA_SPACING_FRACTION,
-                        "subject_decimated_for_nricp": subject_decimated_for_nricp,
-                        "displacement_propagation": (
-                            "none"
-                            if _meshes_share_topology(registration_subject, elastic_mesh)
-                            and not subject_decimated_for_nricp
-                            else (
-                                "knn" if settings.get("outer_shell_only")
-                                else ("tps" if subject_decimated_for_nricp else "tps")
-                            )
-                        ),
-                    },
-                    "mesh_summary": self._mesh_summary(elastic_mesh),
-                    **surface_metrics,
-                })
-                registered_count += 1
-                _mesh_elastic_log(
-                    f"{filename}: completed successfully in {time.perf_counter() - subject_t0:.1f}s "
-                    f"({registered_count}/{total_scans} done)"
-                )
-            except Exception as exc:
-                _mesh_elastic_log(f"ERROR registering {filename} after {time.perf_counter() - subject_t0:.1f}s: {exc}")
-                traceback.print_exc()
-                errors.append(f"{filename}: {exc}")
+                    registered_count += 1
+                    _mesh_elastic_log(
+                        f"{filename}: completed successfully in {time.perf_counter() - subject_t0:.1f}s "
+                        f"({registered_count}/{total_scans} done)"
+                    )
+                except Exception as exc:
+                    _mesh_elastic_log(f"ERROR registering {filename} after {time.perf_counter() - subject_t0:.1f}s: {exc}")
+                    traceback.print_exc()
+                    errors.append(f"{filename}: {exc}")
 
         self._send_progress(total_scans, reference, "Mesh elastic registration complete", total_scans)
         _mesh_elastic_log(
@@ -4361,6 +4390,14 @@ class MeshElasticRegistrationView(MeshElasticRegistrationMixin, APIView):
 
 
 class ApplyMeshCropView(MeshEditMixin, APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_mesh_crop', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get("directory")
         filename = request.data.get("filename")
@@ -4490,6 +4527,14 @@ class ApplyMeshSliceView(MeshEditMixin, APIView):
         print("[apply-mesh-slice] OPTIONS preflight received", flush=True)
         return super().options(request, *args, **kwargs)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_mesh_slice', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get("directory")
         filename = request.data.get("filename")
@@ -4603,6 +4648,10 @@ class ApplyMeshSliceView(MeshEditMixin, APIView):
             "mesh_summary": self._mesh_summary(sliced_mesh),
         }, status=status.HTTP_200_OK)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _post_voxel_slice(self, *, directory, filename, edit, operations, save, json_path, metadata):
         if not save:
             return Response(
@@ -4645,22 +4694,23 @@ class ApplyMeshSliceView(MeshEditMixin, APIView):
         edit_filename = f"{filename}_edit_{edit_number}_sliced.nii.gz"
         output_path = os.path.join(subject_dir, edit_filename)
         print(f"[apply-mesh-slice] writing sliced volume edit: {output_path}", flush=True)
-        nib.save(nib.Nifti1Image(sliced_data.astype(original_dtype), nifti_img.affine), output_path)
+        atomic_nib_save(nib.Nifti1Image(sliced_data.astype(original_dtype), nifti_img.affine), output_path)
 
         # Record exactly which voxels this slice cleared. Linked siblings replay this mask
         # instead of re-running the wedge test, whose candidate set depends on each scan's
         # own threshold and border background value.
+        # It is a hand-off file, not a stored derivative: written only when the subject has
+        # link partners and deleted by ApplyCleanupRemovalMaskView after the replay
+        # (project-open recovery sweeps any leftovers).
         removal_mask_file = None
         try:
-            removal_mask = (sliced_data != nifti_data)
-            removal_mask_file = f"{filename}_edit_{edit_number}_sliced.nii.removal_mask.gz"
-            removal_mask_path = os.path.join(subject_dir, removal_mask_file)
-            removal_mask_temp = os.path.join(subject_dir, f"{filename}_edit_{edit_number}_sliced_removal_mask.nii.gz")
-            nib.save(
-                nib.Nifti1Image(removal_mask.astype(np.uint8), nifti_img.affine),
-                removal_mask_temp,
-            )
-            os.replace(removal_mask_temp, removal_mask_path)
+            if has_link_partners(directory, filename):
+                removal_mask = (sliced_data != nifti_data)
+                removal_mask_file = f"{filename}_edit_{edit_number}_sliced.nii.removal_mask.gz"
+                atomic_nib_save(
+                    nib.Nifti1Image(removal_mask.astype(np.uint8), nifti_img.affine),
+                    os.path.join(subject_dir, removal_mask_file),
+                )
         except Exception as removal_error:
             removal_mask_file = None
             print(f"[apply-mesh-slice] removal mask write failed: {removal_error}", flush=True)
@@ -4716,7 +4766,6 @@ class ApplyMeshSliceView(MeshEditMixin, APIView):
             "slice_operations": operation_summary,
             "lossy_edit": lossy_edit_filename,
             "mask_file": mask_file,
-            "removal_mask_file": removal_mask_file,
             **landmark_details,
             "volume_summary": volume_summary,
         })
@@ -4800,6 +4849,14 @@ class ApplyMeshRotationView(MeshEditMixin, APIView):
                 return np.asarray(center, dtype=np.float64)
         return np.mean(vertices, axis=0)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_mesh_rotation', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get("directory")
         filename = request.data.get("filename")
@@ -4902,6 +4959,14 @@ class ApplyMeshScaleView(MeshEditMixin, APIView):
         end = np.asarray(end_mm, dtype=np.float64)
         return start, end
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_mesh_scale', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get("directory")
         filename = request.data.get("filename")
@@ -5072,6 +5137,10 @@ class ApplyMeshSnapToMeshView(MeshEditMixin, APIView):
 
         return landmarks_list, landmarks_positions
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _distance_analysis(self, directory, filename, edit_stem, landmarks, vertices, faces, snap_distance, use_outer_shell):
         json_path, metadata = self._load_metadata(directory, filename)
         distances = alpaca.calculate_landmark_distances(landmarks, vertices, faces)
@@ -5089,11 +5158,10 @@ class ApplyMeshSnapToMeshView(MeshEditMixin, APIView):
             snapped_outliers_six = None
 
         distances_path = os.path.join(self._subject_dir(directory, filename), f"{edit_stem}_landmark_distances.json")
-        with open(distances_path, "w") as jf:
-            json.dump({
+        atomic_write_json(distances_path, {
                 "distances": distances.tolist(),
                 "snap_distance": snap_distance.tolist(),
-            }, jf, indent=4)
+            }, indent=4)
 
         metadata["landmarks"] = {
             "num_landmarks": int(len(landmarks)),
@@ -5108,9 +5176,16 @@ class ApplyMeshSnapToMeshView(MeshEditMixin, APIView):
             "edit_name": edit_stem,
             "snap_source": "preserved_mesh_ply_outer_shell" if use_outer_shell else "preserved_mesh_ply",
         }
-        with open(json_path, "w") as jf:
-            json.dump(metadata, jf, indent=4)
+        atomic_write_json(json_path, metadata, indent=4)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_mesh_snap_to_mesh', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get("directory")
         filename = request.data.get("filename")
@@ -5121,6 +5196,10 @@ class ApplyMeshSnapToMeshView(MeshEditMixin, APIView):
             return Response({"error": "directory and filename are required."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
+            # Stages for the progress bar (see stepProgress.py).
+            steps = StepProgress(3, filename, 'Snapping landmarks to mesh')
+            steps.start()
+            steps(1, 'Loading mesh')
             _, metadata = self._load_metadata(directory, filename)
             source_path = self._source_mesh_path(directory, filename, edit, metadata)
             mesh = self._load_mesh(source_path)
@@ -5145,6 +5224,7 @@ class ApplyMeshSnapToMeshView(MeshEditMixin, APIView):
                 return Response({"error": "No landmark file found for this mesh edit."}, status=status.HTTP_404_NOT_FOUND)
 
             landmarks_list, landmarks_positions = self._load_landmarks(landmarks_path)
+            steps(2, 'Snapping landmarks to the surface')
             closest_points = alpaca.calculate_landmarks_closest_points(landmarks_positions, vertices, faces)
 
             if landmarks_positions.shape != closest_points.shape:
@@ -5157,9 +5237,9 @@ class ApplyMeshSnapToMeshView(MeshEditMixin, APIView):
             for i, landmark in enumerate(landmarks_list):
                 landmark["position"] = closest_points[i].tolist()
 
-            with open(landmarks_path, "w") as jf:
-                json.dump(landmarks_list, jf, indent=4)
+            atomic_write_json(landmarks_path, landmarks_list, indent=4)
 
+            steps(3, 'Measuring landmark distances')
             self._distance_analysis(
                 directory,
                 filename,
@@ -5183,6 +5263,14 @@ class ApplyMeshSnapToMeshView(MeshEditMixin, APIView):
 
 
 class ApplyMeshCleanupView(MeshEditMixin, APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_mesh_cleanup', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get("directory")
         filename = request.data.get("filename")
@@ -5194,6 +5282,11 @@ class ApplyMeshCleanupView(MeshEditMixin, APIView):
             return Response({"error": "directory and filename are required."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
+            # cleanup_preserved_mesh is one call (no inner stages), but the bar still shows
+            # that it is running and for how long (see stepProgress.py).
+            steps = StepProgress(1, filename, 'Cleaning up mesh')
+            steps.start()
+            steps(1, 'Removing disconnected pieces')
             result = self.cleanup_preserved_mesh(
                 directory,
                 filename,
@@ -5221,6 +5314,14 @@ class ApplyMeshCleanupView(MeshEditMixin, APIView):
 
 
 class ApplyMeshWeldView(MeshEditMixin, APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_mesh_weld', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get("directory")
         filename = request.data.get("filename")
@@ -5337,40 +5438,45 @@ class BatchWeldMeshView(MeshEditMixin, APIView):
 
         results = []
         for idx, scan_name in enumerate(preserved_scans):
-            if channel_layer is not None:
-                async_to_sync(channel_layer.group_send)(
-                    "progress_group",
-                    {
-                        "type": "send_progress",
-                        "progress": idx / total_scans,
+            # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+            # subject is one transaction. A crash or an exception rolls back only this subject;
+            # the subjects already finished stay done. New derivative files go inside this
+            # block, written with the atomic_* helpers.
+            with subject_transaction(directory, scan_name, 'batch_weld_mesh'):
+                if channel_layer is not None:
+                    async_to_sync(channel_layer.group_send)(
+                        "progress_group",
+                        {
+                            "type": "send_progress",
+                            "progress": idx / total_scans,
+                            "scan_name": scan_name,
+                            "custom_message": f"Welding mesh for {scan_name}...",
+                            "total": total_scans,
+                            "current": idx + 1,
+                        },
+                    )
+                try:
+                    result = self.weld_preserved_mesh(
+                        directory,
+                        scan_name,
+                        edit="latest",
+                        distance_factor=distance_factor,
+                    )
+                    results.append({"scan_name": scan_name, "mode": "preserved_mesh", **result})
+                    print(
+                        f"Batch weld mesh [{scan_name}]: {result.get('status')} — {result.get('message')}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    traceback.print_exc()
+                    message = self._format_permission_error(exc)
+                    results.append({
                         "scan_name": scan_name,
-                        "custom_message": f"Welding mesh for {scan_name}...",
-                        "total": total_scans,
-                        "current": idx + 1,
-                    },
-                )
-            try:
-                result = self.weld_preserved_mesh(
-                    directory,
-                    scan_name,
-                    edit="latest",
-                    distance_factor=distance_factor,
-                )
-                results.append({"scan_name": scan_name, "mode": "preserved_mesh", **result})
-                print(
-                    f"Batch weld mesh [{scan_name}]: {result.get('status')} — {result.get('message')}",
-                    flush=True,
-                )
-            except Exception as exc:
-                traceback.print_exc()
-                message = self._format_permission_error(exc)
-                results.append({
-                    "scan_name": scan_name,
-                    "status": "error",
-                    "mode": "preserved_mesh",
-                    "message": message,
-                })
-                print(f"Batch weld mesh [{scan_name}]: error — {message}", flush=True)
+                        "status": "error",
+                        "mode": "preserved_mesh",
+                        "message": message,
+                    })
+                    print(f"Batch weld mesh [{scan_name}]: error — {message}", flush=True)
 
         if channel_layer is not None:
             async_to_sync(channel_layer.group_send)(
@@ -5554,6 +5660,10 @@ class ApplyMeshShellView(MeshEditMixin, APIView):
             "mesh_summary": self._mesh_summary(shell_mesh),
         }, status=status.HTTP_200_OK)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _post_voxel_shell(self, *, directory, filename, edit, json_path, metadata, started_at, gaussian_blur):
         registration_tools = RegistrationTools()
         subject_dir = self._subject_dir(directory, filename)
@@ -5637,7 +5747,7 @@ class ApplyMeshShellView(MeshEditMixin, APIView):
         edit_filename = f"{filename}_edit_{edit_number}_shell.nii.gz"
         output_path = os.path.join(subject_dir, edit_filename)
         print(f"[apply-mesh-shell] writing shell volume edit: {output_path}", flush=True)
-        nib.save(nib.Nifti1Image(shell_data, nifti_img.affine), output_path)
+        atomic_nib_save(nib.Nifti1Image(shell_data, nifti_img.affine), output_path)
 
         lossy_edit_filename = f"{filename}_lossy_edit_{edit_number}_shell.nii.gz"
         lossy_output_path = os.path.join(subject_dir, lossy_edit_filename)
@@ -5707,6 +5817,14 @@ class ApplyMeshShellView(MeshEditMixin, APIView):
             "volume_summary": volume_summary,
         }, status=status.HTTP_200_OK)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_mesh_shell', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         directory = request.data.get("directory")
         filename = request.data.get("filename")

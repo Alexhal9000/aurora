@@ -42,8 +42,15 @@ from skimage.filters import threshold_otsu
 import skimage.morphology
 from scipy.signal import convolve
 from .ALPACA import ALPACA
+from . import antsWorker  # ANTs registrations run in a worker process (engine stays responsive)
 from skimage import exposure
 import os
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    atomic_nib_save,
+    atomic_write_json,
+    atomic_copy,
+)
 # Set the number of threads for ITK to utilize
 os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(psutil.cpu_count(logical=True))
 import ants
@@ -400,6 +407,10 @@ class RegistrationTools():
         # find the corresponding value in the new range
         return (background_value - np.min(image_data)) / (np.max(image_data) - np.min(image_data)) * (new_max - new_min) + new_min
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def load_nifti_mask_data(self, mask_path):
         """Load mask voxel data from disk.
 
@@ -412,7 +423,7 @@ class RegistrationTools():
             fd, tmp_path = tempfile.mkstemp(suffix='_mask_temp.nii.gz')
             os.close(fd)
             try:
-                shutil.copyfile(mask_path, tmp_path)
+                atomic_copy(mask_path, tmp_path)
                 return nib.load(tmp_path).get_fdata()
             finally:
                 try:
@@ -496,6 +507,10 @@ class RegistrationTools():
         
         return result
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def save_as_lossy_nifti(self, image_data, voxel_size, json_file, output_file, stored_scale=1.0, stored_offset=0.0):
         # Load existing metadata
         with open(json_file, 'r') as jf:
@@ -594,7 +609,7 @@ class RegistrationTools():
         
         # Create and save the NIfTI image using the provided output_file
         nifti_img = nib.Nifti1Image(compressed_image_data, affine)
-        nib.save(nifti_img, output_file)
+        atomic_nib_save(nifti_img, output_file)
         
         # After saving, free the last large array
         compressed_image_data = None
@@ -638,12 +653,15 @@ class RegistrationTools():
             stored_offset=stored_offset,
         )
 
-        with open(json_file, 'w') as jf:
-            json.dump(json_metadata, jf, indent=4)
+        atomic_write_json(json_file, json_metadata, indent=4)
         # Callers that later dump an older in-memory metadata dict must reload
         # or merge this list; returning it makes that merge explicit.
         return json_metadata
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def calculate_affine_transform_as_field(self, fixed_image_data, moving_image_data):
         """
         Calculate an affine transformation between fixed and moving images and convert it to a displacement field.
@@ -675,7 +693,7 @@ class RegistrationTools():
         # Perform Affine registration with Identity initial transform
         
         print("\nPerforming Affine registration with Identity initial_transform...")
-        affine_transform = ants.registration(
+        affine_transform = antsWorker.registration(
             fixed=fixed_image_data,
             moving=moving_image_data,
             type_of_transform='Affine',
@@ -786,7 +804,7 @@ class RegistrationTools():
         
         
         # Run a quick SyNOnly registration to get a properly formatted displacement field file
-        quick_syn = ants.registration(
+        quick_syn = antsWorker.registration(
             fixed=fixed_image_data,
             moving=moving_image_data,
             type_of_transform='SyNOnly',
@@ -819,7 +837,7 @@ class RegistrationTools():
                                   displacement_field_img.affine, displacement_field_img.header)
         
         # Save back to the same file
-        nib.save(warp_img, displacement_field_path)
+        atomic_nib_save(warp_img, displacement_field_path)
         
         return affine_file_path, displacement_field_path
 
@@ -857,6 +875,10 @@ class RegistrationTools():
         ])
         return affine, tuple(float(s) for s in field_spacing)
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def save_displacement_field_nifti(self, path, field_data, reference_ants_image):
         """
         Save a displacement field with FOV locked to `reference_ants_image`.
@@ -877,7 +899,7 @@ class RegistrationTools():
         img = nib.Nifti1Image(data, affine)
         img.header.set_intent('vector')
         img.header.set_xyzt_units('mm')
-        nib.save(img, path)
+        atomic_nib_save(img, path)
         print(
             f"Saved displacement field {os.path.basename(path)}: "
             f"grid={tuple(int(x) for x in data.shape[:3])} spacing={field_spacing} "

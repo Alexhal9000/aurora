@@ -2,6 +2,10 @@ import numpy as np
 import open3d as o3d
 from cpdalp import DeformableRegistration
 import matplotlib
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    atomic_write_json,
+)
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import copy
@@ -10,6 +14,10 @@ import gc
 import os
 import json
 import trimesh
+# One RANSAC try's body + the parallel pool for the 40 tries; also the exact-NN helper
+# used by the scoring below (see alpacaRansacWorker's docstring).
+from . import alpacaRansacWorker
+from .alpacaRansacWorker import _nearest_neighbors
 
 
 # This is the ALPACA class that performs the alignment of the source landmarks to the target mesh. 
@@ -22,6 +30,7 @@ import trimesh
 # Fixed Poisson-disk budget for alignment: reference always uses this many samples; the
 # subject uses the same count scaled by incoming vertex ratio (target_vertices/source_vertices).
 ALIGNMENT_REFERENCE_POISSON_POINTS = 5000
+
 
 
 class ALPACA:
@@ -970,101 +979,6 @@ class ALPACA:
         except Exception as e:
             print(f"Warning: Could not save exclusion debug image '{title}': {str(e)}")
 
-    def pca_pre_alignment(self, source_points, target_points):
-        """
-        Performs PCA-based pre-alignment to align principal axes using ONLY proper rotations.
-        This provides a better starting point for RANSAC by aligning the main
-        orientations of both point clouds, reducing the search space significantly.
-        
-        IMPORTANT: Only uses proper rotations (det = +1) to preserve anatomical validity.
-        No reflections are used - only rotations between eigenvector bases.
-        
-        Args:
-            source_points: np.array (N, 3) source landmarks
-            target_points: np.array (M, 3) target landmarks
-            
-        Returns:
-            transformation_matrix: 4x4 proper rotation transformation to pre-align target to source
-        """
-        # Center both point clouds
-        source_centered = source_points - np.mean(source_points, axis=0)
-        target_centered = target_points - np.mean(target_points, axis=0)
-        
-        # Compute PCA for both point clouds
-        source_cov = np.cov(source_centered.T)
-        target_cov = np.cov(target_centered.T)
-        
-        source_eigenvals, source_eigenvecs = np.linalg.eigh(source_cov)
-        target_eigenvals, target_eigenvecs = np.linalg.eigh(target_cov)
-        
-        # Sort by eigenvalues (descending order)
-        source_idx = np.argsort(source_eigenvals)[::-1]
-        target_idx = np.argsort(target_eigenvals)[::-1]
-        
-        source_eigenvecs = source_eigenvecs[:, source_idx]
-        target_eigenvecs = target_eigenvecs[:, target_idx]
-        
-        # Ensure right-handed coordinate systems
-        source_eigenvecs = self._ensure_right_handed(source_eigenvecs)
-        target_eigenvecs = self._ensure_right_handed(target_eigenvecs)
-        
-        # Test different axis alignments to find best PROPER rotation
-        best_rotation = None
-        best_score = float('inf')
-        
-        # Try all possible axis alignments (6 permutations)
-        axis_permutations = [
-            [0, 1, 2], [0, 2, 1], [1, 0, 2], 
-            [1, 2, 0], [2, 0, 1], [2, 1, 0]
-        ]
-        
-        for perm in axis_permutations:
-            # Create permuted target eigenvectors
-            test_eigenvecs = target_eigenvecs[:, perm].copy()
-            
-            # Compute rotation matrix
-            rotation = source_eigenvecs @ test_eigenvecs.T
-            
-            # CRITICAL: Ensure this is a proper rotation (det = +1)
-            # If det = -1, we have a reflection - fix by flipping one eigenvector
-            if np.linalg.det(rotation) < 0:
-                # Flip the last eigenvector to make it a proper rotation
-                test_eigenvecs[:, 2] *= -1
-                rotation = source_eigenvecs @ test_eigenvecs.T
-                
-            # Verify we now have a proper rotation
-            det_rotation = np.linalg.det(rotation)
-            if abs(det_rotation - 1.0) > 1e-10:
-                print(f"Warning: rotation determinant = {det_rotation}, should be 1.0")
-                continue
-                
-            # Test quality by measuring alignment of principal directions
-            aligned_target = (rotation @ target_centered.T).T
-            score = np.sum(np.abs(np.std(aligned_target, axis=0) - np.std(source_centered, axis=0)))
-            
-            if score < best_score:
-                best_score = score
-                best_rotation = rotation
-        
-        # Create 4x4 transformation matrix
-        transformation = np.eye(4)
-        transformation[:3, :3] = best_rotation
-        
-        # Verify final transformation is proper rotation
-        final_det = np.linalg.det(best_rotation)
-        print(f"PCA pre-alignment completed with proper rotation (det = {final_det:.6f}, score = {best_score:.6f})")
-        
-        if abs(final_det - 1.0) > 1e-6:
-            print(f"ERROR: Final transformation is not a proper rotation! det = {final_det}")
-            
-        return transformation
-    
-    def _ensure_right_handed(self, eigenvecs):
-        """Ensure eigenvector matrix forms a right-handed coordinate system"""
-        if np.linalg.det(eigenvecs) < 0:
-            eigenvecs[:, 2] *= -1  # Flip the third eigenvector
-        return eigenvecs
-    
     def test_axis_rotations(self, source_pcd, target_pcd, initial_transformation, description=""):
         """
         Tests 180-degree rotations around each axis to handle symmetry issues.
@@ -1089,73 +1003,15 @@ class ALPACA:
         Returns:
             best_transformation: 4x4 transformation matrix with best rotation applied
         """
-        print(f"Testing 180° axis rotations for {description}...")
-        
-        # Create rotation matrices for 180-degree rotations around each axis
-        # These are proper rotations, NOT reflections - anatomically safe
-        rot_x_180 = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
-        rot_y_180 = np.array([[-1, 0, 0, 0], [0, 1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])  
-        rot_z_180 = np.array([[-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-        
-        # Test only the 4 distinct 180° rotations (combinations are redundant)
-        transformations_to_test = [
-            ("original", initial_transformation),
-            ("rot_x_180", rot_x_180 @ initial_transformation),
-            ("rot_y_180", rot_y_180 @ initial_transformation),
-            ("rot_z_180", rot_z_180 @ initial_transformation)
-        ]
+        # Body lives in alpacaRansacWorker so the parallel RANSAC workers run the same code.
+        return alpacaRansacWorker.test_axis_rotations(
+            source_pcd, target_pcd, initial_transformation, description
+        )
 
-        for name, transform in transformations_to_test:
-            print(f"{name}:")
-            for i in range(4):
-                row = transform[i, :]
-                print(f"  [{row[0]:8.4f} {row[1]:8.4f} {row[2]:8.4f} {row[3]:8.4f}]")
-
-        
-        best_transformation = initial_transformation
-        best_score = -1
-        best_name = "original"
-        
-        # Check if both point clouds have normals
-        if not (source_pcd.has_normals() and target_pcd.has_normals()):
-            print("  Warning: Point clouds missing normals. Returning original transformation.")
-            return best_transformation
-        
-        target_tree = o3d.geometry.KDTreeFlann(target_pcd)
-        target_normals = np.asarray(target_pcd.normals)
-        
-        for name, test_transform in transformations_to_test:
-            # Transform source and compute normal consistency
-            source_test = copy.deepcopy(source_pcd)
-            source_test.transform(test_transform)
-            source_normals = np.asarray(source_test.normals)
-            
-            # Calculate normal consistency
-            total_normal_alignment = 0
-            valid_points = 0
-            
-            for i, point in enumerate(np.asarray(source_test.points)):
-                [_, idx, _] = target_tree.search_knn_vector_3d(point, 1)
-                if len(idx) > 0:
-                    normal_alignment = abs(np.dot(source_normals[i], target_normals[idx[0]]))
-                    total_normal_alignment += normal_alignment
-                    valid_points += 1
-            
-            if valid_points > 0:
-                normal_consistency = total_normal_alignment / valid_points
-            else:
-                normal_consistency = 0.0
-            
-            print(f"  {name}: normal_consistency={normal_consistency:.4f}")
-            
-            if normal_consistency > best_score:
-                best_score = normal_consistency
-                best_transformation = test_transform
-                best_name = name
-        
-        print(f"Best rotation: {best_name} with normal consistency: {best_score:.4f}")
-        return best_transformation
-
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _align_landmarks_to_mesh_impl(
         self,
         source_vertices,
@@ -1172,11 +1028,9 @@ class ALPACA:
         target_poisson_points=None,
     ):
 
-        # PCA pre-alignment rotates the target's principal axes onto the source's before RANSAC.
-        # Disabled by default: FPFH is rotation-invariant so PCA is not needed, and on
-        # bilaterally symmetric shapes PCA sign ambiguity can introduce a 180° flip that
-        # test_axis_rotations then has to correct.  Set to True to re-enable for comparison.
-        do_pca = False
+        # No PCA pre-alignment: FPFH features are rotation-invariant, so RANSAC needs no
+        # head start, and on bilaterally symmetric shapes the PCA sign ambiguity caused
+        # 180° flips. The old pca_pre_alignment path was removed on 2026-10-23.
 
         # source is the reference
         # target is the subject
@@ -1218,7 +1072,7 @@ class ALPACA:
             source_normals = np.asarray(source_transformed.normals)
             target_normals = np.asarray(target_pcd.normals)
 
-            target_tree = o3d.geometry.KDTreeFlann(target_pcd)
+            target_points = np.asarray(target_pcd.points)
 
             total_points = len(source_points)
             if include_mask is not None:
@@ -1238,14 +1092,14 @@ class ALPACA:
             good_alignments = 0
             avg_distance = 0.0
 
-            for i in indices:
-                point = source_points[i]
-                normal = source_normals[i]
-                [_, idx, dist] = target_tree.search_knn_vector_3d(point, 1)
-                avg_distance += np.sqrt(dist[0])
-                normal_alignment = abs(np.dot(normal, target_normals[idx[0]]))
-                if normal_alignment > 0.7:
-                    good_alignments += 1
+            # Vectorised exact 1-NN over the scored subset (same sums as the former loop).
+            if n_use > 0 and len(target_points) > 0:
+                nn_dist, nn_idx = _nearest_neighbors(target_points, source_points[indices])
+                avg_distance = float(np.sum(nn_dist))
+                normal_alignment = np.abs(
+                    np.einsum("ij,ij->i", source_normals[indices], target_normals[nn_idx])
+                )
+                good_alignments = int(np.count_nonzero(normal_alignment > 0.7))
 
             avg_distance /= max(n_use, 1)
             normal_consistency = good_alignments / max(n_use, 1)
@@ -1322,11 +1176,9 @@ class ALPACA:
             """Per-source-point NN distances after applying transformation (full-res clouds; same order as source_pcd_full)."""
             source_tmp = copy.deepcopy(source_pcd_full)
             source_tmp.transform(transformation)
-            target_tree = o3d.geometry.KDTreeFlann(target_pcd_full)
-            out = np.empty(len(np.asarray(source_tmp.points)), dtype=np.float64)
-            for i, pt in enumerate(np.asarray(source_tmp.points)):
-                [_, _, dist_sq] = target_tree.search_knn_vector_3d(pt, 1)
-                out[i] = np.sqrt(dist_sq[0])
+            out, _ = _nearest_neighbors(
+                np.asarray(target_pcd_full.points), np.asarray(source_tmp.points)
+            )
             return out
 
         def save_global_burnin_histogram(flat_distances, global_threshold, output_dir):
@@ -1428,15 +1280,13 @@ class ALPACA:
                     source_keep_mask = None
             src_w = copy.deepcopy(source_pcd)
             src_w.transform(init_transform)
-            tree = o3d.geometry.KDTreeFlann(target_pcd)
             pts_w = np.asarray(src_w.points)
-            keep = []
-            for i in range(n):
-                if source_keep_mask is not None and not source_keep_mask[i]:
-                    continue
-                [_, _, d2] = tree.search_knn_vector_3d(pts_w[i], 1)
-                if np.sqrt(d2[0]) < nn_threshold:
-                    keep.append(i)
+            # Vectorised exact 1-NN; keep indices in ascending order as before.
+            nn_dist, _ = _nearest_neighbors(np.asarray(target_pcd.points), pts_w)
+            keep_bool = nn_dist < nn_threshold
+            if source_keep_mask is not None:
+                keep_bool &= np.asarray(source_keep_mask, dtype=bool)
+            keep = np.nonzero(keep_bool)[0].tolist()
             min_keep = min(200, max(30, n // 20))
             if len(keep) < min_keep:
                 # Fall back: all burn-in-included points without NN cut (better than full cloud).
@@ -1470,6 +1320,7 @@ class ALPACA:
         burn_in_distances = None
         burn_in_idx = 0
         candidate_transforms = []
+        ransac_plans = []
         global_peak_threshold = 0.005
 
         if outer_surface:
@@ -1733,15 +1584,18 @@ class ALPACA:
 
             
             attempt += 1
-            print(f"\nAttempting RANSAC alignment: try {attempt}/{max_retries} with seed {current_seed}")
-
-            print(f"DEBUG: RANSAC uses full-res — source_pcd_full {len(source_pcd_full.points)} pts, target_pcd_full {len(target_pcd_full.points)} pts.")
+            # The try itself runs after this loop (alpacaRansacWorker.run_ransac_attempts),
+            # possibly in parallel; its lines are printed in try order when it finishes.
+            plan_header = [
+                f"\nAttempting RANSAC alignment: try {attempt}/{max_retries} with seed {current_seed}",
+                f"DEBUG: RANSAC uses full-res — source_pcd_full {len(source_pcd_full.points)} pts, target_pcd_full {len(target_pcd_full.points)} pts.",
+            ]
 
             # Every 10th try (1, 11, 21, …): wider parameter jitter for diversity without
             # rebuilding Poisson clouds (same normalized frame for all candidates).
             wide_decile = ((attempt - 1) % 10 == 0)
             if wide_decile:
-                print(
+                plan_header.append(
                     f"Try {attempt}/{max_retries}: wide parameter block "
                     f"(broader FPFH / RANSAC / normal search jitter)."
                 )
@@ -1764,103 +1618,53 @@ class ALPACA:
                 "average_distance": 0.0
             }
 
+            ransac_plans.append({
+                "attempt": attempt,
+                "seed": current_seed,
+                "random_params": random_params,
+                "header": plan_header,
+            })
 
-            # Normals on full-res clouds: dense neighborhoods → stable FPFH (Porto-style single resolution for RANSAC).
-            try:
-                source_pcd_full.estimate_normals(
-                    o3d.geometry.KDTreeSearchParamHybrid(
-                        radius=random_params["normal_search_radius"], 
-                        max_nn=random_params["max_nn_normals"]))
-                target_pcd_full.estimate_normals(
-                    o3d.geometry.KDTreeSearchParamHybrid(
-                        radius=random_params["normal_search_radius"], 
-                        max_nn=random_params["max_nn_normals"]))
-            except Exception as e:
-                print(f"Error estimating normals: {str(e)}")
-
-            # Propagate a globally consistent normal orientation using the tangent-plane
-            # graph.  orient_normals_consistent_tangent_plane has no seed parameter, so
-            # results are deterministic given the point positions and k=100 neighbours.
-            source_pcd_full.orient_normals_consistent_tangent_plane(100)
-            target_pcd_full.orient_normals_consistent_tangent_plane(100)
-
-            # Single-scale FPFH at a radius proportional to the cloud diagonal (Porto-style).
-            # A semi-global radius (5 × voxel_size) captures enough shape context to distinguish
-            # points on smooth anatomy (e.g., embryo heads) where purely local radii produce
-            # identical descriptors everywhere and break correspondence matching.
-            try:
-                source_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-                    source_pcd_full,
-                    o3d.geometry.KDTreeSearchParamHybrid(
-                        radius=random_params["fpfh_radius"],
-                        max_nn=random_params["max_nn_fpfh"]))
-                target_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-                    target_pcd_full,
-                    o3d.geometry.KDTreeSearchParamHybrid(
-                        radius=random_params["fpfh_radius"],
-                        max_nn=random_params["max_nn_fpfh"]))
-            except Exception as e:
-                print(f"Error computing FPFH features: {str(e)}")
-                source_fpfh = None
-                target_fpfh = None
-
-            # Porto-style RANSAC: pass FPFH Feature objects directly and let Open3D handle
-            # correspondence sampling internally.  mutual_filter=True enforces mutual nearest
-            # neighbour (eliminates ambiguous matches without the over-aggressive ratio test).
-            # EdgeLength checker adds geometric consistency: the ratio of matched edge lengths
-            # must agree to within 10 %, which reliably rejects incorrect correspondences even
-            # on smooth surfaces where descriptor distances alone are uninformative.
-            best_ransac_result = None
-            if source_fpfh is not None and target_fpfh is not None:
-                try:
-                    best_ransac_result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-                        source_pcd_full, target_pcd_full,
-                        source_fpfh, target_fpfh,
-                        mutual_filter=True,
-                        max_correspondence_distance=random_params["ransac_max_correspondence_distance"],
-                        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(with_scaling=False),
-                        ransac_n=random_params["ransac_n"],
-                        checkers=[
-                            o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
-                            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(
-                                random_params["ransac_max_correspondence_distance"]),
-                        ],
-                        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
-                            max_iteration=int(self.params["max_ransac_iter"]),
-                            confidence=float(self.params.get("ransac_confidence", 0.9999)),
-                        )
-                    )
-                    print(f"DEBUG: current_ransac.fitness: {best_ransac_result.fitness}")
-                except Exception as e:
-                    print(f"Error during RANSAC: {str(e)}")
-
-            if best_ransac_result is None:
-                print("Warning: RANSAC failed. Using identity transformation as fallback.")
-                best_ransac_result = type('', (), {})()
-                best_ransac_result.transformation = np.eye(4)
-                best_ransac_result.fitness = 0.0
-                best_ransac_result.inlier_rmse = float('inf')
-                
-            ransac_result = best_ransac_result
-            
-            # AXIS FLIP TESTING: Test flipped orientations to handle symmetry issues
-            # This addresses cases where the scan gets aligned upside-down due to symmetry
-            print("Testing axis rotations for RANSAC result...")
-            ransac_result.transformation = self.test_axis_rotations(
-                source_pcd_full, target_pcd_full, 
-                ransac_result.transformation, 
-                "RANSAC result"
-            )
-
-            T = ransac_result.transformation.copy()
+        # Run the tries. Each one is independent (own seed + jittered radii on the same
+        # normalized clouds): normals + orientation, FPFH, feature RANSAC, 180° axis test.
+        # With several cores they run in worker processes; candidates and burn-in columns are
+        # recorded in try order exactly as the serial loop did.
+        def record_ransac_try(plan, result):
+            nonlocal burn_in_idx
+            for line in plan["header"]:
+                print(line)
+            for line in result["log"]:
+                print(line)
+            T = np.asarray(result["transformation"], dtype=np.float64).copy()
             candidate_transforms.append(T)
             dist_col = collect_nn_distances_for_transform(T)
             burn_in_distances[:, burn_in_idx] = dist_col
             burn_in_idx += 1
             print(
-                f"Recorded candidate {attempt}/{n_ransac_attempts} "
-                f"(distance column {burn_in_idx}/{n_ransac_attempts})."
+                f"Recorded candidate {plan['attempt']}/{n_ransac_attempts} "
+                f"(distance column {burn_in_idx}/{n_ransac_attempts}, "
+                f"{result['seconds']:.1f} s)."
             )
+
+        _ransac_t0 = time.time()
+        alpacaRansacWorker.run_ransac_attempts(
+            np.asarray(source_pcd_full.points),
+            np.asarray(target_pcd_full.points),
+            ransac_plans,
+            max_iteration=int(self.params["max_ransac_iter"]),
+            confidence=float(self.params.get("ransac_confidence", 0.9999)),
+            on_result=record_ransac_try,
+        )
+        print(f"RANSAC tries done in {time.time() - _ransac_t0:.1f} s.")
+
+        # Scoring and ICP below read normals from these clouds; the serial loop left them at
+        # the last try's settings, so recompute exactly those (scoring and point-to-plane ICP
+        # only use |n·n| / the normal line, so the sign convention does not matter).
+        alpacaRansacWorker.estimate_oriented_normals(source_pcd_full, ransac_plans[-1]["random_params"])
+        alpacaRansacWorker.estimate_oriented_normals(target_pcd_full, ransac_plans[-1]["random_params"])
+        # Only .transformation is read below (overwritten with the selected candidate).
+        ransac_result = type('', (), {})()
+        ransac_result.transformation = candidate_transforms[-1].copy()
 
         print(
             f"\nScoring {len(candidate_transforms)} candidates: Otsu threshold on all burn-in "
@@ -2072,12 +1876,10 @@ class ALPACA:
         _src_icp_tmp = copy.deepcopy(source_pcd_full)
         _src_icp_tmp.transform(icp_result.transformation)
         _icp_pts = np.asarray(_src_icp_tmp.points)
-        _tgt_tree = o3d.geometry.KDTreeFlann(target_pcd_full)
         _icp_inc_idx = np.nonzero(np.asarray(included_mask, dtype=bool))[0]
-        _icp_nn_dists = np.empty(len(_icp_inc_idx), dtype=np.float64)
-        for _j, _si in enumerate(_icp_inc_idx):
-            _, _, _d2 = _tgt_tree.search_knn_vector_3d(_icp_pts[_si], 1)
-            _icp_nn_dists[_j] = np.sqrt(_d2[0])
+        _icp_nn_dists, _ = _nearest_neighbors(
+            np.asarray(target_pcd_full.points), _icp_pts[_icp_inc_idx]
+        )
         icp_median = float(np.median(_icp_nn_dists))
         icp_score = icp_nc / (1.0 + icp_median)
 
@@ -2133,8 +1935,7 @@ class ALPACA:
                 metadata["alignment_median_nn"] = float(chosen_median)
                 tmp_path = target_metadata_path + ".tmp"
                 try:
-                    with open(tmp_path, "w") as f:
-                        json.dump(metadata, f, indent=4)
+                    atomic_write_json(tmp_path, metadata, indent=4)
                     os.replace(tmp_path, target_metadata_path)
                 except Exception:
                     if os.path.isfile(tmp_path):
@@ -2185,13 +1986,7 @@ class ALPACA:
                            target_landmarks_transformed, 
                            "06_Final_Result", debug_dir)
 
-        # Compose PCA pre-alignment into the final matrix only when it was actually applied;
-        # skipping this when do_pca=False keeps the matrix correct (PCA was never applied to the clouds).
-        if do_pca:
-            transformation_matrix = transformation_matrix @ pca_transformation
-            print("Final transformation matrix (including PCA pre-alignment):", transformation_matrix)
-        else:
-            print("Final transformation matrix:", transformation_matrix)
+        print("Final transformation matrix:", transformation_matrix)
        
 
         return {

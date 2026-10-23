@@ -28,6 +28,10 @@ from .coordinateFrames import is_preserved_mesh_metadata
 from .meshBasedTools import build_temporary_mesh_reference_volume
 from .meshGridTools import strip_ephemeral_scan_metadata
 from .registrationHeatmapTools import _latest_voxel_elastic_edit
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    atomic_write_json,
+)
 
 
 def _union_mask_ncc(fixed_volume, moving_volume, reference_threshold, moving_threshold):
@@ -179,6 +183,10 @@ def _list_candidates(directory):
 class BackfillElasticNccView(APIView):
     """TEMPORARY: project-wide elastic_ncc backfill (check_only or compute)."""
 
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def post(self, request, *args, **kwargs):
         directory = request.data.get("directory")
         check_only = bool(request.data.get("check_only", False))
@@ -233,8 +241,7 @@ class BackfillElasticNccView(APIView):
                     continue
                 metadata["elastic_ncc"] = float(elastic_ncc)
                 strip_ephemeral_scan_metadata(metadata)
-                with open(json_path, "w") as jf:
-                    json.dump(metadata, jf, indent=4)
+                atomic_write_json(json_path, metadata, indent=4)
                 updated.append({"name": scan_name, "elastic_ncc": float(elastic_ncc)})
                 print(f"[elastic_ncc backfill] {scan_name}: {elastic_ncc:.4f}")
             except Exception as exc:

@@ -41,7 +41,18 @@ import skimage.morphology
 from scipy.signal import convolve
 from .ALPACA import ALPACA
 from .batch_flag_filter import load_flagged_subject_names, apply_flag_filter, normalize_flag_filter_value
-from .linkedScans import filter_out_linked_children, get_same_shape_siblings, full_res_nifti_path
+from .linkedScans import filter_out_linked_children, get_same_shape_siblings, full_res_nifti_path, has_link_partners
+# Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .crashSafety import (
+    crash_safe_view,
+    request_subjects,
+    subject_transaction,
+    tracked_remove,
+    atomic_nib_save,
+    atomic_write_json,
+    atomic_copy,
+    load_nifti_readonly,
+)
 from skimage import exposure
 # Set the number of threads for ITK to utilize
 os.environ["ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS"] = str(psutil.cpu_count(logical=True))
@@ -67,11 +78,13 @@ from .registrationTools import RegistrationTools
 from .coordinateFrames import (
     is_preserved_mesh_metadata,
     load_extracted_scan_metadata,
+    list_extracted_scan_names,
     partition_voxel_and_preserved_mesh_scans,
     voxel_only_all_meshes_message,
     voxel_only_no_eligible_targets_message,
 )
 from .meshBasedTools import ApplyMeshCleanupView
+from .stepProgress import StepProgress
 from .backgroundOffsetEstimation import (
     estimate_background_peak,
     normalize_region as normalize_background_region,
@@ -152,9 +165,7 @@ def has_elastic_registration(scan_name, directory):
             metadata = json.load(jf)
             if metadata.get('reference', False):
                 # Check if there are any elastic_to in the json metadata on any of the subjects on the project matching the scan_name
-                for subject in os.listdir(os.path.join(directory, "extracted")):
-                    if subject == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", subject)):
-                        continue
+                for subject in list_extracted_scan_names(directory):
                     json_path = os.path.join(directory, "extracted", subject, f"{subject}.json")
                     with open(json_path, 'r') as jf:
                         metadata = json.load(jf)
@@ -562,6 +573,14 @@ class CleanupMeshView(APIView):
         return returned, cleanup_performed, removal_mask, outcome
 
     # This function is used to clean up the mesh by removing small disconnected components and trying to separate connected objects
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('cleanup_mesh', lambda request: request_subjects(request, 'filename'))
     def post(self, request):
         print("Cleaning up mesh")
         directory = request.data['directory']
@@ -606,11 +625,16 @@ class CleanupMeshView(APIView):
             nifti_path = os.path.join(directory, sub_path, edit.replace("_lossy", ""))
 
         print("nifti_path: "+nifti_path)
+        # Stages for the progress bar (see stepProgress.py).
+        steps = StepProgress(4, filename, 'Cleaning up mesh')
+        steps.start()
+        steps(1, 'Loading scan')
         nifti_img = nib.load(nifti_path)
         original_dtype = nifti_img.get_data_dtype()
         nifti_data = nifti_img.get_fdata().astype(original_dtype)
 
         # Clean the resulting mesh using the class CleanMesh and save it in the variable cleaned_data
+        steps(2, 'Removing disconnected islands')
         cleaned_data, cleanup_performed, removal_mask, cleanup_outcome = self.clean_mesh(
             nifti_data,
             threshold,
@@ -663,25 +687,23 @@ class CleanupMeshView(APIView):
             edit_number += 1
 
         # Save the cleaned image
+        steps(3, 'Saving cleaned scan')
         output_path = os.path.join(directory, sub_path, f"{filename}_edit_{edit_number}_cleaned.nii.gz")
-        nib.save(new_nifti, output_path)
+        atomic_nib_save(new_nifti, output_path)
 
         reloaded = nib.load(output_path).get_fdata()
         above_reload = int((reloaded > threshold).sum())
         print(f"[post] after save: reloaded voxels above threshold = {above_reload}, path = {output_path}")
 
-        # Save removal mask if cleanup was performed
+        # Removal mask (exactly which voxels were cleared) for linked siblings to replay.
+        # It is a hand-off file, not a stored derivative: written only when the subject has
+        # link partners, and deleted by ApplyCleanupRemovalMaskView once the UI has replayed
+        # it (delete-edit and project-open recovery sweep any that are left behind).
         removal_mask_path = None
-        if removal_mask is not None:
-            # Save as uint8 NIfTI with .nii.removal_mask.gz extension
-            # Use temp rename pattern like other masks
-            removal_mask_uint8 = removal_mask.astype(np.uint8)
-            removal_mask_nifti = nib.Nifti1Image(removal_mask_uint8, nifti_img.affine)
-            removal_mask_temp = os.path.join(directory, sub_path, f"{filename}_edit_{edit_number}_cleaned_removal_mask.nii.gz")
+        if removal_mask is not None and "atlas" not in sub_path and has_link_partners(directory, filename):
             removal_mask_path = os.path.join(directory, sub_path, f"{filename}_edit_{edit_number}_cleaned.nii.removal_mask.gz")
-            nib.save(removal_mask_nifti, removal_mask_temp)
-            os.replace(removal_mask_temp, removal_mask_path)
-            print(f"Saved removal mask to: {removal_mask_path}")
+            atomic_nib_save(nib.Nifti1Image(removal_mask.astype(np.uint8), nifti_img.affine), removal_mask_path)
+            print(f"Saved removal mask for linked replay: {removal_mask_path}")
 
         # Generate the lossy version using the existing save_as_lossy_nifti function
         RegistrationTools().save_as_lossy_nifti(
@@ -708,6 +730,7 @@ class CleanupMeshView(APIView):
             print(f"Warning: could not save mesh_cleanup_settings: {meta_err}")
 
         # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
+        steps(4, 'Updating paired mask and landmarks')
         try:
             # Determine source base - if edit is provided, use it; otherwise use filename
             if edit is None:
@@ -721,7 +744,7 @@ class CleanupMeshView(APIView):
             dst_nifti_lossy = os.path.join(directory, sub_path, f"{filename}_lossy_edit_{edit_number}_cleaned.nii.gz")
 
             if os.path.isfile(src_mask_full):
-                shutil.copyfile(src_mask_full, dst_mask_full)
+                atomic_copy(src_mask_full, dst_mask_full)
                 print(f"Copied full-res mask to: {dst_mask_full}")
 
                 # Downsample copied full-res mask to create lossy mask
@@ -744,19 +767,14 @@ class CleanupMeshView(APIView):
 
                 mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
                 lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
-                os.replace(dst_mask_full, mask_temp)
-                try:
-                    mask_img = nib.load(mask_temp)
-                    mask_dtype = mask_img.get_data_dtype()
-                    # Round before astype to avoid truncating floats
-                    mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
-                    slices = [slice(None, None, resolution_factor) for _ in range(3)]
-                    lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
-                    nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_temp)
-                    os.replace(lossy_temp, dst_mask_lossy)
-                    print(f"Generated lossy mask: {dst_mask_lossy}")
-                finally:
-                    os.replace(mask_temp, dst_mask_full)
+                mask_img = load_nifti_readonly(dst_mask_full)
+                mask_dtype = mask_img.get_data_dtype()
+                # Round before astype to avoid truncating floats
+                mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                slices = [slice(None, None, resolution_factor) for _ in range(3)]
+                lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
+                atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
+                print(f"Generated lossy mask: {dst_mask_lossy}")
             else:
                 print("No source full-res mask found; skipping.")
         except Exception as me:
@@ -778,11 +796,11 @@ class CleanupMeshView(APIView):
             dest_distances_path = os.path.join(directory, sub_path, f"{dest_landmark_base}_landmark_distances.json")
             
             if os.path.isfile(source_landmarks_path):
-                shutil.copyfile(source_landmarks_path, dest_landmarks_path)
+                atomic_copy(source_landmarks_path, dest_landmarks_path)
                 print(f"Copied landmarks to: {dest_landmarks_path}")
             
             if os.path.isfile(source_distances_path):
-                shutil.copyfile(source_distances_path, dest_distances_path)
+                atomic_copy(source_distances_path, dest_distances_path)
                 print(f"Copied landmark distances to: {dest_distances_path}")
         except Exception as le:
             print(f"Error handling paired landmark files (cleaned): {le}")
@@ -817,6 +835,14 @@ class ApplyCleanupRemovalMaskView(APIView):
         - propagate_linked: bool (auto-resolve same-shape siblings of source)
         - edit_suffix: str (edit name suffix for the written edits, default 'cleaned')
     """
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything this view writes for
+    # its subject(s) is one transaction (the decorator below): a crash or an error
+    # response rolls the subject back to how it was before the request. Files are
+    # written with the atomic_* helpers and sources read with load_nifti_readonly.
+    # Adding a new derivative file? Write it from this method (or a helper it calls)
+    # with an atomic_* helper; if it lands in another subject, add that subject to
+    # the list the decorator resolves.
+    @crash_safe_view('apply_cleanup_removal_mask', lambda request: request_subjects(request, 'targets', 'source_filename', linked=bool(request.data.get('propagate_linked'))))
     def post(self, request):
         directory = request.data.get('directory')
         source_filename = request.data.get('source_filename')
@@ -875,15 +901,10 @@ class ApplyCleanupRemovalMaskView(APIView):
         if not targets:
             return Response({'error': 'No targets specified or resolved'}, status=status.HTTP_400_BAD_REQUEST)
         
-        # Load removal mask
-        removal_mask_temp = removal_mask_path.replace('.nii.removal_mask.gz', '_removal_mask.nii.gz')
-        os.replace(removal_mask_path, removal_mask_temp)
-        try:
-            mask_img = nib.load(removal_mask_temp)
-            removal_mask = np.round(mask_img.get_fdata()).astype(bool)
-            mask_affine = mask_img.affine
-        finally:
-            os.replace(removal_mask_temp, removal_mask_path)
+        # Load removal mask (read in place: the source file is never renamed)
+        mask_img = load_nifti_readonly(removal_mask_path)
+        removal_mask = np.round(mask_img.get_fdata()).astype(bool)
+        mask_affine = mask_img.affine
 
         source_cleanup_settings = None
         if source_filename:
@@ -914,6 +935,14 @@ class ApplyCleanupRemovalMaskView(APIView):
             except Exception as e:
                 failed.append({'name': target_name, 'reason': str(e)})
         
+        # The removal mask is only a hand-off to the siblings (see CleanupMeshView): once
+        # replayed, success or not, it has no further use, so it is not left on disk.
+        if removal_mask_path.endswith('.nii.removal_mask.gz'):
+            try:
+                tracked_remove(removal_mask_path)
+            except OSError as rm_err:
+                print(f"Warning: could not remove replayed removal mask {removal_mask_path}: {rm_err}")
+
         message = f"Applied removal mask to {len(successful)}/{len(targets)} targets"
         return Response({
             'message': message,
@@ -921,6 +950,10 @@ class ApplyCleanupRemovalMaskView(APIView):
             'failed': failed,
         }, status=status.HTTP_200_OK)
     
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _apply_to_target(
         self,
         directory,
@@ -1031,7 +1064,7 @@ class ApplyCleanupRemovalMaskView(APIView):
         # Save cleaned target
         new_nifti = nib.Nifti1Image(target_data, target_img.affine)
         output_path = os.path.join(directory, "extracted", target_name, f"{target_name}_edit_{new_edit_number}_{edit_suffix}.nii.gz")
-        nib.save(new_nifti, output_path)
+        atomic_nib_save(new_nifti, output_path)
         
         # Save lossy version
         RegistrationTools().save_as_lossy_nifti(
@@ -1058,7 +1091,7 @@ class ApplyCleanupRemovalMaskView(APIView):
             src_mask_full = os.path.join(directory, "extracted", target_name, f"{source_base}.nii.mask.gz")
             if os.path.isfile(src_mask_full):
                 dst_mask_full = os.path.join(directory, "extracted", target_name, f"{target_name}_edit_{new_edit_number}_{edit_suffix}.nii.mask.gz")
-                shutil.copyfile(src_mask_full, dst_mask_full)
+                atomic_copy(src_mask_full, dst_mask_full)
         except Exception as me:
             print(f"  Error copying paired mask for {target_name}: {me}")
         
@@ -1071,7 +1104,7 @@ class ApplyCleanupRemovalMaskView(APIView):
             source_landmarks_path = os.path.join(directory, "extracted", target_name, f"{source_landmark_base}_landmarks.json")
             if os.path.isfile(source_landmarks_path):
                 dest_landmarks_path = os.path.join(directory, "extracted", target_name, f"{target_name}_edit_{new_edit_number}_{edit_suffix}_landmarks.json")
-                shutil.copyfile(source_landmarks_path, dest_landmarks_path)
+                atomic_copy(source_landmarks_path, dest_landmarks_path)
         except Exception as le:
             print(f"  Error copying landmarks for {target_name}: {le}")
         
@@ -1187,211 +1220,210 @@ class HomogenizeBackgroundView(APIView):
         for idx, scan_name in enumerate(scan_names):
             try:
                 # Send progress update
-                channel_layer = get_channel_layer()
-                if channel_layer is not None:
-                    progress = idx / scan_count
-                    if optimal_background is not None:
-                        progress_message = f'Setting background of {scan_name} to value {optimal_background}...'
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'homogenize_background'):
+                    channel_layer = get_channel_layer()
+                    if channel_layer is not None:
+                        progress = idx / scan_count
+                        if optimal_background is not None:
+                            progress_message = f'Setting background of {scan_name} to value {optimal_background}...'
+                        else:
+                            progress_message = f'Finding and applying the background value of {scan_name}...'
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': progress_message,
+                                'total': scan_count,
+                                'current': idx + 1,
+                            }
+                        )
+
+                    # find the latest edit number
+                    latest_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                        latest_edit += 1
+                    latest_edit -= 1
+
+                    # Load the scan data path
+                    if latest_edit >= 0:
+                        scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
                     else:
-                        progress_message = f'Finding and applying the background value of {scan_name}...'
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': progress_message,
-                            'total': scan_count,
-                            'current': idx + 1,
-                        }
-                    )
+                        scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
 
-                # find the latest edit number
-                latest_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                    latest_edit += 1
-                latest_edit -= 1
-
-                # Load the scan data path
-                if latest_edit >= 0:
-                    scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
-                else:
-                    scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
-
-                # Load the scan data
-                time_start = time.time()
-                nifti_img = nib.load(scan_path)
-                original_dtype = nifti_img.get_data_dtype()  # Get the original data type
-                scan_data = nifti_img.get_fdata().astype(original_dtype)  # keep original dtype
-                time_end = time.time()
-                print(f"Time taken to load {scan_name} scan data: {time_end - time_start} seconds")
-                print(f"Original data type: {original_dtype}")
-
-                # Auto mode: estimate this scan's background from the volume just loaded
-                scan_background = optimal_background
-                estimate_info = None
-                if optimal_background is None:
-                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
-                        estimate_threshold = json.load(jf)['threshold']
+                    # Load the scan data
                     time_start = time.time()
-                    scan_background, estimate_info = self._get_background_value(
-                        scan_data,
-                        estimate_threshold,
-                        region=background_region,
+                    nifti_img = nib.load(scan_path)
+                    original_dtype = nifti_img.get_data_dtype()  # Get the original data type
+                    scan_data = nifti_img.get_fdata().astype(original_dtype)  # keep original dtype
+                    time_end = time.time()
+                    print(f"Time taken to load {scan_name} scan data: {time_end - time_start} seconds")
+                    print(f"Original data type: {original_dtype}")
+
+                    # Auto mode: estimate this scan's background from the volume just loaded
+                    scan_background = optimal_background
+                    estimate_info = None
+                    if optimal_background is None:
+                        with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
+                            estimate_threshold = json.load(jf)['threshold']
+                        time_start = time.time()
+                        scan_background, estimate_info = self._get_background_value(
+                            scan_data,
+                            estimate_threshold,
+                            region=background_region,
+                        )
+                        print(f"Time taken to analyze background: {time.time() - time_start} seconds")
+                        print(f"Analyzed {scan_name}, background value: {scan_background} ({estimate_info})")
+                        if scan_background is None:
+                            print(f"Skipping {scan_name}: no background value was estimated")
+                            continue
+
+                    # Apply homogenization
+                    time_start = time.time()
+                    scan_data = self._homogenize_background(scan_data, scan_background)
+                    time_end = time.time()
+                    print(f"Time taken to homogenize {scan_name} background: {time_end - time_start} seconds")
+
+                    cleanup_memory()
+                
+                    # Save the homogenized data
+                    new_edit_number = latest_edit + 1
+                    output_path = os.path.join(directory, "extracted", scan_name, 
+                                              f"{scan_name}_edit_{new_edit_number}_backfixed.nii.gz")
+                    output_path_lossy = os.path.join(directory, "extracted", scan_name, 
+                                              f"{scan_name}_lossy_edit_{new_edit_number}_backfixed.nii.gz")
+                
+                                    # Save the homogenized data with the original data type
+                    new_img = nib.Nifti1Image(scan_data.astype(original_dtype), nifti_img.affine, nifti_img.header)
+                    atomic_nib_save(new_img, output_path)
+                
+                    print(f"Saved homogenized version of {scan_name} with original dtype: {original_dtype}")
+
+                    # Update threshold in metadata 
+                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
+                        scan_metadata = json.load(jf)
+                    from .rigidAlignment import (
+                        normalize_threshold_edit_stem,
+                        snapshot_previous_edit_threshold,
+                        append_background_offset_history,
                     )
-                    print(f"Time taken to analyze background: {time.time() - time_start} seconds")
-                    print(f"Analyzed {scan_name}, background value: {scan_background} ({estimate_info})")
-                    if scan_background is None:
-                        print(f"Skipping {scan_name}: no background value was estimated")
-                        continue
+                    previous_stem = (
+                        normalize_threshold_edit_stem(os.path.basename(scan_path), scan_name)
+                        if latest_edit >= 0
+                        else scan_name
+                    )
+                    snapshot_previous_edit_threshold(scan_metadata, previous_stem)
+                    if optimal_background is not None:
+                        applied_shift = int(optimal_background)
+                        offset_mode = 'fixed'
+                    else:
+                        applied_shift = int(scan_background)
+                        offset_mode = 'auto_per_scan'
+                    scan_metadata['threshold'] = scan_metadata['threshold'] - applied_shift
+                    scan_metadata['backfixed_shift'] = applied_shift
+                    scan_metadata['background_offset_settings'] = {
+                        'mode': offset_mode,
+                        'shift': applied_shift,
+                    }
+                    if optimal_background is None and estimate_info:
+                        # Provenance of the automatic estimate (method, region,
+                        # derived constants, sample counts, any fallback).
+                        scan_metadata['background_offset_settings']['estimator'] = estimate_info
+                    append_background_offset_history(
+                        scan_metadata,
+                        f"{scan_name}_edit_{new_edit_number}_backfixed",
+                        offset_mode,
+                        applied_shift,
+                    )
 
-                # Apply homogenization
-                time_start = time.time()
-                scan_data = self._homogenize_background(scan_data, scan_background)
-                time_end = time.time()
-                print(f"Time taken to homogenize {scan_name} background: {time_end - time_start} seconds")
-
-                cleanup_memory()
-                
-                # Save the homogenized data
-                new_edit_number = latest_edit + 1
-                output_path = os.path.join(directory, "extracted", scan_name, 
-                                          f"{scan_name}_edit_{new_edit_number}_backfixed.nii.gz")
-                output_path_lossy = os.path.join(directory, "extracted", scan_name, 
-                                          f"{scan_name}_lossy_edit_{new_edit_number}_backfixed.nii.gz")
-                
-                                # Save the homogenized data with the original data type
-                new_img = nib.Nifti1Image(scan_data.astype(original_dtype), nifti_img.affine, nifti_img.header)
-                nib.save(new_img, output_path)
-                
-                print(f"Saved homogenized version of {scan_name} with original dtype: {original_dtype}")
-
-                # Update threshold in metadata 
-                with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
-                    scan_metadata = json.load(jf)
-                from .rigidAlignment import (
-                    normalize_threshold_edit_stem,
-                    snapshot_previous_edit_threshold,
-                    append_background_offset_history,
-                )
-                previous_stem = (
-                    normalize_threshold_edit_stem(os.path.basename(scan_path), scan_name)
-                    if latest_edit >= 0
-                    else scan_name
-                )
-                snapshot_previous_edit_threshold(scan_metadata, previous_stem)
-                if optimal_background is not None:
-                    applied_shift = int(optimal_background)
-                    offset_mode = 'fixed'
-                else:
-                    applied_shift = int(scan_background)
-                    offset_mode = 'auto_per_scan'
-                scan_metadata['threshold'] = scan_metadata['threshold'] - applied_shift
-                scan_metadata['backfixed_shift'] = applied_shift
-                scan_metadata['background_offset_settings'] = {
-                    'mode': offset_mode,
-                    'shift': applied_shift,
-                }
-                if optimal_background is None and estimate_info:
-                    # Provenance of the automatic estimate (method, region,
-                    # derived constants, sample counts, any fallback).
-                    scan_metadata['background_offset_settings']['estimator'] = estimate_info
-                append_background_offset_history(
-                    scan_metadata,
-                    f"{scan_name}_edit_{new_edit_number}_backfixed",
-                    offset_mode,
-                    applied_shift,
-                )
-
-                with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'w') as jf:
-                    json.dump(scan_metadata, jf, indent=4)
+                    atomic_write_json(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), scan_metadata, indent=4)
 
 
-                # Save compressed version
-                RegistrationTools().save_as_lossy_nifti(
-                    scan_data,
-                    scan_metadata['voxel_size'],
-                    os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"),
-                    output_path_lossy,
-                    stored_offset=-float(applied_shift),
-                )
-                print(f"Saved compressed version of {scan_name}")
+                    # Save compressed version
+                    RegistrationTools().save_as_lossy_nifti(
+                        scan_data,
+                        scan_metadata['voxel_size'],
+                        os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"),
+                        output_path_lossy,
+                        stored_offset=-float(applied_shift),
+                    )
+                    print(f"Saved compressed version of {scan_name}")
 
-                # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
-                try:
-                    source_base = os.path.basename(scan_path).replace('.nii.gz', '') if latest_edit >= 0 else scan_name
-                    src_mask_full = os.path.join(directory, "extracted", scan_name, f"{source_base}.nii.mask.gz")
+                    # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
+                    try:
+                        source_base = os.path.basename(scan_path).replace('.nii.gz', '') if latest_edit >= 0 else scan_name
+                        src_mask_full = os.path.join(directory, "extracted", scan_name, f"{source_base}.nii.mask.gz")
 
-                    dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit_number}_backfixed.nii.mask.gz")
-                    dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit_number}_backfixed.nii.mask.gz")
+                        dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit_number}_backfixed.nii.mask.gz")
+                        dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit_number}_backfixed.nii.mask.gz")
 
-                    if os.path.isfile(src_mask_full):
-                        shutil.copyfile(src_mask_full, dst_mask_full)
-                        print(f"Copied full-res mask to: {dst_mask_full}")
+                        if os.path.isfile(src_mask_full):
+                            atomic_copy(src_mask_full, dst_mask_full)
+                            print(f"Copied full-res mask to: {dst_mask_full}")
 
-                        # Downsample copied full-res mask to create lossy mask
-                        resolution_factor = 2
-                        lc = scan_metadata.get('lossy_compression', None)
-                        if isinstance(lc, list) and len(lc) > 0:
-                            try:
-                                resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
-                            except Exception:
-                                pass
-                        elif isinstance(lc, dict) and lc:
-                            try:
-                                resolution_factor = int(lc.get('resolution_factor', resolution_factor))
-                            except Exception:
-                                pass
+                            # Downsample copied full-res mask to create lossy mask
+                            resolution_factor = 2
+                            lc = scan_metadata.get('lossy_compression', None)
+                            if isinstance(lc, list) and len(lc) > 0:
+                                try:
+                                    resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
+                                except Exception:
+                                    pass
+                            elif isinstance(lc, dict) and lc:
+                                try:
+                                    resolution_factor = int(lc.get('resolution_factor', resolution_factor))
+                                except Exception:
+                                    pass
 
-                        # load the lossy destination nifti image to get the affine
-                        lossy_nifti_img = nib.load(output_path_lossy)
-                        lossy_affine = lossy_nifti_img.affine
+                            # load the lossy destination nifti image to get the affine
+                            lossy_nifti_img = nib.load(output_path_lossy)
+                            lossy_affine = lossy_nifti_img.affine
 
-                        mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
-                        lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
-                        os.replace(dst_mask_full, mask_temp)
-                        try:
-                            mask_img = nib.load(mask_temp)
+                            mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
+                            lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
+                            mask_img = load_nifti_readonly(dst_mask_full)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
                             mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
                             slices = [slice(None, None, resolution_factor) for _ in range(3)]
                             lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
-                            nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_temp)
-                            os.replace(lossy_temp, dst_mask_lossy)
+                            atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
                             print(f"Generated lossy mask: {dst_mask_lossy}")
-                        finally:
-                            os.replace(mask_temp, dst_mask_full)
-                    else:
-                        print("No source full-res mask found; skipping.")
-                except Exception as me:
-                    print(f"Error handling paired mask (backfixed): {me}")
+                        else:
+                            print("No source full-res mask found; skipping.")
+                    except Exception as me:
+                        print(f"Error handling paired mask (backfixed): {me}")
 
-                # Copy paired landmark files (non-geometry change) if they exist
-                try:
-                    if latest_edit >= 0:
-                        source_landmark_base = os.path.basename(scan_path).replace('.nii.gz', '')
-                    else:
-                        source_landmark_base = scan_name
+                    # Copy paired landmark files (non-geometry change) if they exist
+                    try:
+                        if latest_edit >= 0:
+                            source_landmark_base = os.path.basename(scan_path).replace('.nii.gz', '')
+                        else:
+                            source_landmark_base = scan_name
                     
-                    source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
-                    source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
+                        source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
+                        source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
                     
-                    dest_landmark_base = f"{scan_name}_edit_{new_edit_number}_backfixed"
-                    dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
-                    dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
+                        dest_landmark_base = f"{scan_name}_edit_{new_edit_number}_backfixed"
+                        dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
+                        dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
                     
-                    if os.path.isfile(source_landmarks_path):
-                        shutil.copyfile(source_landmarks_path, dest_landmarks_path)
-                        print(f"  Copied landmarks to: {dest_landmarks_path}")
+                        if os.path.isfile(source_landmarks_path):
+                            atomic_copy(source_landmarks_path, dest_landmarks_path)
+                            print(f"  Copied landmarks to: {dest_landmarks_path}")
                     
-                    if os.path.isfile(source_distances_path):
-                        shutil.copyfile(source_distances_path, dest_distances_path)
-                        print(f"  Copied landmark distances to: {dest_distances_path}")
-                except Exception as le:
-                    print(f"  Error handling paired landmark files (backfixed): {le}")
+                        if os.path.isfile(source_distances_path):
+                            atomic_copy(source_distances_path, dest_distances_path)
+                            print(f"  Copied landmark distances to: {dest_distances_path}")
+                    except Exception as le:
+                        print(f"  Error handling paired landmark files (backfixed): {le}")
 
-                cleanup_memory()
+                    cleanup_memory()
 
                 
             except Exception as e:
@@ -1717,76 +1749,80 @@ class ApplyThresholdView(APIView):
             for idx, scan_name in enumerate(scan_names):
                 try:
                     # Find the latest edit for this scan
-                    latest_edit = 0
-                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                        latest_edit += 1
-                    latest_edit -= 1
+                    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                    # subject is one transaction. A crash or an exception rolls back only this subject;
+                    # the subjects already finished stay done. New derivative files go inside this
+                    # block, written with the atomic_* helpers.
+                    with subject_transaction(directory, scan_name, 'apply_threshold'):
+                        latest_edit = 0
+                        while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                            latest_edit += 1
+                        latest_edit -= 1
                     
-                    # Send progress update
-                    if channel_layer is not None:
-                        progress = ((idx) / total_scans)
-                        async_to_sync(channel_layer.group_send)(
-                            'progress_group',
-                            {
-                                'type': 'send_progress',
-                                'progress': progress,
-                                'scan_name': scan_name,
-                                'custom_message': f'Applying threshold to {scan_name}...',
-                                'total': total_scans,
-                                'current': idx + 1,
-                            }
-                        )
+                        # Send progress update
+                        if channel_layer is not None:
+                            progress = ((idx) / total_scans)
+                            async_to_sync(channel_layer.group_send)(
+                                'progress_group',
+                                {
+                                    'type': 'send_progress',
+                                    'progress': progress,
+                                    'scan_name': scan_name,
+                                    'custom_message': f'Applying threshold to {scan_name}...',
+                                    'total': total_scans,
+                                    'current': idx + 1,
+                                }
+                            )
                     
-                    # Load the scan data
-                    if latest_edit >= 0:
-                        scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
-                    else:
-                        scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
-                    
-                    # Load the scan's metadata
-                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
-                        scan_metadata = json.load(jf)
-                    
-                    if method != 'same-threshold':
                         # Load the scan data
-                        nifti_img = nib.load(scan_path)
-                        scan_original_dtype = nifti_img.get_data_dtype()
-                        scan_data = nifti_img.get_fdata().astype(scan_original_dtype)
-                        scan_data = gaussian_filter(scan_data, sigma=1.0)
+                        if latest_edit >= 0:
+                            scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
+                        else:
+                            scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
+                    
+                        # Load the scan's metadata
+                        with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
+                            scan_metadata = json.load(jf)
+                    
+                        if method != 'same-threshold':
+                            # Load the scan data
+                            nifti_img = nib.load(scan_path)
+                            scan_original_dtype = nifti_img.get_data_dtype()
+                            scan_data = nifti_img.get_fdata().astype(scan_original_dtype)
+                            scan_data = gaussian_filter(scan_data, sigma=1.0)
                     
 
                     
-                    # Apply preprocessing based on method
-                    if method == 'histogram-matching':
-                        # Calculate memory requirements and available memory
-                        threshold_value = self._find_histogram_matching_threshold(scan_data, reference_data, reference_threshold)
-                    elif method == 'otsus-method':
-                        # Calculate threshold using Otsu's method for each scan individually
-                        threshold_value = threshold_otsu(scan_data)
-                    elif method == 'li-method':
-                        # Calculate threshold using Li's method for each scan individually
-                        threshold_value = self._find_li_threshold(scan_data)
-                    elif method == 'kapur-entropy':
-                        # Calculate threshold using Kapur's entropy method for each scan individually
-                        threshold_value = self._find_kapur_threshold(scan_data)
-                    elif method == 'same-threshold':
-                        threshold_value = reference_threshold    
-                    elif method == 'percentile-matching':
-                        # Find the percentile matching threshold
-                        threshold_value = self._find_percentile_matching_threshold(scan_data, reference_data, reference_threshold)
-                    else:
-                        raise ValueError(f"Invalid threshold method: {method}")
+                        # Apply preprocessing based on method
+                        if method == 'histogram-matching':
+                            # Calculate memory requirements and available memory
+                            threshold_value = self._find_histogram_matching_threshold(scan_data, reference_data, reference_threshold)
+                        elif method == 'otsus-method':
+                            # Calculate threshold using Otsu's method for each scan individually
+                            threshold_value = threshold_otsu(scan_data)
+                        elif method == 'li-method':
+                            # Calculate threshold using Li's method for each scan individually
+                            threshold_value = self._find_li_threshold(scan_data)
+                        elif method == 'kapur-entropy':
+                            # Calculate threshold using Kapur's entropy method for each scan individually
+                            threshold_value = self._find_kapur_threshold(scan_data)
+                        elif method == 'same-threshold':
+                            threshold_value = reference_threshold    
+                        elif method == 'percentile-matching':
+                            # Find the percentile matching threshold
+                            threshold_value = self._find_percentile_matching_threshold(scan_data, reference_data, reference_threshold)
+                        else:
+                            raise ValueError(f"Invalid threshold method: {method}")
                                         
-                    # Update metadata with the new threshold
-                    if method != "same-threshold":
-                        if threshold_value < np.min(scan_data):
-                            threshold_value = np.min(scan_data)
-                    scan_metadata['threshold'] = float(threshold_value)
-                    print(f"New threshold for {scan_name}: {threshold_value}")
-                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'w') as jf:
-                        json.dump(scan_metadata, jf, indent=4)
+                        # Update metadata with the new threshold
+                        if method != "same-threshold":
+                            if threshold_value < np.min(scan_data):
+                                threshold_value = np.min(scan_data)
+                        scan_metadata['threshold'] = float(threshold_value)
+                        print(f"New threshold for {scan_name}: {threshold_value}")
+                        atomic_write_json(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), scan_metadata, indent=4)
                     
-                    print(f"Applied threshold of {threshold_value} to {scan_name}")
+                        print(f"Applied threshold of {threshold_value} to {scan_name}")
                     
                 except Exception as e:
                     print(f"Error processing {scan_name}: {str(e)}")
@@ -1951,6 +1987,10 @@ class ApplyThresholdView(APIView):
         return threshold_value
 
 class RemoveBackgroundView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _apply_backremove_mask_to_sibling(self, directory, sibling_name, removal_mask_path, mask_affine, threshold, min_value):
         """Apply a removal mask from background removal to a same-shape linked sibling scan."""
         # Skip if has elastic registration
@@ -1977,14 +2017,8 @@ class RemoveBackgroundView(APIView):
         else:
             nifti_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
         
-        # Load removal mask
-        removal_mask_temp = removal_mask_path.replace('.nii.removal_mask.gz', '_removal_mask.nii.gz')
-        os.replace(removal_mask_path, removal_mask_temp)
-        try:
-            mask_img = nib.load(removal_mask_temp)
-            removal_mask = np.round(mask_img.get_fdata()).astype(bool)
-        finally:
-            os.replace(removal_mask_temp, removal_mask_path)
+        # Load removal mask (read in place: the source file is never renamed)
+        removal_mask = np.round(load_nifti_readonly(removal_mask_path).get_fdata()).astype(bool)
         
         # Load sibling nifti
         sibling_img = nib.load(nifti_path)
@@ -2019,7 +2053,7 @@ class RemoveBackgroundView(APIView):
         # Save backremoved sibling
         new_nifti = nib.Nifti1Image(sibling_data, sibling_img.affine)
         output_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{new_edit_number}_backremoved.nii.gz")
-        nib.save(new_nifti, output_path)
+        atomic_nib_save(new_nifti, output_path)
         
         # Save lossy version
         RegistrationTools().save_as_lossy_nifti(
@@ -2038,7 +2072,7 @@ class RemoveBackgroundView(APIView):
             src_mask_full = os.path.join(directory, "extracted", sibling_name, f"{source_base}.nii.mask.gz")
             if os.path.isfile(src_mask_full):
                 dst_mask_full = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{new_edit_number}_backremoved.nii.mask.gz")
-                shutil.copyfile(src_mask_full, dst_mask_full)
+                atomic_copy(src_mask_full, dst_mask_full)
         except Exception as me:
             print(f"      Error copying paired mask for {sibling_name}: {me}")
         
@@ -2051,7 +2085,7 @@ class RemoveBackgroundView(APIView):
             source_landmarks_path = os.path.join(directory, "extracted", sibling_name, f"{source_landmark_base}_landmarks.json")
             if os.path.isfile(source_landmarks_path):
                 dest_landmarks_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{new_edit_number}_backremoved_landmarks.json")
-                shutil.copyfile(source_landmarks_path, dest_landmarks_path)
+                atomic_copy(source_landmarks_path, dest_landmarks_path)
         except Exception as le:
             print(f"      Error copying landmarks for {sibling_name}: {le}")
 
@@ -2067,10 +2101,7 @@ class RemoveBackgroundView(APIView):
 
         # Make a list of faulty files
         faulty_files = []
-        for file in os.listdir(os.path.join(directory, "extracted")):
-            # Skip project_settings.json file
-            if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                continue
+        for file in list_extracted_scan_names(directory, log_prefix="RemoveBackground"):
             json_path = os.path.join(directory, "extracted", file, f"{file}.json")
             with open(json_path, 'r') as jf:
                 metadata = json.load(jf)
@@ -2078,8 +2109,7 @@ class RemoveBackgroundView(APIView):
                     faulty_files.append(file)
         
         # Find all unique scan names by listing subdirectories in extracted folder
-        scan_names = [d for d in os.listdir(os.path.join(directory, "extracted")) 
-                     if os.path.isdir(os.path.join(directory, "extracted", d)) and d not in faulty_files]
+        scan_names = [d for d in list_extracted_scan_names(directory) if d not in faulty_files]
 
         scan_names, skipped_preserved_meshes = partition_voxel_and_preserved_mesh_scans(directory, scan_names)
         if not scan_names:
@@ -2156,197 +2186,196 @@ class RemoveBackgroundView(APIView):
         for idx, scan_name in enumerate(scan_names):
             try:
                 # Update progress
-                if channel_layer is not None:
-                    progress = idx / total_scans
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Removing background from {scan_name}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'remove_background', linked=propagate_linked):
+                    if channel_layer is not None:
+                        progress = idx / total_scans
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Removing background from {scan_name}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
                 
-                # Find the latest edit for this scan
-                latest_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                    latest_edit += 1
-                latest_edit -= 1
+                    # Find the latest edit for this scan
+                    latest_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                        latest_edit += 1
+                    latest_edit -= 1
                 
-                # Determine the file to process
-                if latest_edit >= 0:
-                    edit_files = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))
-                    if edit_files:
-                        edit_file = os.path.basename(edit_files[0])
-                        nifti_path = os.path.join(directory, "extracted", scan_name, edit_file)
+                    # Determine the file to process
+                    if latest_edit >= 0:
+                        edit_files = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))
+                        if edit_files:
+                            edit_file = os.path.basename(edit_files[0])
+                            nifti_path = os.path.join(directory, "extracted", scan_name, edit_file)
+                        else:
+                            nifti_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
                     else:
                         nifti_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
-                else:
-                    nifti_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
                 
-                # Load metadata to get threshold
-                json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
-                with open(json_path, 'r') as jf:
-                    scan_metadata = json.load(jf)
+                    # Load metadata to get threshold
+                    json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
+                    with open(json_path, 'r') as jf:
+                        scan_metadata = json.load(jf)
                 
-                threshold = scan_metadata['threshold']
-                print(f"Processing {scan_name} with threshold {threshold}")
+                    threshold = scan_metadata['threshold']
+                    print(f"Processing {scan_name} with threshold {threshold}")
                 
-                # Load the scan data
-                nifti_img = nib.load(nifti_path)
-                original_dtype = nifti_img.get_data_dtype()
-                nifti_data = nifti_img.get_fdata().astype(original_dtype)
+                    # Load the scan data
+                    nifti_img = nib.load(nifti_path)
+                    original_dtype = nifti_img.get_data_dtype()
+                    nifti_data = nifti_img.get_fdata().astype(original_dtype)
                 
-                # Compute removal mask BEFORE modifying nifti_data (True where background will be removed)
-                removal_mask = (nifti_data < threshold)
+                    # Compute removal mask BEFORE modifying nifti_data (True where background will be removed)
+                    removal_mask = (nifti_data < threshold)
                 
-                # Get the minimum value for the current scan
-                min_value = np.min(nifti_data)
+                    # Get the minimum value for the current scan
+                    min_value = np.min(nifti_data)
                 
-                # Set background (values below threshold) to minimum value
-                nifti_data[removal_mask] = min_value
+                    # Set background (values below threshold) to minimum value
+                    nifti_data[removal_mask] = min_value
                 
-                # Create new nifti image
-                new_nifti = nib.Nifti1Image(nifti_data, nifti_img.affine)
+                    # Create new nifti image
+                    new_nifti = nib.Nifti1Image(nifti_data, nifti_img.affine)
                 
-                # Save the processed image with new edit number
-                new_edit = latest_edit + 1
-                output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit}_backremoved.nii.gz")
-                nib.save(new_nifti, output_path)
+                    # Save the processed image with new edit number
+                    new_edit = latest_edit + 1
+                    output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit}_backremoved.nii.gz")
+                    atomic_nib_save(new_nifti, output_path)
                 
-                # Save the lossy version
-                lossy_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit}_backremoved.nii.gz")
-                RegistrationTools().save_as_lossy_nifti(
-                    nifti_data,
-                    scan_metadata['voxel_size'],
-                    json_path,
-                    lossy_path
-                )
+                    # Save the lossy version
+                    lossy_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit}_backremoved.nii.gz")
+                    RegistrationTools().save_as_lossy_nifti(
+                        nifti_data,
+                        scan_metadata['voxel_size'],
+                        json_path,
+                        lossy_path
+                    )
                 
-                # Save removal mask
-                removal_mask_path = None
-                if removal_mask is not None:
-                    removal_mask_uint8 = removal_mask.astype(np.uint8)
-                    removal_mask_nifti = nib.Nifti1Image(removal_mask_uint8, nifti_img.affine)
-                    removal_mask_temp = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit}_backremoved_removal_mask.nii.gz")
-                    removal_mask_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit}_backremoved.nii.removal_mask.gz")
-                    nib.save(removal_mask_nifti, removal_mask_temp)
-                    os.replace(removal_mask_temp, removal_mask_path)
-                    print(f"  Saved removal mask to: {removal_mask_path}")
+                    # Removal mask hand-off for same-shape linked children (deleted again right
+                    # after the propagation below; only written when propagating).
+                    removal_mask_path = None
+                    if removal_mask is not None and propagate_linked:
+                        removal_mask_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit}_backremoved.nii.removal_mask.gz")
+                        atomic_nib_save(nib.Nifti1Image(removal_mask.astype(np.uint8), nifti_img.affine), removal_mask_path)
+                        print(f"  Saved removal mask for linked propagation: {removal_mask_path}")
                 
-                # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
-                try:
-                    source_base = os.path.basename(nifti_path).replace('.nii.gz', '') if latest_edit >= 0 else scan_name
-                    src_mask_full = os.path.join(directory, "extracted", scan_name, f"{source_base}.nii.mask.gz")
-                    dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit}_backremoved.nii.mask.gz")
-                    dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit}_backremoved.nii.mask.gz")
+                    # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
+                    try:
+                        source_base = os.path.basename(nifti_path).replace('.nii.gz', '') if latest_edit >= 0 else scan_name
+                        src_mask_full = os.path.join(directory, "extracted", scan_name, f"{source_base}.nii.mask.gz")
+                        dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit}_backremoved.nii.mask.gz")
+                        dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit}_backremoved.nii.mask.gz")
 
-                    if os.path.isfile(src_mask_full):
-                        shutil.copyfile(src_mask_full, dst_mask_full)
-                        print(f"  Copied full-res mask to: {dst_mask_full}")
+                        if os.path.isfile(src_mask_full):
+                            atomic_copy(src_mask_full, dst_mask_full)
+                            print(f"  Copied full-res mask to: {dst_mask_full}")
 
-                        # Downsample copied full-res mask to create lossy mask
-                        resolution_factor = 2
-                        lc = scan_metadata.get('lossy_compression', None)
-                        if isinstance(lc, list) and len(lc) > 0:
-                            try:
-                                resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
-                            except Exception:
-                                pass
-                        elif isinstance(lc, dict) and lc:
-                            try:
-                                resolution_factor = int(lc.get('resolution_factor', resolution_factor))
-                            except Exception:
-                                pass
+                            # Downsample copied full-res mask to create lossy mask
+                            resolution_factor = 2
+                            lc = scan_metadata.get('lossy_compression', None)
+                            if isinstance(lc, list) and len(lc) > 0:
+                                try:
+                                    resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
+                                except Exception:
+                                    pass
+                            elif isinstance(lc, dict) and lc:
+                                try:
+                                    resolution_factor = int(lc.get('resolution_factor', resolution_factor))
+                                except Exception:
+                                    pass
 
-                        # load the lossy destination nifti image to get the affine
-                        lossy_nifti_img = nib.load(lossy_path)
-                        lossy_affine = lossy_nifti_img.affine
+                            # load the lossy destination nifti image to get the affine
+                            lossy_nifti_img = nib.load(lossy_path)
+                            lossy_affine = lossy_nifti_img.affine
 
-                        mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
-                        lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
-                        os.replace(dst_mask_full, mask_temp)
-                        try:
-                            mask_img = nib.load(mask_temp)
+                            mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
+                            lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
+                            mask_img = load_nifti_readonly(dst_mask_full)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
                             mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
                             slices = [slice(None, None, resolution_factor) for _ in range(3)]
                             lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
-                            nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_temp)
-                            os.replace(lossy_temp, dst_mask_lossy)
+                            atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
                             print(f"  Generated lossy mask: {dst_mask_lossy}")
-                        finally:
-                            os.replace(mask_temp, dst_mask_full)
-                    else:
-                        print("  No source full-res mask found; skipping.")
-                except Exception as me:
-                    print(f"  Error handling paired mask (backremoved): {me}")
+                        else:
+                            print("  No source full-res mask found; skipping.")
+                    except Exception as me:
+                        print(f"  Error handling paired mask (backremoved): {me}")
                 
-                # Copy paired landmark files (non-geometry change) if they exist
-                try:
-                    if latest_edit >= 0:
-                        source_landmark_base = os.path.basename(nifti_path).replace('.nii.gz', '')
-                    else:
-                        source_landmark_base = scan_name
-                    
-                    source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
-                    source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
-                    
-                    dest_landmark_base = f"{scan_name}_edit_{new_edit}_backremoved"
-                    dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
-                    dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
-                    
-                    if os.path.isfile(source_landmarks_path):
-                        shutil.copyfile(source_landmarks_path, dest_landmarks_path)
-                        print(f"  Copied landmarks to: {dest_landmarks_path}")
-                    
-                    if os.path.isfile(source_distances_path):
-                        shutil.copyfile(source_distances_path, dest_distances_path)
-                        print(f"  Copied landmark distances to: {dest_distances_path}")
-                except Exception as le:
-                    print(f"  Error handling paired landmark files (backremoved): {le}")
-                
-                # Propagate removal mask to same-shape linked children if requested
-                if propagate_linked and removal_mask_path and os.path.isfile(removal_mask_path):
+                    # Copy paired landmark files (non-geometry change) if they exist
                     try:
-                        siblings, err = get_same_shape_siblings(directory, scan_name)
-                        if err:
-                            print(f"  Could not get same-shape siblings for {scan_name}: {err}")
-                        elif siblings:
-                            print(f"  Propagating background removal from {scan_name} to {len(siblings)} same-shape linked children")
-                            for sibling_name in siblings:
-                                try:
-                                    sib_result = self._apply_backremove_mask_to_sibling(
-                                        directory, sibling_name, removal_mask_path, nifti_img.affine, threshold, min_value
-                                    )
-                                    if isinstance(sib_result, dict):
-                                        linked_propagation_results.append(sib_result)
-                                    else:
+                        if latest_edit >= 0:
+                            source_landmark_base = os.path.basename(nifti_path).replace('.nii.gz', '')
+                        else:
+                            source_landmark_base = scan_name
+                    
+                        source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
+                        source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
+                    
+                        dest_landmark_base = f"{scan_name}_edit_{new_edit}_backremoved"
+                        dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
+                        dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
+                    
+                        if os.path.isfile(source_landmarks_path):
+                            atomic_copy(source_landmarks_path, dest_landmarks_path)
+                            print(f"  Copied landmarks to: {dest_landmarks_path}")
+                    
+                        if os.path.isfile(source_distances_path):
+                            atomic_copy(source_distances_path, dest_distances_path)
+                            print(f"  Copied landmark distances to: {dest_distances_path}")
+                    except Exception as le:
+                        print(f"  Error handling paired landmark files (backremoved): {le}")
+                
+                    # Propagate removal mask to same-shape linked children if requested
+                    if propagate_linked and removal_mask_path and os.path.isfile(removal_mask_path):
+                        try:
+                            siblings, err = get_same_shape_siblings(directory, scan_name)
+                            if err:
+                                print(f"  Could not get same-shape siblings for {scan_name}: {err}")
+                            elif siblings:
+                                print(f"  Propagating background removal from {scan_name} to {len(siblings)} same-shape linked children")
+                                for sibling_name in siblings:
+                                    try:
+                                        sib_result = self._apply_backremove_mask_to_sibling(
+                                            directory, sibling_name, removal_mask_path, nifti_img.affine, threshold, min_value
+                                        )
+                                        if isinstance(sib_result, dict):
+                                            linked_propagation_results.append(sib_result)
+                                        else:
+                                            linked_propagation_results.append({
+                                                'scan_name': sibling_name,
+                                                'status': 'success',
+                                            })
+                                        print(f"    Propagated to {sibling_name}")
+                                    except Exception as sib_err:
                                         linked_propagation_results.append({
                                             'scan_name': sibling_name,
-                                            'status': 'success',
+                                            'status': 'failed',
+                                            'reason': str(sib_err),
                                         })
-                                    print(f"    Propagated to {sibling_name}")
-                                except Exception as sib_err:
-                                    linked_propagation_results.append({
-                                        'scan_name': sibling_name,
-                                        'status': 'failed',
-                                        'reason': str(sib_err),
-                                    })
-                                    print(f"    Failed to propagate to {sibling_name}: {sib_err}")
-                        else:
-                            print(f"  No same-shape linked children found for {scan_name}")
-                    except Exception as prop_err:
-                        print(f"  Error during linked propagation for {scan_name}: {prop_err}")
+                                        print(f"    Failed to propagate to {sibling_name}: {sib_err}")
+                            else:
+                                print(f"  No same-shape linked children found for {scan_name}")
+                        except Exception as prop_err:
+                            print(f"  Error during linked propagation for {scan_name}: {prop_err}")
+                    if removal_mask_path and os.path.isfile(removal_mask_path):
+                        tracked_remove(removal_mask_path)  # hand-off only; never kept as a derivative
                 
-                print(f"Successfully removed background from {scan_name}")
+                    print(f"Successfully removed background from {scan_name}")
                 
-                # Clean up memory after each scan
-                cleanup_memory()
+                    # Clean up memory after each scan
+                    cleanup_memory()
                                 
             except Exception as e:
                 print(f"Error processing {scan_name}: {str(e)}")
@@ -2394,69 +2423,74 @@ class MatchHistogramView(APIView):
         for idx, scan_name in enumerate(scan_names):
             try:
                 # Update progress
-                if channel_layer is not None:
-                    progress = idx / total_scans
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Matching histogram of {scan_name} to {reference}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'match_histogram'):
+                    if channel_layer is not None:
+                        progress = idx / total_scans
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Matching histogram of {scan_name} to {reference}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
                 
-                print(f"Processing {scan_name} ({idx+1}/{total_scans})")
+                    print(f"Processing {scan_name} ({idx+1}/{total_scans})")
                 
-                # Load scan
-                latest_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                    latest_edit += 1
-                latest_edit -= 1
-                scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
-                print(f"Using scan file: {os.path.basename(scan_path)}")
+                    # Load scan
+                    latest_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                        latest_edit += 1
+                    latest_edit -= 1
+                    scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
+                    print(f"Using scan file: {os.path.basename(scan_path)}")
                 
-                scan_img = nib.load(scan_path)
-                scan_affine = scan_img.affine
-                scan_original_dtype = scan_img.get_data_dtype()
-                scan_data = scan_img.get_fdata().astype(scan_original_dtype)
+                    scan_img = nib.load(scan_path)
+                    scan_affine = scan_img.affine
+                    scan_original_dtype = scan_img.get_data_dtype()
+                    scan_data = scan_img.get_fdata().astype(scan_original_dtype)
 
-                # Get the scan threshold from metadata
-                with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
-                    scan_metadata = json.load(jf)
-                scan_threshold = scan_metadata['threshold']
+                    # Get the scan threshold from metadata
+                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
+                        scan_metadata = json.load(jf)
+                    scan_threshold = scan_metadata['threshold']
                 
-                # Create scan foreground mask
-                scan_mask = scan_data > scan_threshold
+                    # Create scan foreground mask
+                    scan_mask = scan_data > scan_threshold
                 
-                # Create a copy of the scan data to modify
-                matched_data = scan_data.copy()
+                    # Create a copy of the scan data to modify
+                    matched_data = scan_data.copy()
                 
-                # Apply histogram matching only to foreground voxels
-                print(f"Matching histogram of {scan_name} to {reference} (foreground only)")
-                ref_foreground = reference_data[reference_mask]
-                scan_foreground = scan_data[scan_mask]
+                    # Apply histogram matching only to foreground voxels
+                    print(f"Matching histogram of {scan_name} to {reference} (foreground only)")
+                    ref_foreground = reference_data[reference_mask]
+                    scan_foreground = scan_data[scan_mask]
                 
-                if scan_foreground.size > 0 and ref_foreground.size > 0:
-                    # Match histograms of foreground regions only
-                    matched_foreground = match_histograms(scan_foreground, ref_foreground, channel_axis=None)
+                    if scan_foreground.size > 0 and ref_foreground.size > 0:
+                        # Match histograms of foreground regions only
+                        matched_foreground = match_histograms(scan_foreground, ref_foreground, channel_axis=None)
                     
-                    # Replace foreground voxels in the output with the matched values
-                    matched_data[scan_mask] = matched_foreground
-                else:
-                    print(f"Warning: Empty foreground in either reference or scan {scan_name}")
+                        # Replace foreground voxels in the output with the matched values
+                        matched_data[scan_mask] = matched_foreground
+                    else:
+                        print(f"Warning: Empty foreground in either reference or scan {scan_name}")
 
-                print("Completed histogram matching, saving...")
+                    print("Completed histogram matching, saving...")
 
-                # Save results using consistent helper
-                self._save_processed_scan(directory, scan_name, matched_data, scan_affine, latest_edit + 1, 
-                                        "histmatched", reference_metadata, scan_metadata)
+                    # Save results using consistent helper
+                    self._save_processed_scan(directory, scan_name, matched_data, scan_affine, latest_edit + 1, 
+                                            "histmatched", reference_metadata, scan_metadata)
                 
-                # Clean up memory after each scan
-                del scan_data, scan_img, matched_data
-                cleanup_memory()
+                    # Clean up memory after each scan
+                    del scan_data, scan_img, matched_data
+                    cleanup_memory()
                 
             except Exception as e:
                 print(f"Error processing {scan_name}: {str(e)}")
@@ -2468,70 +2502,75 @@ class MatchHistogramView(APIView):
         for idx, scan_name in enumerate(scan_names):
             try:
                 # Update progress
-                if channel_layer is not None:
-                    progress = idx / total_scans
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Aligning threshold of {scan_name} to {reference}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'match_histogram'):
+                    if channel_layer is not None:
+                        progress = idx / total_scans
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Aligning threshold of {scan_name} to {reference}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
+                
+                    print(f"Processing {scan_name} ({idx+1}/{total_scans})")
+                
+                    # Load scan
+                    latest_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                        latest_edit += 1
+                    latest_edit -= 1
+                    scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
+                
+                    scan_img = nib.load(scan_path)
+                    scan_affine = scan_img.affine
+                    scan_original_dtype = scan_img.get_data_dtype()
+                    scan_data = scan_img.get_fdata().astype(scan_original_dtype)
+                
+                    # Get scan threshold
+                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
+                        scan_metadata = json.load(jf)
+                    scan_threshold = scan_metadata['threshold']
+                
+                    # Calculate shift needed to align thresholds
+                    shift = reference_threshold - scan_threshold
+                    print(f"Scan {scan_name} threshold: {scan_threshold}, reference threshold: {reference_threshold}, shift: {shift}")
+                
+                    # Apply linear shift to ALL values
+                    aligned_data = scan_data.astype(np.float32) + shift
+                
+                    # Determine valid range based on data type
+                    if np.issubdtype(scan_original_dtype, np.integer):
+                        min_val = 0
+                        max_val = np.iinfo(scan_original_dtype).max
+                    else:
+                        min_val = 0.0
+                        max_val = np.finfo(scan_original_dtype).max
+                
+                    # Clip values to valid range
+                    aligned_data = np.clip(aligned_data, min_val, max_val)
+                    aligned_data = aligned_data.astype(scan_original_dtype)
+                
+                    print(f"Values clipped to range [{min_val}, {max_val}]")
+                
+                    # Save results using consistent helper
+                    self._save_processed_scan(
+                        directory, scan_name, aligned_data, scan_affine, latest_edit + 1,
+                        "histmatched", reference_metadata, scan_metadata,
+                        stored_offset=float(shift),
                     )
                 
-                print(f"Processing {scan_name} ({idx+1}/{total_scans})")
-                
-                # Load scan
-                latest_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                    latest_edit += 1
-                latest_edit -= 1
-                scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
-                
-                scan_img = nib.load(scan_path)
-                scan_affine = scan_img.affine
-                scan_original_dtype = scan_img.get_data_dtype()
-                scan_data = scan_img.get_fdata().astype(scan_original_dtype)
-                
-                # Get scan threshold
-                with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
-                    scan_metadata = json.load(jf)
-                scan_threshold = scan_metadata['threshold']
-                
-                # Calculate shift needed to align thresholds
-                shift = reference_threshold - scan_threshold
-                print(f"Scan {scan_name} threshold: {scan_threshold}, reference threshold: {reference_threshold}, shift: {shift}")
-                
-                # Apply linear shift to ALL values
-                aligned_data = scan_data.astype(np.float32) + shift
-                
-                # Determine valid range based on data type
-                if np.issubdtype(scan_original_dtype, np.integer):
-                    min_val = 0
-                    max_val = np.iinfo(scan_original_dtype).max
-                else:
-                    min_val = 0.0
-                    max_val = np.finfo(scan_original_dtype).max
-                
-                # Clip values to valid range
-                aligned_data = np.clip(aligned_data, min_val, max_val)
-                aligned_data = aligned_data.astype(scan_original_dtype)
-                
-                print(f"Values clipped to range [{min_val}, {max_val}]")
-                
-                # Save results using consistent helper
-                self._save_processed_scan(
-                    directory, scan_name, aligned_data, scan_affine, latest_edit + 1,
-                    "histmatched", reference_metadata, scan_metadata,
-                    stored_offset=float(shift),
-                )
-                
-                # Clean up
-                del scan_data, scan_img, aligned_data
-                cleanup_memory()
+                    # Clean up
+                    del scan_data, scan_img, aligned_data
+                    cleanup_memory()
                 
             except Exception as e:
                 print(f"Error processing {scan_name}: {str(e)}")
@@ -2564,90 +2603,95 @@ class MatchHistogramView(APIView):
         for idx, scan_name in enumerate(scan_names):
             try:
                 # Update progress
-                if channel_layer is not None:
-                    progress = idx / total_scans
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Tissue-aware normalizing {scan_name} to match {reference}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'match_histogram'):
+                    if channel_layer is not None:
+                        progress = idx / total_scans
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Tissue-aware normalizing {scan_name} to match {reference}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
                 
-                print(f"Processing {scan_name} ({idx+1}/{total_scans})")
+                    print(f"Processing {scan_name} ({idx+1}/{total_scans})")
                 
-                # Load scan
-                latest_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                    latest_edit += 1
-                latest_edit -= 1
-                scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
+                    # Load scan
+                    latest_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                        latest_edit += 1
+                    latest_edit -= 1
+                    scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
                 
-                scan_img = nib.load(scan_path)
-                scan_affine = scan_img.affine
-                scan_original_dtype = scan_img.get_data_dtype()
-                scan_data = scan_img.get_fdata().astype(scan_original_dtype)
+                    scan_img = nib.load(scan_path)
+                    scan_affine = scan_img.affine
+                    scan_original_dtype = scan_img.get_data_dtype()
+                    scan_data = scan_img.get_fdata().astype(scan_original_dtype)
                 
-                # Get scan threshold
-                with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
-                    scan_metadata = json.load(jf)
-                scan_threshold = scan_metadata['threshold']
+                    # Get scan threshold
+                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
+                        scan_metadata = json.load(jf)
+                    scan_threshold = scan_metadata['threshold']
                 
-                # Find scan tissue ranges
-                scan_foreground = scan_data[scan_data > scan_threshold]
-                if scan_foreground.size == 0:
-                    print(f"Warning: No foreground values in scan {scan_name}")
-                    continue
+                    # Find scan tissue ranges
+                    scan_foreground = scan_data[scan_data > scan_threshold]
+                    if scan_foreground.size == 0:
+                        print(f"Warning: No foreground values in scan {scan_name}")
+                        continue
                 
-                scan_hist, scan_bins = np.histogram(scan_foreground, bins=256)
-                scan_peak_idx = np.argmax(scan_hist)
-                scan_peak = scan_bins[scan_peak_idx]
+                    scan_hist, scan_bins = np.histogram(scan_foreground, bins=256)
+                    scan_peak_idx = np.argmax(scan_hist)
+                    scan_peak = scan_bins[scan_peak_idx]
                 
-                # Define corresponding tissue ranges for scan
-                scan_soft_window = scan_peak * 0.5
-                scan_soft_min = max(scan_threshold, scan_peak - scan_soft_window)
-                scan_soft_max = scan_peak + scan_soft_window
-                scan_bone_min = scan_soft_max
-                scan_bone_max = np.percentile(scan_foreground, 99)
+                    # Define corresponding tissue ranges for scan
+                    scan_soft_window = scan_peak * 0.5
+                    scan_soft_min = max(scan_threshold, scan_peak - scan_soft_window)
+                    scan_soft_max = scan_peak + scan_soft_window
+                    scan_bone_min = scan_soft_max
+                    scan_bone_max = np.percentile(scan_foreground, 99)
                 
-                print(f"Scan {scan_name} tissue ranges - Peak: {scan_peak:.1f}, Soft: {scan_soft_min:.1f}-{scan_soft_max:.1f}, Bone: {scan_bone_min:.1f}-{scan_bone_max:.1f}")
+                    print(f"Scan {scan_name} tissue ranges - Peak: {scan_peak:.1f}, Soft: {scan_soft_min:.1f}-{scan_soft_max:.1f}, Bone: {scan_bone_min:.1f}-{scan_bone_max:.1f}")
                 
-                # Create normalized data
-                normalized_data = scan_data.copy().astype(np.float32)
-                foreground_mask = scan_data > scan_threshold
+                    # Create normalized data
+                    normalized_data = scan_data.copy().astype(np.float32)
+                    foreground_mask = scan_data > scan_threshold
                 
-                # Apply tissue-specific normalization
-                # Soft tissue range (most important for registration)
-                soft_tissue_mask = foreground_mask & (scan_data >= scan_soft_min) & (scan_data <= scan_soft_max)
-                if np.any(soft_tissue_mask) and (scan_soft_max - scan_soft_min) > 0:
-                    normalized_data[soft_tissue_mask] = (
-                        (scan_data[soft_tissue_mask].astype(np.float32) - scan_soft_min) / 
-                        (scan_soft_max - scan_soft_min) * (ref_soft_max - ref_soft_min) + ref_soft_min
-                    )
+                    # Apply tissue-specific normalization
+                    # Soft tissue range (most important for registration)
+                    soft_tissue_mask = foreground_mask & (scan_data >= scan_soft_min) & (scan_data <= scan_soft_max)
+                    if np.any(soft_tissue_mask) and (scan_soft_max - scan_soft_min) > 0:
+                        normalized_data[soft_tissue_mask] = (
+                            (scan_data[soft_tissue_mask].astype(np.float32) - scan_soft_min) / 
+                            (scan_soft_max - scan_soft_min) * (ref_soft_max - ref_soft_min) + ref_soft_min
+                        )
                 
-                # Bone range (preserve relative spacing but don't let it dominate)
-                bone_mask = foreground_mask & (scan_data > scan_soft_max)
-                if np.any(bone_mask) and (scan_bone_max - scan_bone_min) > 0:
-                    normalized_data[bone_mask] = (
-                        (scan_data[bone_mask].astype(np.float32) - scan_bone_min) / 
-                        (scan_bone_max - scan_bone_min) * (ref_bone_max - ref_bone_min) + ref_bone_min
-                    )
+                    # Bone range (preserve relative spacing but don't let it dominate)
+                    bone_mask = foreground_mask & (scan_data > scan_soft_max)
+                    if np.any(bone_mask) and (scan_bone_max - scan_bone_min) > 0:
+                        normalized_data[bone_mask] = (
+                            (scan_data[bone_mask].astype(np.float32) - scan_bone_min) / 
+                            (scan_bone_max - scan_bone_min) * (ref_bone_max - ref_bone_min) + ref_bone_min
+                        )
                 
-                # Ensure values stay within valid range
-                normalized_data = np.clip(normalized_data, 0, np.iinfo(scan_original_dtype).max if np.issubdtype(scan_original_dtype, np.integer) else normalized_data.max())
-                normalized_data = normalized_data.astype(scan_original_dtype)
+                    # Ensure values stay within valid range
+                    normalized_data = np.clip(normalized_data, 0, np.iinfo(scan_original_dtype).max if np.issubdtype(scan_original_dtype, np.integer) else normalized_data.max())
+                    normalized_data = normalized_data.astype(scan_original_dtype)
                 
-                # Save results using consistent helper
-                self._save_processed_scan(directory, scan_name, normalized_data, scan_affine, latest_edit + 1, 
-                                        "histmatched", reference_metadata, scan_metadata)
+                    # Save results using consistent helper
+                    self._save_processed_scan(directory, scan_name, normalized_data, scan_affine, latest_edit + 1, 
+                                            "histmatched", reference_metadata, scan_metadata)
                 
-                # Clean up
-                del scan_data, scan_img, normalized_data
-                cleanup_memory()
+                    # Clean up
+                    del scan_data, scan_img, normalized_data
+                    cleanup_memory()
                 
             except Exception as e:
                 print(f"Error processing {scan_name}: {str(e)}")
@@ -2656,109 +2700,118 @@ class MatchHistogramView(APIView):
         """Clip to [percentile_low, percentile_high] (foreground) and linearly map to the full data type range."""
         for idx, scan_name in enumerate(scan_names):
             try:
-                if channel_layer is not None:
-                    progress = idx / total_scans
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Percentile normalizing {scan_name} ({percentile_low}–{percentile_high}%)...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'match_histogram'):
+                    if channel_layer is not None:
+                        progress = idx / total_scans
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Percentile normalizing {scan_name} ({percentile_low}–{percentile_high}%)...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
+
+                    # Find the latest edit file or use raw file
+                    latest_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                        latest_edit += 1
+                    latest_edit -= 1
+                
+                    # Choose the appropriate file path
+                    if latest_edit >= 0:
+                        scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
+                    else:
+                        scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
+
+                    print(f"Processing {scan_name} ({idx+1}/{total_scans}) using file: {os.path.basename(scan_path)}")
+
+                    scan_img = nib.load(scan_path)
+                    scan_affine = scan_img.affine
+                    scan_original_dtype = scan_img.get_data_dtype()
+                    scan_data = scan_img.get_fdata().astype(scan_original_dtype)
+
+                    with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
+                        scan_metadata = json.load(jf)
+                    scan_threshold = scan_metadata['threshold']
+
+                    # FIXED: Calculate percentiles on ENTIRE image data, not just foreground
+                    # This matches what the frontend shows
+                    all_voxels = scan_data.reshape(-1)
+                    p_low = np.percentile(all_voxels, percentile_low)
+                    p_high = np.percentile(all_voxels, percentile_high)
+
+                    print(f"  Percentiles for {scan_name}: {percentile_low}% = {p_low:.1f}, {percentile_high}% = {p_high:.1f}")
+
+                    if not np.isfinite(p_low) or not np.isfinite(p_high) or p_high <= p_low:
+                        print(f"Invalid percentiles in {scan_name} (p{percentile_low}={p_low}, p{percentile_high}={p_high}); skipping")
+                        continue
+
+                    clipped = np.clip(scan_data.astype(np.float32), p_low, p_high)
+                    # Determine output range based on dtype
+                    if np.issubdtype(scan_original_dtype, np.integer):
+                        out_min = 0
+                        out_max = np.iinfo(scan_original_dtype).max
+                    else:
+                        out_min = 0.0
+                        out_max = 1.0
+
+                    scaled = (clipped - p_low) / (p_high - p_low)
+                    normalized_data = (scaled * (out_max - out_min) + out_min)
+
+                    # Safety clip and cast back
+                    if np.issubdtype(scan_original_dtype, np.integer):
+                        normalized_data = np.clip(normalized_data, out_min, out_max)
+                    else:
+                        normalized_data = np.clip(normalized_data, out_min, out_max)
+                    normalized_data = normalized_data.astype(scan_original_dtype)
+
+                    # Calculate the new threshold using the linear mapping
+                    # Map the original threshold through the same transformation
+                    if scan_threshold <= p_low:
+                        new_threshold = out_min
+                    elif scan_threshold >= p_high:
+                        new_threshold = out_max
+                    else:
+                        # Linear interpolation
+                        new_threshold = ((scan_threshold - p_low) / (p_high - p_low)) * (out_max - out_min) + out_min
+
+                    # Update reference_metadata with the calculated threshold before saving
+                    reference_metadata_copy = reference_metadata.copy()
+                    reference_metadata_copy['threshold'] = float(new_threshold)
+                    reference_metadata_copy['filename'] = f"Percentile normalized ({percentile_low}%-{percentile_high}%)"
+
+                    # Determine next edit number
+                    next_edit = latest_edit + 1
+
+                    in_span = float(p_high - p_low)
+                    out_span = float(out_max - out_min)
+                    percentile_scale = out_span / in_span if in_span else 1.0
+                    percentile_offset = float(out_min) - percentile_scale * float(p_low)
+                    self._save_processed_scan(
+                        directory, scan_name, normalized_data, scan_affine, next_edit,
+                        "histmatched", reference_metadata_copy, scan_metadata,
+                        stored_scale=percentile_scale,
+                        stored_offset=percentile_offset,
                     )
 
-                # Find the latest edit file or use raw file
-                latest_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                    latest_edit += 1
-                latest_edit -= 1
-                
-                # Choose the appropriate file path
-                if latest_edit >= 0:
-                    scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
-                else:
-                    scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
-
-                print(f"Processing {scan_name} ({idx+1}/{total_scans}) using file: {os.path.basename(scan_path)}")
-
-                scan_img = nib.load(scan_path)
-                scan_affine = scan_img.affine
-                scan_original_dtype = scan_img.get_data_dtype()
-                scan_data = scan_img.get_fdata().astype(scan_original_dtype)
-
-                with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
-                    scan_metadata = json.load(jf)
-                scan_threshold = scan_metadata['threshold']
-
-                # FIXED: Calculate percentiles on ENTIRE image data, not just foreground
-                # This matches what the frontend shows
-                all_voxels = scan_data.reshape(-1)
-                p_low = np.percentile(all_voxels, percentile_low)
-                p_high = np.percentile(all_voxels, percentile_high)
-
-                print(f"  Percentiles for {scan_name}: {percentile_low}% = {p_low:.1f}, {percentile_high}% = {p_high:.1f}")
-
-                if not np.isfinite(p_low) or not np.isfinite(p_high) or p_high <= p_low:
-                    print(f"Invalid percentiles in {scan_name} (p{percentile_low}={p_low}, p{percentile_high}={p_high}); skipping")
-                    continue
-
-                clipped = np.clip(scan_data.astype(np.float32), p_low, p_high)
-                # Determine output range based on dtype
-                if np.issubdtype(scan_original_dtype, np.integer):
-                    out_min = 0
-                    out_max = np.iinfo(scan_original_dtype).max
-                else:
-                    out_min = 0.0
-                    out_max = 1.0
-
-                scaled = (clipped - p_low) / (p_high - p_low)
-                normalized_data = (scaled * (out_max - out_min) + out_min)
-
-                # Safety clip and cast back
-                if np.issubdtype(scan_original_dtype, np.integer):
-                    normalized_data = np.clip(normalized_data, out_min, out_max)
-                else:
-                    normalized_data = np.clip(normalized_data, out_min, out_max)
-                normalized_data = normalized_data.astype(scan_original_dtype)
-
-                # Calculate the new threshold using the linear mapping
-                # Map the original threshold through the same transformation
-                if scan_threshold <= p_low:
-                    new_threshold = out_min
-                elif scan_threshold >= p_high:
-                    new_threshold = out_max
-                else:
-                    # Linear interpolation
-                    new_threshold = ((scan_threshold - p_low) / (p_high - p_low)) * (out_max - out_min) + out_min
-
-                # Update reference_metadata with the calculated threshold before saving
-                reference_metadata_copy = reference_metadata.copy()
-                reference_metadata_copy['threshold'] = float(new_threshold)
-                reference_metadata_copy['filename'] = f"Percentile normalized ({percentile_low}%-{percentile_high}%)"
-
-                # Determine next edit number
-                next_edit = latest_edit + 1
-
-                in_span = float(p_high - p_low)
-                out_span = float(out_max - out_min)
-                percentile_scale = out_span / in_span if in_span else 1.0
-                percentile_offset = float(out_min) - percentile_scale * float(p_low)
-                self._save_processed_scan(
-                    directory, scan_name, normalized_data, scan_affine, next_edit,
-                    "histmatched", reference_metadata_copy, scan_metadata,
-                    stored_scale=percentile_scale,
-                    stored_offset=percentile_offset,
-                )
-
-                del scan_data, scan_img, normalized_data
-                cleanup_memory()
+                    del scan_data, scan_img, normalized_data
+                    cleanup_memory()
 
             except Exception as e:
                 print(f"Error processing {scan_name}: {str(e)}")
     
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _save_processed_scan(self, directory, scan_name, processed_data, affine, edit_number, method_suffix, reference_metadata, scan_metadata, stored_scale=1.0, stored_offset=0.0):
         """Helper method to save processed scan data and metadata"""
         # Determine source base before saving (previous latest edit or base scan)
@@ -2778,7 +2831,7 @@ class MatchHistogramView(APIView):
         # Save the processed data
         output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_{method_suffix}.nii.gz")
         scan_img = nib.Nifti1Image(processed_data, affine)
-        nib.save(scan_img, output_path)
+        atomic_nib_save(scan_img, output_path)
         print(f"  Saved processed data to: {output_path}")
         
         # Update metadata
@@ -2798,8 +2851,7 @@ class MatchHistogramView(APIView):
         if isinstance(intensity_norm, dict):
             scan_metadata['intensity_norm_settings'] = intensity_norm
         
-        with open(json_path, 'w') as jf:
-            json.dump(scan_metadata, jf, indent=4)
+        atomic_write_json(json_path, scan_metadata, indent=4)
         print(f"  Updated metadata with threshold: {reference_metadata['threshold']}")
         
         # Save lossy version
@@ -2822,7 +2874,7 @@ class MatchHistogramView(APIView):
             dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_{method_suffix}.nii.mask.gz")
 
             if os.path.isfile(src_mask_full):
-                shutil.copyfile(src_mask_full, dst_mask_full)
+                atomic_copy(src_mask_full, dst_mask_full)
                 print(f"  Copied full-res mask to: {dst_mask_full}")
 
                 # Downsample copied full-res mask to create lossy mask
@@ -2845,19 +2897,14 @@ class MatchHistogramView(APIView):
 
                 mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
                 lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
-                os.replace(dst_mask_full, mask_temp)
-                try:
-                    mask_img = nib.load(mask_temp)
-                    mask_dtype = mask_img.get_data_dtype()
-                    # Round before astype to avoid truncating floats
-                    mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
-                    slices = [slice(None, None, resolution_factor) for _ in range(3)]
-                    lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
-                    nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_temp)
-                    os.replace(lossy_temp, dst_mask_lossy)
-                    print(f"  Generated lossy mask: {dst_mask_lossy}")
-                finally:
-                    os.replace(mask_temp, dst_mask_full)
+                mask_img = load_nifti_readonly(dst_mask_full)
+                mask_dtype = mask_img.get_data_dtype()
+                # Round before astype to avoid truncating floats
+                mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                slices = [slice(None, None, resolution_factor) for _ in range(3)]
+                lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
+                atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
+                print(f"  Generated lossy mask: {dst_mask_lossy}")
             else:
                 print("  No source full-res mask found; skipping.")
         except Exception as me:
@@ -2873,11 +2920,11 @@ class MatchHistogramView(APIView):
             dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
             
             if os.path.isfile(source_landmarks_path):
-                shutil.copyfile(source_landmarks_path, dest_landmarks_path)
+                atomic_copy(source_landmarks_path, dest_landmarks_path)
                 print(f"  Copied landmarks to: {dest_landmarks_path}")
             
             if os.path.isfile(source_distances_path):
-                shutil.copyfile(source_distances_path, dest_distances_path)
+                atomic_copy(source_distances_path, dest_distances_path)
                 print(f"  Copied landmark distances to: {dest_distances_path}")
         except Exception as le:
             print(f"  Error handling paired landmark files (histmatched): {le}")
@@ -2904,10 +2951,7 @@ class MatchHistogramView(APIView):
 
         # Make a list of faulty files
         faulty_files = []
-        for file in os.listdir(os.path.join(directory, "extracted")):
-            # Skip project_settings.json file
-            if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                continue
+        for file in list_extracted_scan_names(directory, log_prefix="MatchHistogram"):
             if file != reference:
                 json_path = os.path.join(directory, "extracted", file, f"{file}.json")
                 with open(json_path, 'r') as jf:
@@ -2916,8 +2960,7 @@ class MatchHistogramView(APIView):
                         faulty_files.append(file)
         
         # Find all unique scan names by listing subdirectories in extracted folder
-        scan_names = [d for d in os.listdir(os.path.join(directory, "extracted")) 
-                     if os.path.isdir(os.path.join(directory, "extracted", d)) and d not in faulty_files]
+        scan_names = [d for d in list_extracted_scan_names(directory) if d not in faulty_files]
 
         scan_names, skipped_preserved_meshes = partition_voxel_and_preserved_mesh_scans(directory, scan_names)
         if not scan_names:
@@ -3093,6 +3136,10 @@ class MatchHistogramView(APIView):
 
 # For a batch of scans inside a directory, do cleanupMesh on the latest edit, and save the result in original and lossy formats
 class BatchCleanupMeshView(APIView):
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
     def _apply_removal_mask_to_sibling(
         self,
         directory,
@@ -3128,14 +3175,8 @@ class BatchCleanupMeshView(APIView):
         else:
             nifti_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
         
-        # Load removal mask
-        removal_mask_temp = removal_mask_path.replace('.nii.removal_mask.gz', '_removal_mask.nii.gz')
-        os.replace(removal_mask_path, removal_mask_temp)
-        try:
-            mask_img = nib.load(removal_mask_temp)
-            removal_mask = np.round(mask_img.get_fdata()).astype(bool)
-        finally:
-            os.replace(removal_mask_temp, removal_mask_path)
+        # Load removal mask (read in place: the source file is never renamed)
+        removal_mask = np.round(load_nifti_readonly(removal_mask_path).get_fdata()).astype(bool)
         
         # Load sibling nifti
         sibling_img = nib.load(nifti_path)
@@ -3207,7 +3248,7 @@ class BatchCleanupMeshView(APIView):
         # Save cleaned sibling
         new_nifti = nib.Nifti1Image(sibling_data, sibling_img.affine)
         output_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{new_edit_number}_cleaned.nii.gz")
-        nib.save(new_nifti, output_path)
+        atomic_nib_save(new_nifti, output_path)
         
         # Save lossy version
         RegistrationTools().save_as_lossy_nifti(
@@ -3234,7 +3275,7 @@ class BatchCleanupMeshView(APIView):
             src_mask_full = os.path.join(directory, "extracted", sibling_name, f"{source_base}.nii.mask.gz")
             if os.path.isfile(src_mask_full):
                 dst_mask_full = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{new_edit_number}_cleaned.nii.mask.gz")
-                shutil.copyfile(src_mask_full, dst_mask_full)
+                atomic_copy(src_mask_full, dst_mask_full)
         except Exception as me:
             print(f"  Error copying paired mask for {sibling_name}: {me}")
         
@@ -3247,7 +3288,7 @@ class BatchCleanupMeshView(APIView):
             source_landmarks_path = os.path.join(directory, "extracted", sibling_name, f"{source_landmark_base}_landmarks.json")
             if os.path.isfile(source_landmarks_path):
                 dest_landmarks_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}_edit_{new_edit_number}_cleaned_landmarks.json")
-                shutil.copyfile(source_landmarks_path, dest_landmarks_path)
+                atomic_copy(source_landmarks_path, dest_landmarks_path)
         except Exception as le:
             print(f"  Error copying landmarks for {sibling_name}: {le}")
         
@@ -3273,10 +3314,7 @@ class BatchCleanupMeshView(APIView):
 
         # Make a list of faulty files
         faulty_files = []
-        for file in os.listdir(os.path.join(directory, "extracted")):
-            # Skip project_settings.json file
-            if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                continue
+        for file in list_extracted_scan_names(directory, log_prefix="BatchCleanupMesh"):
             json_path = os.path.join(directory, "extracted", file, f"{file}.json")
             with open(json_path, 'r') as jf:
                 metadata = json.load(jf)
@@ -3284,8 +3322,7 @@ class BatchCleanupMeshView(APIView):
                     faulty_files.append(file)
 
         # Find all unique scan names by listing subdirectories in extracted folder
-        scan_names = [d for d in os.listdir(os.path.join(directory, "extracted")) 
-                     if os.path.isdir(os.path.join(directory, "extracted", d)) and d not in faulty_files]
+        scan_names = [d for d in list_extracted_scan_names(directory) if d not in faulty_files]
         
         # Remove voxel-based scans that have elastic registration; preserved meshes use PLY edits.
         elastic_scan_names = []
@@ -3346,324 +3383,323 @@ class BatchCleanupMeshView(APIView):
         results = []
         for idx, scan_name in enumerate(scan_names):
             try:
-                json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
-                with open(json_path, 'r') as jf:
-                    json_metadata = json.load(jf)
-                is_preserved_mesh = is_preserved_mesh_metadata(json_metadata)
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'batch_cleanup_mesh', linked=propagate_linked):
+                    json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
+                    with open(json_path, 'r') as jf:
+                        json_metadata = json.load(jf)
+                    is_preserved_mesh = is_preserved_mesh_metadata(json_metadata)
 
-                # Send progress update
-                if channel_layer is not None:
-                    progress = ((idx) / total_scans)
-                    cleanup_label = "preserved mesh" if is_preserved_mesh else "voxel mesh"
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
+                    # Send progress update
+                    if channel_layer is not None:
+                        progress = ((idx) / total_scans)
+                        cleanup_label = "preserved mesh" if is_preserved_mesh else "voxel mesh"
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Cleaning up {cleanup_label} for {scan_name}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
+
+                    if is_preserved_mesh:
+                        mesh_result = preserved_mesh_cleanup_view.cleanup_preserved_mesh(
+                            directory,
+                            scan_name,
+                            edit="latest",
+                            use_island_volume_threshold=use_island_volume_threshold,
+                            min_island_volume_percent=min_island_volume_percent,
+                        )
+                        results.append({
                             'scan_name': scan_name,
-                            'custom_message': f'Cleaning up {cleanup_label} for {scan_name}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
+                            'mode': 'preserved_mesh',
+                            **mesh_result,
+                        })
+                        cleanup_memory()
+                        continue
 
-                if is_preserved_mesh:
-                    mesh_result = preserved_mesh_cleanup_view.cleanup_preserved_mesh(
-                        directory,
-                        scan_name,
-                        edit="latest",
+                    # Find the latest edit for this voxel-based scan
+                    latest_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                        latest_edit += 1
+                    latest_edit -= 1
+                
+                    # Determine the file to process
+                    if latest_edit >= 0:
+                        edit_files = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))
+                        if edit_files:
+                            edit_file = os.path.basename(edit_files[0])
+                        else:
+                            edit_file = None
+                    else:
+                        edit_file = None
+
+                    # If edit file is elastic, skip
+                    if edit_file and 'elastic' in edit_file.lower():
+                        print(f"Skipping {scan_name} - elastic registration detected")
+                        results.append({
+                            'scan_name': scan_name,
+                            'status': 'skipped',
+                            'mode': 'voxel',
+                            'message': 'Elastic registration detected, skipping cleanup'
+                        })
+                        continue
+
+                    # If latest edit is already cleaned, skip
+                    if edit_file and 'cleaned' in edit_file.lower():
+                        print(f"Skipping {scan_name} - latest edit is already cleaned")
+                        results.append({
+                            'scan_name': scan_name,
+                            'status': 'skipped',
+                            'mode': 'voxel',
+                            'message': 'Latest edit is already cleaned'
+                        })
+                        continue
+                
+                    # Get threshold from json metadata
+                    threshold = json_metadata.get('threshold')
+                
+                    # Get the 3D nifti file and load it into a numpy array
+                    if edit_file is None:
+                        nifti_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
+                    else:
+                        nifti_path = os.path.join(directory, "extracted", scan_name, edit_file)
+                
+                    print(f"Processing voxel scan {scan_name} with file {nifti_path}")
+                
+                    # Load the nifti file
+                    nifti_img = nib.load(nifti_path)
+                    original_dtype = nifti_img.get_data_dtype()
+                    nifti_data = nifti_img.get_fdata().astype(original_dtype)
+                
+                    # Clean the mesh and check if cleanup was actually performed
+                    cleaned_data, cleanup_performed, removal_mask, cleanup_outcome = cleanup_mesh_view.clean_mesh(
+                        nifti_data,
+                        threshold,
+                        original_dtype,
+                        gaussian_blur,
                         use_island_volume_threshold=use_island_volume_threshold,
                         min_island_volume_percent=min_island_volume_percent,
                     )
-                    results.append({
-                        'scan_name': scan_name,
-                        'mode': 'preserved_mesh',
-                        **mesh_result,
-                    })
-                    cleanup_memory()
-                    continue
 
-                # Find the latest edit for this voxel-based scan
-                latest_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                    latest_edit += 1
-                latest_edit -= 1
+                    source_edit_name = edit_file if edit_file else f"{scan_name}.nii.gz"
                 
-                # Determine the file to process
-                if latest_edit >= 0:
-                    edit_files = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))
-                    if edit_files:
-                        edit_file = os.path.basename(edit_files[0])
-                    else:
-                        edit_file = None
-                else:
-                    edit_file = None
-
-                # If edit file is elastic, skip
-                if edit_file and 'elastic' in edit_file.lower():
-                    print(f"Skipping {scan_name} - elastic registration detected")
-                    results.append({
-                        'scan_name': scan_name,
-                        'status': 'skipped',
-                        'mode': 'voxel',
-                        'message': 'Elastic registration detected, skipping cleanup'
-                    })
-                    continue
-
-                # If latest edit is already cleaned, skip
-                if edit_file and 'cleaned' in edit_file.lower():
-                    print(f"Skipping {scan_name} - latest edit is already cleaned")
-                    results.append({
-                        'scan_name': scan_name,
-                        'status': 'skipped',
-                        'mode': 'voxel',
-                        'message': 'Latest edit is already cleaned'
-                    })
-                    continue
+                    if not cleanup_performed:
+                        print(f"Skipping {scan_name} - no islands removed, no cleanup needed")
+                        try:
+                            noop_settings = build_mesh_cleanup_settings(
+                                use_island_volume_threshold=use_island_volume_threshold,
+                                min_island_volume_percent=min_island_volume_percent,
+                                gaussian_blur=gaussian_blur,
+                                geometry='voxel',
+                                cleanup_performed=False,
+                                reason=(cleanup_outcome or {}).get('reason') or 'no_disconnected_components',
+                                source_edit=source_edit_name,
+                                components_found=(cleanup_outcome or {}).get('components_found'),
+                            )
+                            write_subject_json_settings(
+                                json_path, 'mesh_cleanup_settings', noop_settings, metadata=json_metadata
+                            )
+                        except Exception as meta_err:
+                            print(f"Warning: could not save mesh_cleanup_settings (no-op) for {scan_name}: {meta_err}")
+                        results.append({
+                            'scan_name': scan_name,
+                            'status': 'skipped',
+                            'mode': 'voxel',
+                            'message': 'No islands removed, no cleanup needed',
+                            'cleanup_performed': False,
+                            'reason': (cleanup_outcome or {}).get('reason'),
+                            'components_found': (cleanup_outcome or {}).get('components_found'),
+                            'source_edit': source_edit_name,
+                        })
+                    
+                        # Clean up memory after each scan
+                        cleanup_memory()
+                        continue
                 
-                # Get threshold from json metadata
-                threshold = json_metadata.get('threshold')
-                
-                # Get the 3D nifti file and load it into a numpy array
-                if edit_file is None:
-                    nifti_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
-                else:
-                    nifti_path = os.path.join(directory, "extracted", scan_name, edit_file)
-                
-                print(f"Processing voxel scan {scan_name} with file {nifti_path}")
-                
-                # Load the nifti file
-                nifti_img = nib.load(nifti_path)
-                original_dtype = nifti_img.get_data_dtype()
-                nifti_data = nifti_img.get_fdata().astype(original_dtype)
-                
-                # Clean the mesh and check if cleanup was actually performed
-                cleaned_data, cleanup_performed, removal_mask, cleanup_outcome = cleanup_mesh_view.clean_mesh(
-                    nifti_data,
-                    threshold,
-                    original_dtype,
-                    gaussian_blur,
-                    use_island_volume_threshold=use_island_volume_threshold,
-                    min_island_volume_percent=min_island_volume_percent,
-                )
-
-                source_edit_name = edit_file if edit_file else f"{scan_name}.nii.gz"
-                
-                if not cleanup_performed:
-                    print(f"Skipping {scan_name} - no islands removed, no cleanup needed")
-                    try:
-                        noop_settings = build_mesh_cleanup_settings(
-                            use_island_volume_threshold=use_island_volume_threshold,
-                            min_island_volume_percent=min_island_volume_percent,
-                            gaussian_blur=gaussian_blur,
-                            geometry='voxel',
-                            cleanup_performed=False,
-                            reason=(cleanup_outcome or {}).get('reason') or 'no_disconnected_components',
-                            source_edit=source_edit_name,
-                            components_found=(cleanup_outcome or {}).get('components_found'),
+                    # Update progress message for actual file saving
+                    if channel_layer is not None:
+                        progress = ((idx) / total_scans)
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Saving cleaned mesh for {scan_name}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
                         )
+                
+                    # Create new nifti image with cleaned data
+                    new_nifti = nib.Nifti1Image(cleaned_data, nifti_img.affine)
+                
+                    # Find the next edit number
+                    edit_number = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_*.nii.gz")):
+                        edit_number += 1
+                
+                    # Save the cleaned image
+                    output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_cleaned.nii.gz")
+                    atomic_nib_save(new_nifti, output_path)
+                
+                    # Generate the lossy version
+                    RegistrationTools().save_as_lossy_nifti(
+                        cleaned_data, 
+                        json_metadata['voxel_size'], 
+                        os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"),
+                        os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_cleaned.nii.gz")
+                    )
+
+                    try:
+                        performed_settings = {
+                            **voxel_cleanup_settings,
+                            'cleanup_performed': True,
+                            'reason': (cleanup_outcome or {}).get('reason') or 'components_removed',
+                            'source_edit': os.path.basename(str(source_edit_name)),
+                        }
+                        if (cleanup_outcome or {}).get('components_found') is not None:
+                            performed_settings['components_found'] = int(cleanup_outcome['components_found'])
                         write_subject_json_settings(
-                            json_path, 'mesh_cleanup_settings', noop_settings, metadata=json_metadata
+                            json_path, 'mesh_cleanup_settings', performed_settings, metadata=json_metadata
                         )
                     except Exception as meta_err:
-                        print(f"Warning: could not save mesh_cleanup_settings (no-op) for {scan_name}: {meta_err}")
-                    results.append({
-                        'scan_name': scan_name,
-                        'status': 'skipped',
-                        'mode': 'voxel',
-                        'message': 'No islands removed, no cleanup needed',
-                        'cleanup_performed': False,
-                        'reason': (cleanup_outcome or {}).get('reason'),
-                        'components_found': (cleanup_outcome or {}).get('components_found'),
-                        'source_edit': source_edit_name,
-                    })
+                        print(f"Warning: could not save mesh_cleanup_settings for {scan_name}: {meta_err}")
+
+                    # Removal mask hand-off for same-shape linked children (deleted again right
+                    # after the propagation below; only written when propagating).
+                    removal_mask_path = None
+                    if removal_mask is not None and propagate_linked:
+                        removal_mask_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_cleaned.nii.removal_mask.gz")
+                        atomic_nib_save(nib.Nifti1Image(removal_mask.astype(np.uint8), nifti_img.affine), removal_mask_path)
+                        print(f"Saved removal mask for linked propagation: {removal_mask_path}")
+
+                    # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
+                    try:
+                        if latest_edit >= 0:
+                            source_base = os.path.basename(nifti_path).replace('.nii.gz', '')
+                        else:
+                            source_base = scan_name
                     
-                    # Clean up memory after each scan
-                    cleanup_memory()
-                    continue
-                
-                # Update progress message for actual file saving
-                if channel_layer is not None:
-                    progress = ((idx) / total_scans)
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Saving cleaned mesh for {scan_name}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
-                
-                # Create new nifti image with cleaned data
-                new_nifti = nib.Nifti1Image(cleaned_data, nifti_img.affine)
-                
-                # Find the next edit number
-                edit_number = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_*.nii.gz")):
-                    edit_number += 1
-                
-                # Save the cleaned image
-                output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_cleaned.nii.gz")
-                nib.save(new_nifti, output_path)
-                
-                # Generate the lossy version
-                RegistrationTools().save_as_lossy_nifti(
-                    cleaned_data, 
-                    json_metadata['voxel_size'], 
-                    os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"),
-                    os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_cleaned.nii.gz")
-                )
+                        src_mask_full = os.path.join(directory, "extracted", scan_name, f"{source_base}.nii.mask.gz")
+                        dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_cleaned.nii.mask.gz")
+                        dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_cleaned.nii.mask.gz")
+                        dst_nifti_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_cleaned.nii.gz")
 
-                try:
-                    performed_settings = {
-                        **voxel_cleanup_settings,
-                        'cleanup_performed': True,
-                        'reason': (cleanup_outcome or {}).get('reason') or 'components_removed',
-                        'source_edit': os.path.basename(str(source_edit_name)),
-                    }
-                    if (cleanup_outcome or {}).get('components_found') is not None:
-                        performed_settings['components_found'] = int(cleanup_outcome['components_found'])
-                    write_subject_json_settings(
-                        json_path, 'mesh_cleanup_settings', performed_settings, metadata=json_metadata
-                    )
-                except Exception as meta_err:
-                    print(f"Warning: could not save mesh_cleanup_settings for {scan_name}: {meta_err}")
+                        if os.path.isfile(src_mask_full):
+                            atomic_copy(src_mask_full, dst_mask_full)
+                            print(f"Copied full-res mask to: {dst_mask_full}")
 
-                # Save removal mask if cleanup was performed
-                removal_mask_path = None
-                if removal_mask is not None:
-                    removal_mask_uint8 = removal_mask.astype(np.uint8)
-                    removal_mask_nifti = nib.Nifti1Image(removal_mask_uint8, nifti_img.affine)
-                    removal_mask_temp = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_cleaned_removal_mask.nii.gz")
-                    removal_mask_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_cleaned.nii.removal_mask.gz")
-                    nib.save(removal_mask_nifti, removal_mask_temp)
-                    os.replace(removal_mask_temp, removal_mask_path)
-                    print(f"Saved removal mask to: {removal_mask_path}")
+                            # Downsample copied full-res mask to create lossy mask
+                            resolution_factor = 2
+                            lc = json_metadata.get('lossy_compression', None)
+                            if isinstance(lc, list) and len(lc) > 0:
+                                try:
+                                    resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
+                                except Exception:
+                                    pass
+                            elif isinstance(lc, dict) and lc:
+                                try:
+                                    resolution_factor = int(lc.get('resolution_factor', resolution_factor))
+                                except Exception:
+                                    pass
 
-                # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
-                try:
-                    if latest_edit >= 0:
-                        source_base = os.path.basename(nifti_path).replace('.nii.gz', '')
-                    else:
-                        source_base = scan_name
-                    
-                    src_mask_full = os.path.join(directory, "extracted", scan_name, f"{source_base}.nii.mask.gz")
-                    dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_cleaned.nii.mask.gz")
-                    dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_cleaned.nii.mask.gz")
-                    dst_nifti_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_cleaned.nii.gz")
+                            # load the lossy destination nifti image to get the affine
+                            lossy_nifti_img = nib.load(dst_nifti_lossy)
+                            lossy_affine = lossy_nifti_img.affine
 
-                    if os.path.isfile(src_mask_full):
-                        shutil.copyfile(src_mask_full, dst_mask_full)
-                        print(f"Copied full-res mask to: {dst_mask_full}")
-
-                        # Downsample copied full-res mask to create lossy mask
-                        resolution_factor = 2
-                        lc = json_metadata.get('lossy_compression', None)
-                        if isinstance(lc, list) and len(lc) > 0:
-                            try:
-                                resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
-                            except Exception:
-                                pass
-                        elif isinstance(lc, dict) and lc:
-                            try:
-                                resolution_factor = int(lc.get('resolution_factor', resolution_factor))
-                            except Exception:
-                                pass
-
-                        # load the lossy destination nifti image to get the affine
-                        lossy_nifti_img = nib.load(dst_nifti_lossy)
-                        lossy_affine = lossy_nifti_img.affine
-
-                        mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
-                        lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
-                        os.replace(dst_mask_full, mask_temp)
-                        try:
-                            mask_img = nib.load(mask_temp)
+                            mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
+                            lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
+                            mask_img = load_nifti_readonly(dst_mask_full)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
                             mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
                             slices = [slice(None, None, resolution_factor) for _ in range(3)]
                             lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
-                            nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_temp)
-                            os.replace(lossy_temp, dst_mask_lossy)
+                            atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
                             print(f"Generated lossy mask: {dst_mask_lossy}")
-                        finally:
-                            os.replace(mask_temp, dst_mask_full)
-                    else:
-                        print("No source full-res mask found; skipping.")
-                except Exception as me:
-                    print(f"Error handling paired mask (batch cleaned): {me}")
-                
-                # Copy paired landmark files (non-geometry change) if they exist
-                try:
-                    if latest_edit >= 0:
-                        source_landmark_base = os.path.basename(nifti_path).replace('.nii.gz', '')
-                    else:
-                        source_landmark_base = scan_name
-                    
-                    source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
-                    source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
-                    
-                    dest_landmark_base = f"{scan_name}_edit_{edit_number}_cleaned"
-                    dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
-                    dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
-                    
-                    if os.path.isfile(source_landmarks_path):
-                        shutil.copyfile(source_landmarks_path, dest_landmarks_path)
-                        print(f"Copied landmarks to: {dest_landmarks_path}")
-                    
-                    if os.path.isfile(source_distances_path):
-                        shutil.copyfile(source_distances_path, dest_distances_path)
-                        print(f"Copied landmark distances to: {dest_distances_path}")
-                except Exception as le:
-                    print(f"Error handling paired landmark files (batch cleaned): {le}")
-                
-                # Propagate cleanup removal mask to same-shape linked children if requested
-                linked_propagation = []
-                if propagate_linked and removal_mask_path and os.path.isfile(removal_mask_path):
-                    try:
-                        siblings, err = get_same_shape_siblings(directory, scan_name)
-                        if err:
-                            print(f"Could not get same-shape siblings for {scan_name}: {err}")
-                        elif siblings:
-                            print(f"Propagating cleanup removal mask from {scan_name} to {len(siblings)} same-shape linked children")
-                            for sibling_name in siblings:
-                                try:
-                                    sibling_result = self._apply_removal_mask_to_sibling(
-                                        directory,
-                                        sibling_name,
-                                        removal_mask_path,
-                                        nifti_img.affine,
-                                        threshold,
-                                        cleanup_settings=voxel_cleanup_settings,
-                                    )
-                                    linked_propagation.append(sibling_result)
-                                    print(f"  Propagated cleanup to {sibling_name}: {sibling_result['status']}")
-                                except Exception as sib_err:
-                                    print(f"  Failed to propagate cleanup to {sibling_name}: {sib_err}")
-                                    linked_propagation.append({'scan_name': sibling_name, 'status': 'error', 'reason': str(sib_err)})
                         else:
-                            print(f"No same-shape linked children found for {scan_name}")
-                    except Exception as prop_err:
-                        print(f"Error during linked propagation for {scan_name}: {prop_err}")
+                            print("No source full-res mask found; skipping.")
+                    except Exception as me:
+                        print(f"Error handling paired mask (batch cleaned): {me}")
                 
-                result_entry = {
-                    'scan_name': scan_name,
-                    'status': 'success',
-                    'mode': 'voxel',
-                    'edit': f"{scan_name}_lossy_edit_{edit_number}_cleaned.nii.gz"
-                }
-                if linked_propagation:
-                    result_entry['linked_propagation'] = linked_propagation
-                results.append(result_entry)
+                    # Copy paired landmark files (non-geometry change) if they exist
+                    try:
+                        if latest_edit >= 0:
+                            source_landmark_base = os.path.basename(nifti_path).replace('.nii.gz', '')
+                        else:
+                            source_landmark_base = scan_name
+                    
+                        source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
+                        source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
+                    
+                        dest_landmark_base = f"{scan_name}_edit_{edit_number}_cleaned"
+                        dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
+                        dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
+                    
+                        if os.path.isfile(source_landmarks_path):
+                            atomic_copy(source_landmarks_path, dest_landmarks_path)
+                            print(f"Copied landmarks to: {dest_landmarks_path}")
+                    
+                        if os.path.isfile(source_distances_path):
+                            atomic_copy(source_distances_path, dest_distances_path)
+                            print(f"Copied landmark distances to: {dest_distances_path}")
+                    except Exception as le:
+                        print(f"Error handling paired landmark files (batch cleaned): {le}")
                 
-                print(f"Successfully cleaned {scan_name}")
+                    # Propagate cleanup removal mask to same-shape linked children if requested
+                    linked_propagation = []
+                    if propagate_linked and removal_mask_path and os.path.isfile(removal_mask_path):
+                        try:
+                            siblings, err = get_same_shape_siblings(directory, scan_name)
+                            if err:
+                                print(f"Could not get same-shape siblings for {scan_name}: {err}")
+                            elif siblings:
+                                print(f"Propagating cleanup removal mask from {scan_name} to {len(siblings)} same-shape linked children")
+                                for sibling_name in siblings:
+                                    try:
+                                        sibling_result = self._apply_removal_mask_to_sibling(
+                                            directory,
+                                            sibling_name,
+                                            removal_mask_path,
+                                            nifti_img.affine,
+                                            threshold,
+                                            cleanup_settings=voxel_cleanup_settings,
+                                        )
+                                        linked_propagation.append(sibling_result)
+                                        print(f"  Propagated cleanup to {sibling_name}: {sibling_result['status']}")
+                                    except Exception as sib_err:
+                                        print(f"  Failed to propagate cleanup to {sibling_name}: {sib_err}")
+                                        linked_propagation.append({'scan_name': sibling_name, 'status': 'error', 'reason': str(sib_err)})
+                            else:
+                                print(f"No same-shape linked children found for {scan_name}")
+                        except Exception as prop_err:
+                            print(f"Error during linked propagation for {scan_name}: {prop_err}")
+                    if removal_mask_path and os.path.isfile(removal_mask_path):
+                        tracked_remove(removal_mask_path)  # hand-off only; never kept as a derivative
                 
-                # Clean up memory after each scan
-                cleanup_memory()
+                    result_entry = {
+                        'scan_name': scan_name,
+                        'status': 'success',
+                        'mode': 'voxel',
+                        'edit': f"{scan_name}_lossy_edit_{edit_number}_cleaned.nii.gz"
+                    }
+                    if linked_propagation:
+                        result_entry['linked_propagation'] = linked_propagation
+                    results.append(result_entry)
+                
+                    print(f"Successfully cleaned {scan_name}")
+                
+                    # Clean up memory after each scan
+                    cleanup_memory()
                 
             except Exception as e:
                 print(f"Error processing {scan_name}: {str(e)}")
@@ -3731,10 +3767,7 @@ class N4BiasCorrectionView(APIView):
         else:
             # Make a list of faulty files
             faulty_files = []
-            for file in os.listdir(os.path.join(directory, "extracted")):
-                # Skip project_settings.json file
-                if file == "project_settings.json" or not os.path.isdir(os.path.join(directory, "extracted", file)):
-                    continue
+            for file in list_extracted_scan_names(directory, log_prefix="N4BiasCorrection"):
                 json_path = os.path.join(directory, "extracted", file, f"{file}.json")
                 with open(json_path, 'r') as jf:
                     metadata = json.load(jf)
@@ -3742,8 +3775,7 @@ class N4BiasCorrectionView(APIView):
                         faulty_files.append(file)
 
             # Find all unique scan names by listing subdirectories in extracted folder
-            scan_names = [d for d in os.listdir(os.path.join(directory, "extracted")) 
-                        if os.path.isdir(os.path.join(directory, "extracted", d)) and d not in faulty_files]
+            scan_names = [d for d in list_extracted_scan_names(directory) if d not in faulty_files]
             
             # Order scan names alphabetically
             scan_names.sort()
@@ -3793,163 +3825,162 @@ class N4BiasCorrectionView(APIView):
         for idx, scan_name in enumerate(scan_names):
             try:
                 # Find the latest edit for this scan
-                latest_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                    latest_edit += 1
-                latest_edit -= 1
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'n4_bias_correction'):
+                    latest_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                        latest_edit += 1
+                    latest_edit -= 1
                 
-                # Send progress update
-                if channel_layer is not None and filename is None:
-                    progress = ((idx) / total_scans)
-                    async_to_sync(channel_layer.group_send)(
-                        'progress_group',
-                        {
-                            'type': 'send_progress',
-                            'progress': progress,
-                            'scan_name': scan_name,
-                            'custom_message': f'Applying N4 bias correction to {scan_name}...',
-                            'total': total_scans,
-                            'current': idx + 1,
-                        }
-                    )
+                    # Send progress update
+                    if channel_layer is not None and filename is None:
+                        progress = ((idx) / total_scans)
+                        async_to_sync(channel_layer.group_send)(
+                            'progress_group',
+                            {
+                                'type': 'send_progress',
+                                'progress': progress,
+                                'scan_name': scan_name,
+                                'custom_message': f'Applying N4 bias correction to {scan_name}...',
+                                'total': total_scans,
+                                'current': idx + 1,
+                            }
+                        )
                 
-                # Determine the file to process
-                if latest_edit >= 0:
-                    edit_files = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))
-                    if edit_files:
-                        edit_file = os.path.basename(edit_files[0])
-                        nifti_path = os.path.join(directory, "extracted", scan_name, edit_file)
+                    # Determine the file to process
+                    if latest_edit >= 0:
+                        edit_files = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))
+                        if edit_files:
+                            edit_file = os.path.basename(edit_files[0])
+                            nifti_path = os.path.join(directory, "extracted", scan_name, edit_file)
+                        else:
+                            nifti_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
                     else:
                         nifti_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
-                else:
-                    nifti_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
                 
-                print(f"Processing {scan_name} with file {nifti_path}")
+                    print(f"Processing {scan_name} with file {nifti_path}")
                 
-                # Load the nifti file
-                nifti_img = nib.load(nifti_path)
-                original_dtype = nifti_img.get_data_dtype()
-                nifti_data = nifti_img.get_fdata().astype(np.float32)  # Convert to float32 for ANTs
+                    # Load the nifti file
+                    nifti_img = nib.load(nifti_path)
+                    original_dtype = nifti_img.get_data_dtype()
+                    nifti_data = nifti_img.get_fdata().astype(np.float32)  # Convert to float32 for ANTs
                 
-                # Apply N4 bias correction
-                corrected_data = self.correct(nifti_data, params)
-                print(f"Corrected data shape: {corrected_data.shape}")
+                    # Apply N4 bias correction
+                    corrected_data = self.correct(nifti_data, params)
+                    print(f"Corrected data shape: {corrected_data.shape}")
                 
                 
-                # Convert back to original data type
-                corrected_data = np.clip(corrected_data, np.iinfo(original_dtype).min, np.iinfo(original_dtype).max).astype(original_dtype)
+                    # Convert back to original data type
+                    corrected_data = np.clip(corrected_data, np.iinfo(original_dtype).min, np.iinfo(original_dtype).max).astype(original_dtype)
                 
-                # Create new nifti image with corrected data
-                new_nifti = nib.Nifti1Image(corrected_data, nifti_img.affine)
+                    # Create new nifti image with corrected data
+                    new_nifti = nib.Nifti1Image(corrected_data, nifti_img.affine)
                 
-                # Find the next edit number
-                edit_number = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_*.nii.gz")):
-                    edit_number += 1
+                    # Find the next edit number
+                    edit_number = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_*.nii.gz")):
+                        edit_number += 1
                 
-                                # Save the corrected image
-                output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_n4corrected.nii.gz")
-                nib.save(new_nifti, output_path)
+                                    # Save the corrected image
+                    output_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_n4corrected.nii.gz")
+                    atomic_nib_save(new_nifti, output_path)
                 
-                # Load the metadata JSON
-                json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
-                with open(json_path, 'r') as jf:
-                    json_metadata = json.load(jf)
-                json_metadata['n4_bias_settings'] = build_n4_bias_settings(params)
-                with open(json_path, 'w') as jf:
-                    json.dump(json_metadata, jf, indent=4)
+                    # Load the metadata JSON
+                    json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
+                    with open(json_path, 'r') as jf:
+                        json_metadata = json.load(jf)
+                    json_metadata['n4_bias_settings'] = build_n4_bias_settings(params)
+                    atomic_write_json(json_path, json_metadata, indent=4)
                 
-                # Generate the lossy version
-                RegistrationTools().save_as_lossy_nifti(
-                    corrected_data, 
-                    json_metadata['voxel_size'], 
-                    json_path,
-                    os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_n4corrected.nii.gz")
-                )
+                    # Generate the lossy version
+                    RegistrationTools().save_as_lossy_nifti(
+                        corrected_data, 
+                        json_metadata['voxel_size'], 
+                        json_path,
+                        os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_n4corrected.nii.gz")
+                    )
                 
-                print(f"Successfully applied N4 bias correction to {scan_name}")
-                processed_scans.append(scan_name)
+                    print(f"Successfully applied N4 bias correction to {scan_name}")
+                    processed_scans.append(scan_name)
 
-                # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
-                try:
-                    # Determine source base used as input
-                    if latest_edit >= 0:
-                        source_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
-                        source_base = os.path.basename(source_path).replace('.nii.gz', '')
-                    else:
-                        source_base = scan_name
+                    # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
+                    try:
+                        # Determine source base used as input
+                        if latest_edit >= 0:
+                            source_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
+                            source_base = os.path.basename(source_path).replace('.nii.gz', '')
+                        else:
+                            source_base = scan_name
 
-                    src_mask_full = os.path.join(directory, "extracted", scan_name, f"{source_base}.nii.mask.gz")
+                        src_mask_full = os.path.join(directory, "extracted", scan_name, f"{source_base}.nii.mask.gz")
 
-                    dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_n4corrected.nii.mask.gz")
-                    dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_n4corrected.nii.mask.gz")
-                    dst_nifti_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_n4corrected.nii.gz")
+                        dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{edit_number}_n4corrected.nii.mask.gz")
+                        dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_n4corrected.nii.mask.gz")
+                        dst_nifti_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{edit_number}_n4corrected.nii.gz")
 
-                    if os.path.isfile(src_mask_full):
-                        shutil.copyfile(src_mask_full, dst_mask_full)
-                        print(f"Copied full-res mask to: {dst_mask_full}")
+                        if os.path.isfile(src_mask_full):
+                            atomic_copy(src_mask_full, dst_mask_full)
+                            print(f"Copied full-res mask to: {dst_mask_full}")
 
-                        # Downsample copied full-res mask to create lossy mask
-                        resolution_factor = 2
-                        lc = json_metadata.get('lossy_compression', None)
-                        if isinstance(lc, list) and len(lc) > 0:
-                            try:
-                                resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
-                            except Exception:
-                                pass
-                        elif isinstance(lc, dict) and lc:
-                            try:
-                                resolution_factor = int(lc.get('resolution_factor', resolution_factor))
-                            except Exception:
-                                pass
+                            # Downsample copied full-res mask to create lossy mask
+                            resolution_factor = 2
+                            lc = json_metadata.get('lossy_compression', None)
+                            if isinstance(lc, list) and len(lc) > 0:
+                                try:
+                                    resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
+                                except Exception:
+                                    pass
+                            elif isinstance(lc, dict) and lc:
+                                try:
+                                    resolution_factor = int(lc.get('resolution_factor', resolution_factor))
+                                except Exception:
+                                    pass
 
-                        # load the lossy destination nifti image to get the affine
-                        lossy_nifti_img = nib.load(dst_nifti_lossy)
-                        lossy_affine = lossy_nifti_img.affine
+                            # load the lossy destination nifti image to get the affine
+                            lossy_nifti_img = nib.load(dst_nifti_lossy)
+                            lossy_affine = lossy_nifti_img.affine
 
-                        mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
-                        lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
-                        os.replace(dst_mask_full, mask_temp)
-                        try:
-                            mask_img = nib.load(mask_temp)
+                            mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
+                            lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
+                            mask_img = load_nifti_readonly(dst_mask_full)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
                             mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
                             slices = [slice(None, None, resolution_factor) for _ in range(3)]
                             lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
-                            nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_temp)
-                            os.replace(lossy_temp, dst_mask_lossy)
+                            atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
                             print(f"Generated lossy mask: {dst_mask_lossy}")
-                        finally:
-                            os.replace(mask_temp, dst_mask_full)
-                    else:
-                        print("No source full-res mask found; skipping.")
-                except Exception as me:
-                    print(f"Error handling paired mask (N4): {me}")
+                        else:
+                            print("No source full-res mask found; skipping.")
+                    except Exception as me:
+                        print(f"Error handling paired mask (N4): {me}")
                 
-                # Copy paired landmark files (non-geometry change) if they exist
-                try:
-                    if latest_edit >= 0:
-                        source_landmark_base = os.path.basename(nifti_path).replace('.nii.gz', '')
-                    else:
-                        source_landmark_base = scan_name
+                    # Copy paired landmark files (non-geometry change) if they exist
+                    try:
+                        if latest_edit >= 0:
+                            source_landmark_base = os.path.basename(nifti_path).replace('.nii.gz', '')
+                        else:
+                            source_landmark_base = scan_name
                     
-                    source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
-                    source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
+                        source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
+                        source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
                     
-                    dest_landmark_base = f"{scan_name}_edit_{edit_number}_n4corrected"
-                    dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
-                    dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
+                        dest_landmark_base = f"{scan_name}_edit_{edit_number}_n4corrected"
+                        dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
+                        dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
                     
-                    if os.path.isfile(source_landmarks_path):
-                        shutil.copyfile(source_landmarks_path, dest_landmarks_path)
-                        print(f"Copied landmarks to: {dest_landmarks_path}")
+                        if os.path.isfile(source_landmarks_path):
+                            atomic_copy(source_landmarks_path, dest_landmarks_path)
+                            print(f"Copied landmarks to: {dest_landmarks_path}")
                     
-                    if os.path.isfile(source_distances_path):
-                        shutil.copyfile(source_distances_path, dest_distances_path)
-                        print(f"Copied landmark distances to: {dest_distances_path}")
-                except Exception as le:
-                    print(f"Error handling paired landmark files (N4): {le}")
+                        if os.path.isfile(source_distances_path):
+                            atomic_copy(source_distances_path, dest_distances_path)
+                            print(f"Copied landmark distances to: {dest_distances_path}")
+                    except Exception as le:
+                        print(f"Error handling paired landmark files (N4): {le}")
 
             except Exception as e:
                 print(f"Error processing {scan_name}: {str(e)}")
@@ -4023,163 +4054,162 @@ class SaveBackgroundValuesView(APIView):
         for idx, (scan_name, scan_values) in enumerate(scans_to_process.items()):            
             try:
                 # If the background value is 0, then skip
-                if scan_values['background'] == 0:
-                    continue
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'save_background_values'):
+                    if scan_values['background'] == 0:
+                        continue
 
-                # Find the latest edit for this scan
-                latest_edit = 0
-                while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
-                    latest_edit += 1
-                latest_edit -= 1
+                    # Find the latest edit for this scan
+                    latest_edit = 0
+                    while glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz")):
+                        latest_edit += 1
+                    latest_edit -= 1
                 
-                # Load the scan data path
-                if latest_edit >= 0:
-                    scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
-                else:
-                    scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
+                    # Load the scan data path
+                    if latest_edit >= 0:
+                        scan_path = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{latest_edit}_*.nii.gz"))[0]
+                    else:
+                        scan_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.nii.gz")
                 
-                # Load the scan data
-                nifti_img = nib.load(scan_path)
-                original_dtype = nifti_img.get_data_dtype()
-                scan_data = nifti_img.get_fdata().astype(original_dtype)
+                    # Load the scan data
+                    nifti_img = nib.load(scan_path)
+                    original_dtype = nifti_img.get_data_dtype()
+                    scan_data = nifti_img.get_fdata().astype(original_dtype)
                 
-                # Apply background correction using the HomogenizeBackgroundView method
-                background_value = float(scan_values['background'])
-                homogenizer = HomogenizeBackgroundView()
-                corrected_data = homogenizer._homogenize_background(scan_data, background_value)
+                    # Apply background correction using the HomogenizeBackgroundView method
+                    background_value = float(scan_values['background'])
+                    homogenizer = HomogenizeBackgroundView()
+                    corrected_data = homogenizer._homogenize_background(scan_data, background_value)
                 
-                # Save the corrected data
-                new_edit_number = latest_edit + 1
-                output_path = os.path.join(directory, "extracted", scan_name, 
-                                          f"{scan_name}_edit_{new_edit_number}_backfixed.nii.gz")
-                output_path_lossy = os.path.join(directory, "extracted", scan_name, 
-                                          f"{scan_name}_lossy_edit_{new_edit_number}_backfixed.nii.gz")
+                    # Save the corrected data
+                    new_edit_number = latest_edit + 1
+                    output_path = os.path.join(directory, "extracted", scan_name, 
+                                              f"{scan_name}_edit_{new_edit_number}_backfixed.nii.gz")
+                    output_path_lossy = os.path.join(directory, "extracted", scan_name, 
+                                              f"{scan_name}_lossy_edit_{new_edit_number}_backfixed.nii.gz")
                 
-                # Save the corrected data with the original data type
-                new_img = nib.Nifti1Image(corrected_data.astype(original_dtype), nifti_img.affine, nifti_img.header)
-                nib.save(new_img, output_path)
+                    # Save the corrected data with the original data type
+                    new_img = nib.Nifti1Image(corrected_data.astype(original_dtype), nifti_img.affine, nifti_img.header)
+                    atomic_nib_save(new_img, output_path)
                 
-                # Update threshold in metadata (subtract the background shift)
-                json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
-                with open(json_path, 'r') as jf:
-                    scan_metadata = json.load(jf)
+                    # Update threshold in metadata (subtract the background shift)
+                    json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
+                    with open(json_path, 'r') as jf:
+                        scan_metadata = json.load(jf)
 
-                from .rigidAlignment import (
-                    normalize_threshold_edit_stem,
-                    snapshot_previous_edit_threshold,
-                    append_background_offset_history,
-                )
-                previous_stem = (
-                    normalize_threshold_edit_stem(os.path.basename(scan_path), scan_name)
-                    if latest_edit >= 0
-                    else scan_name
-                )
-                snapshot_previous_edit_threshold(scan_metadata, previous_stem)
-                applied_shift = int(background_value)
-                scan_metadata['threshold'] = scan_metadata['threshold'] - applied_shift
-                scan_metadata['backfixed_shift'] = applied_shift
-                scan_metadata['background_offset_settings'] = {
-                    'mode': 'manual_per_scan',
-                    'shift': applied_shift,
-                }
-                append_background_offset_history(
-                    scan_metadata,
-                    f"{scan_name}_edit_{new_edit_number}_backfixed",
-                    'manual_per_scan',
-                    applied_shift,
-                )
+                    from .rigidAlignment import (
+                        normalize_threshold_edit_stem,
+                        snapshot_previous_edit_threshold,
+                        append_background_offset_history,
+                    )
+                    previous_stem = (
+                        normalize_threshold_edit_stem(os.path.basename(scan_path), scan_name)
+                        if latest_edit >= 0
+                        else scan_name
+                    )
+                    snapshot_previous_edit_threshold(scan_metadata, previous_stem)
+                    applied_shift = int(background_value)
+                    scan_metadata['threshold'] = scan_metadata['threshold'] - applied_shift
+                    scan_metadata['backfixed_shift'] = applied_shift
+                    scan_metadata['background_offset_settings'] = {
+                        'mode': 'manual_per_scan',
+                        'shift': applied_shift,
+                    }
+                    append_background_offset_history(
+                        scan_metadata,
+                        f"{scan_name}_edit_{new_edit_number}_backfixed",
+                        'manual_per_scan',
+                        applied_shift,
+                    )
                 
-                with open(json_path, 'w') as jf:
-                    json.dump(scan_metadata, jf, indent=4)
+                    atomic_write_json(json_path, scan_metadata, indent=4)
                 
-                # Save compressed version
-                RegistrationTools().save_as_lossy_nifti(
-                    corrected_data, 
-                    scan_metadata['voxel_size'], 
-                    json_path,
-                    output_path_lossy,
-                    stored_offset=-float(applied_shift),
-                )
+                    # Save compressed version
+                    RegistrationTools().save_as_lossy_nifti(
+                        corrected_data, 
+                        scan_metadata['voxel_size'], 
+                        json_path,
+                        output_path_lossy,
+                        stored_offset=-float(applied_shift),
+                    )
 
-                # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
-                try:
-                    source_base = os.path.basename(scan_path).replace('.nii.gz', '') if latest_edit >= 0 else scan_name
-                    src_mask_full = os.path.join(directory, "extracted", scan_name, f"{source_base}.nii.mask.gz")
+                    # Copy paired mask (non-geometry change) and generate lossy by downsampling from copied full-res
+                    try:
+                        source_base = os.path.basename(scan_path).replace('.nii.gz', '') if latest_edit >= 0 else scan_name
+                        src_mask_full = os.path.join(directory, "extracted", scan_name, f"{source_base}.nii.mask.gz")
 
-                    dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit_number}_backfixed.nii.mask.gz")
-                    dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit_number}_backfixed.nii.mask.gz")
+                        dst_mask_full = os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_{new_edit_number}_backfixed.nii.mask.gz")
+                        dst_mask_lossy = os.path.join(directory, "extracted", scan_name, f"{scan_name}_lossy_edit_{new_edit_number}_backfixed.nii.mask.gz")
 
-                    if os.path.isfile(src_mask_full):
-                        shutil.copyfile(src_mask_full, dst_mask_full)
-                        print(f"Copied full-res mask to: {dst_mask_full}")
+                        if os.path.isfile(src_mask_full):
+                            atomic_copy(src_mask_full, dst_mask_full)
+                            print(f"Copied full-res mask to: {dst_mask_full}")
 
-                        # Downsample copied full-res mask to create lossy mask
-                        resolution_factor = 2
-                        lc = scan_metadata.get('lossy_compression', None)
-                        if isinstance(lc, list) and len(lc) > 0:
-                            try:
-                                resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
-                            except Exception:
-                                pass
-                        elif isinstance(lc, dict) and lc:
-                            try:
-                                resolution_factor = int(lc.get('resolution_factor', resolution_factor))
-                            except Exception:
-                                pass
+                            # Downsample copied full-res mask to create lossy mask
+                            resolution_factor = 2
+                            lc = scan_metadata.get('lossy_compression', None)
+                            if isinstance(lc, list) and len(lc) > 0:
+                                try:
+                                    resolution_factor = int(lc[-1].get('resolution_factor', resolution_factor))
+                                except Exception:
+                                    pass
+                            elif isinstance(lc, dict) and lc:
+                                try:
+                                    resolution_factor = int(lc.get('resolution_factor', resolution_factor))
+                                except Exception:
+                                    pass
 
-                        # load the lossy destination nifti image to get the affine
-                        lossy_nifti_img = nib.load(output_path_lossy)
-                        lossy_affine = lossy_nifti_img.affine
+                            # load the lossy destination nifti image to get the affine
+                            lossy_nifti_img = nib.load(output_path_lossy)
+                            lossy_affine = lossy_nifti_img.affine
 
-                        mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
-                        lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
-                        os.replace(dst_mask_full, mask_temp)
-                        try:
-                            mask_img = nib.load(mask_temp)
+                            mask_temp = dst_mask_full.replace('.nii.mask.gz', '_mask.nii.gz')
+                            lossy_temp = dst_mask_lossy.replace('.nii.mask.gz', '_mask.nii.gz')
+                            mask_img = load_nifti_readonly(dst_mask_full)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
                             mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
                             slices = [slice(None, None, resolution_factor) for _ in range(3)]
                             lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
-                            nib.save(nib.Nifti1Image(lossy_mask, lossy_affine), lossy_temp)
-                            os.replace(lossy_temp, dst_mask_lossy)
+                            atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
                             print(f"Generated lossy mask: {dst_mask_lossy}")
-                        finally:
-                            os.replace(mask_temp, dst_mask_full)
-                    else:
-                        print("No source full-res mask found; skipping.")
-                except Exception as me:
-                    print(f"Error handling paired mask (backfixed values): {me}")
+                        else:
+                            print("No source full-res mask found; skipping.")
+                    except Exception as me:
+                        print(f"Error handling paired mask (backfixed values): {me}")
 
-                # Copy paired landmark files (non-geometry change) if they exist
-                try:
-                    if latest_edit >= 0:
-                        source_landmark_base = os.path.basename(scan_path).replace('.nii.gz', '')
-                    else:
-                        source_landmark_base = scan_name
+                    # Copy paired landmark files (non-geometry change) if they exist
+                    try:
+                        if latest_edit >= 0:
+                            source_landmark_base = os.path.basename(scan_path).replace('.nii.gz', '')
+                        else:
+                            source_landmark_base = scan_name
                     
-                    source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
-                    source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
+                        source_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmarks.json")
+                        source_distances_path = os.path.join(directory, "extracted", scan_name, f"{source_landmark_base}_landmark_distances.json")
                     
-                    dest_landmark_base = f"{scan_name}_edit_{new_edit_number}_backfixed"
-                    dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
-                    dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
+                        dest_landmark_base = f"{scan_name}_edit_{new_edit_number}_backfixed"
+                        dest_landmarks_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmarks.json")
+                        dest_distances_path = os.path.join(directory, "extracted", scan_name, f"{dest_landmark_base}_landmark_distances.json")
                     
-                    if os.path.isfile(source_landmarks_path):
-                        shutil.copyfile(source_landmarks_path, dest_landmarks_path)
-                        print(f"Copied landmarks to: {dest_landmarks_path}")
+                        if os.path.isfile(source_landmarks_path):
+                            atomic_copy(source_landmarks_path, dest_landmarks_path)
+                            print(f"Copied landmarks to: {dest_landmarks_path}")
                     
-                    if os.path.isfile(source_distances_path):
-                        shutil.copyfile(source_distances_path, dest_distances_path)
-                        print(f"Copied landmark distances to: {dest_distances_path}")
-                except Exception as le:
-                    print(f"Error handling paired landmark files (backfixed values): {le}")
+                        if os.path.isfile(source_distances_path):
+                            atomic_copy(source_distances_path, dest_distances_path)
+                            print(f"Copied landmark distances to: {dest_distances_path}")
+                    except Exception as le:
+                        print(f"Error handling paired landmark files (backfixed values): {le}")
                 
-                updated_scans.append(scan_name)
-                print(f"Applied background correction to {scan_name} with value {background_value}")
+                    updated_scans.append(scan_name)
+                    print(f"Applied background correction to {scan_name} with value {background_value}")
                 
-                # Clean up memory
-                cleanup_memory()
+                    # Clean up memory
+                    cleanup_memory()
                 
             except Exception as e:
                 error_msg = f"Error processing {scan_name}: {str(e)}"
@@ -4218,26 +4248,30 @@ class SaveThresholdValuesView(APIView):
         for scan_name, scan_values in values.items():
             try:
                 # Path to the scan's metadata JSON file
-                json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
+                # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): everything written for this
+                # subject is one transaction. A crash or an exception rolls back only this subject;
+                # the subjects already finished stay done. New derivative files go inside this
+                # block, written with the atomic_* helpers.
+                with subject_transaction(directory, scan_name, 'save_threshold_values'):
+                    json_path = os.path.join(directory, "extracted", scan_name, f"{scan_name}.json")
                 
-                if not os.path.exists(json_path):
-                    errors.append(f"Metadata file not found for {scan_name}")
-                    continue
+                    if not os.path.exists(json_path):
+                        errors.append(f"Metadata file not found for {scan_name}")
+                        continue
                 
-                # Load existing metadata
-                with open(json_path, 'r') as jf:
-                    metadata = json.load(jf)
+                    # Load existing metadata
+                    with open(json_path, 'r') as jf:
+                        metadata = json.load(jf)
                 
-                # Update threshold value if provided
-                if 'threshold' in scan_values:
-                    metadata['threshold'] = float(scan_values['threshold'])
-                    print(f"Updated threshold value for {scan_name}: {scan_values['threshold']}")
+                    # Update threshold value if provided
+                    if 'threshold' in scan_values:
+                        metadata['threshold'] = float(scan_values['threshold'])
+                        print(f"Updated threshold value for {scan_name}: {scan_values['threshold']}")
                 
-                # Save updated metadata
-                with open(json_path, 'w') as jf:
-                    json.dump(metadata, jf, indent=4)
+                    # Save updated metadata
+                    atomic_write_json(json_path, metadata, indent=4)
                 
-                updated_scans.append(scan_name)
+                    updated_scans.append(scan_name)
                 
             except Exception as e:
                 error_msg = f"Error updating {scan_name}: {str(e)}"

@@ -82,6 +82,10 @@ def load_project_settings(directory):
         return {}
 
 
+# CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+# an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+# here is covered by the transaction that the calling view or batch loop opens. Adding a
+# new derivative file? Use an atomic_* helper and keep it inside that transaction.
 def save_project_settings(directory, settings):
     """Atomically persist the full project_settings.json payload."""
     path = project_settings_path(directory)
@@ -191,14 +195,44 @@ def voxel_only_no_eligible_targets_message(tool_name):
     )
 
 
-def list_extracted_scan_names(directory):
+def is_extracted_subject_dir(directory, name):
+    """
+    True when ``extracted/<name>/`` is a real subject folder.
+
+    Every extracted subject carries its metadata file ``<name>.json``. Other
+    folders can sit next to the subjects (e.g. ``figures_cache`` written by the
+    report figures, or leftovers in older projects) and must not be treated as
+    subjects by batch tools.
+    """
+    return os.path.isfile(os.path.join(directory, "extracted", name, f"{name}.json"))
+
+
+def list_extracted_scan_names(directory, log_prefix=None):
+    """
+    Sorted subject folder names under ``extracted/``.
+
+    Only folders holding their ``<name>.json`` metadata are returned (see
+    ``is_extracted_subject_dir``); loose files such as ``project_settings.json``
+    and non-subject folders are skipped so batch tools adapt to older projects
+    instead of failing on a missing metadata file. When ``log_prefix`` is given,
+    each skipped folder is printed as a warning tagged ``[<log_prefix>]``.
+    """
     extracted_dir = os.path.join(directory, "extracted")
     if not os.path.isdir(extracted_dir):
         return []
-    return sorted(
-        name for name in os.listdir(extracted_dir)
-        if os.path.isdir(os.path.join(extracted_dir, name))
-    )
+    subject_names = []
+    for name in sorted(os.listdir(extracted_dir)):
+        if not os.path.isdir(os.path.join(extracted_dir, name)):
+            continue
+        if not is_extracted_subject_dir(directory, name):
+            if log_prefix:
+                print(
+                    f"[{log_prefix}] Skipping folder '{name}' in extracted/: "
+                    f"no {name}.json metadata (not a subject)"
+                )
+            continue
+        subject_names.append(name)
+    return subject_names
 
 
 def native_voxel_size_mm(metadata):
