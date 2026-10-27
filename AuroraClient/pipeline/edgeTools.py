@@ -23,6 +23,8 @@ from rest_framework import status
 import pygltflib
 
 from .preprocessingTools import cleanup_memory
+# Threaded, exact ball closing (same result as skimage's binary_closing; see parallelVolumeOps.py).
+from .parallelVolumeOps import binary_closing_ball
 # Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
 from .crashSafety import (
     crash_safe_view,
@@ -96,7 +98,7 @@ def _run_pipeline(volume, low, high, closing_radius, fill_holes,
     vol_norm = (volume - v_min) / (v_max - v_min)
 
     edges = filters.apply_hysteresis_threshold(vol_norm, low=low, high=high)
-    closed = morphology.binary_closing(edges, footprint=morphology.ball(closing_radius))
+    closed = binary_closing_ball(edges, closing_radius)
 
     # Fill small holes (remove_small_holes) — disabled for now; closing radius usually suffices
     # if fill_holes:
@@ -205,7 +207,7 @@ class EdgeDetectionSlicePreviewView(APIView):
         patch_norm = (raw_patch - v_min) / (v_max - v_min)
 
         edges = filters.apply_hysteresis_threshold(patch_norm, low=low, high=high)
-        closed = morphology.binary_closing(edges, footprint=morphology.ball(closing_radius))
+        closed = binary_closing_ball(edges, closing_radius)
         # if fill_holes:
         #     filled = morphology.remove_small_holes(closed, area_threshold=fill_area_threshold)
         # else:

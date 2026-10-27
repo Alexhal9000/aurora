@@ -14,6 +14,8 @@ from skimage import exposure
 import shutil
 
 from .registrationTools import RegistrationTools
+# Threaded, lower-memory CLAHE, bit-identical to skimage's (see parallelVolumeOps.py).
+from . import parallelVolumeOps
 from .preprocessingTools import has_elastic_registration, build_restore_settings
 from .batch_flag_filter import load_flagged_subject_names, apply_flag_filter, normalize_flag_filter_value
 from .linkedScans import filter_out_linked_children
@@ -51,7 +53,7 @@ class RestoreAllScansView(APIView):
         kernel_size_param = None if kernel_size == 0 else int(kernel_size)
         
         # Apply CLAHE
-        restored = exposure.equalize_adapthist(
+        restored = parallelVolumeOps.equalize_adapthist(
             data_normalized,
             kernel_size=kernel_size_param,
             clip_limit=clip_limit,

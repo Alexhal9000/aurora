@@ -4,6 +4,7 @@ import json
 import time
 import base64
 import shutil
+from types import SimpleNamespace
 import glob
 import io
 import re
@@ -85,6 +86,7 @@ from .crashSafety import (
 )
 from .registrationTools import RegistrationTools, generate_lossy_isometric_projection_png
 from .coordinateFrames import (
+    is_extracted_subject_dir,
     is_preserved_mesh_metadata,
     load_extracted_scan_metadata,
     list_extracted_scan_names,
@@ -766,10 +768,15 @@ class LinkScansView(APIView):
 class ListDirectoriesView(APIView):
     def get(self, request, *args, **kwargs):
         path = unquote(request.query_params.get('path', '~'))
+        clamped = False
         if networkFolders.is_remote_request(request) or networkFolders.running_as_service():
             # Network session, or the background service (which can only reach the shared
-            # folders anyway): start in and stay within the shared folders.
-            path = networkFolders.listing_start(path)
+            # folders anyway): start in and stay within the shared folders. "clamped" tells
+            # the browser to take the folder shown as its working folder ("~" there means
+            # this computer's home, which is not shared).
+            requested = path
+            path = networkFolders.listing_start(path, networkFolders.folders_for(request))
+            clamped = path != requested
         try:
             if path == "root":
                 path = "/"
@@ -787,6 +794,7 @@ class ListDirectoriesView(APIView):
                     'files': [],
                     'sizes': [],
                     'path': os.path.abspath(path),
+                    'clamped': clamped,
                     'missing': True,
                 }
                 response_json = json.dumps(response_data, ensure_ascii=False).encode('utf-8', 'replace').decode('utf-8')
@@ -826,7 +834,8 @@ class ListDirectoriesView(APIView):
                     'directories': directories,
                     'files': ['-- RESTRICTED PATH --'],
                     'sizes': ['-- RESTRICTED PATH --'],
-                    'path': os.path.abspath(path)
+                    'path': os.path.abspath(path),
+                    'clamped': clamped
                 }
 
                 response_json = json.dumps(response_data, ensure_ascii=False).encode('utf-8', 'replace').decode('utf-8')
@@ -837,7 +846,8 @@ class ListDirectoriesView(APIView):
                 'directories': directories,
                 'files': files,
                 'sizes': sizes,
-                'path': os.path.abspath(path)
+                'path': os.path.abspath(path),
+                    'clamped': clamped
             }
             
             response_json = json.dumps(response_data, ensure_ascii=False).encode('utf-8', 'replace').decode('utf-8')
@@ -1348,7 +1358,7 @@ class QuickAccessPathsView(APIView):
         # background service (its own home folder is empty), get the shared folders as
         # their shortcuts instead of this account's Home/Desktop/Documents/Downloads.
         if networkFolders.is_remote_request(request) or networkFolders.running_as_service():
-            shared = [str(folder).replace('\\', '/') for folder in networkFolders.shared_folders()]
+            shared = [str(folder).replace('\\', '/') for folder in networkFolders.folders_for(request)]
             return Response({
                 'shared': [{'label': os.path.basename(folder.rstrip('/')) or folder, 'path': folder}
                            for folder in shared],
@@ -12698,6 +12708,142 @@ class GetLandmarkHistogramView(APIView):
             'landmark_index': landmark_index,
             'subject_distances': subject_distances
         }, status=status.HTTP_200_OK)
+
+
+class DeleteExtractedScanView(APIView):
+    """
+    Delete a subject's extracted RAW scan (extracted/<name>/), never the original.
+
+    In the working-directory delete tool RAW is the bottom of the edit stack: edits are
+    removed newest to oldest (DeleteEditView), and once none are left the RAW extraction
+    is removed here like any other edit. The original file in the project root is not
+    touched, so the subject shows up again as not extracted.
+    """
+
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): the subject folder is removed with
+    # remove_subject_folder (one atomic move into .aurora_trash, then the slow delete), never
+    # shutil.rmtree, so a crash cannot leave a half-deleted subject in extracted/.
+    @crash_safe_view('delete_extracted_scan', lambda request: request_subjects(request, 'filename'))
+    def post(self, request):
+        directory = request.data.get('directory')
+        filename = request.data.get('filename')
+        if not directory or not filename:
+            return Response({'error': 'Missing directory or filename.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Only a plain subject folder name under extracted/ (never the atlas, never a path).
+        if (filename == "atlas" or filename in (".", "..")
+                or os.sep in filename or "/" in filename or (os.altsep and os.altsep in filename)):
+            return Response({'error': "Only an extracted subject's RAW scan can be deleted here."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not is_extracted_subject_dir(directory, filename):
+            return Response({'error': f'No extracted scan named {filename} in this project.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        scan_dir = os.path.join(directory, "extracted", filename)
+
+        # Same stack rule as DeleteEditView: RAW goes only after every edit is gone.
+        edit_re = re.compile(rf"^{re.escape(filename)}(?:_lossy)?_edit_\d+_")
+        if any(edit_re.match(f) for f in os.listdir(scan_dir)):
+            return Response({'error': 'This scan still has edits. Delete them first, then the RAW scan.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        print(f"\033[91mdeleting extracted RAW scan {filename} from {directory} (original kept)\033[0m")
+        remove_subject_folder(scan_dir)
+        return Response({'message': 'Extracted scan deleted.'}, status=status.HTTP_200_OK)
+
+
+class DeleteEditRangeView(APIView):
+    """
+    Delete a subject's edits from the last one down to a chosen edit, or down to and
+    including the extracted RAW scan (from_edit = "raw").
+
+    The working-directory delete tool lets the user pick any edit pill; everything above
+    it goes too, so the stack never keeps a gap. This view does that iteratively in the
+    engine: it deletes the current last edit with DeleteEditView, one at a time, until the
+    chosen edit is gone, and for "raw" finally removes extracted/<name>/ with
+    DeleteExtractedScanView (the original file is kept). Deleting top-down means every step
+    is an ordinary last-edit delete, including an elastic with a masked edit inserted
+    before it (the elastic goes first, then the masked edit).
+
+    All steps run in one transaction: if any step fails, the subject is rolled back to how
+    it was before the request, so no edit is ever left half deleted.
+    """
+
+    # Safety stop for the loop; no subject has anywhere near this many edits.
+    _MAX_STEPS = 1000
+
+    @staticmethod
+    def _top_edit(scan_dir, filename):
+        """Highest edit slot number in the subject folder, or None when it has no edits."""
+        slot_re = re.compile(rf"^{re.escape(filename)}(?:_lossy)?_edit_(\d+)_")
+        slots = [
+            int(m.group(1))
+            for m in (slot_re.match(f) for f in os.listdir(scan_dir)
+                      if os.path.isfile(os.path.join(scan_dir, f)))
+            if m
+        ]
+        return max(slots) if slots else None
+
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): the whole range is one transaction
+    # (the decorator below). The per-step DeleteEditView / DeleteExtractedScanView calls open
+    # their own transaction on the same subject, which joins this one, and an error response
+    # from any step is returned from here, so the decorator rolls back every step.
+    @crash_safe_view('delete_edit_range', lambda request: request_subjects(request, 'filename'))
+    def post(self, request):
+        directory = request.data.get('directory')
+        filename = request.data.get('filename')
+        from_edit = request.data.get('from_edit')
+        if not directory or not filename or from_edit is None:
+            return Response({'error': 'Missing directory, filename or from_edit.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        delete_raw = str(from_edit).lower() == 'raw'
+        if delete_raw:
+            stop_at = 0
+        else:
+            try:
+                stop_at = int(from_edit)
+            except (TypeError, ValueError):
+                return Response({'error': f'Invalid from_edit: {from_edit}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        sub_path = atlas_sub_path(directory) if filename == "atlas" else "extracted/" + filename
+        scan_dir = os.path.join(directory, sub_path)
+        if not os.path.isdir(scan_dir):
+            return Response({'error': f'No scan named {filename} in this project.'}, status=status.HTTP_400_BAD_REQUEST)
+        if delete_raw and filename == "atlas":
+            return Response({'error': "The atlas has no RAW scan to delete here."}, status=status.HTTP_400_BAD_REQUEST)
+
+        top = self._top_edit(scan_dir, filename)
+        if not delete_raw and (top is None or stop_at > top):
+            return Response({'error': f'Edit {stop_at} is not in the stack of {filename}.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        deleted = []
+        for _ in range(self._MAX_STEPS):
+            top = self._top_edit(scan_dir, filename)
+            if top is None or top < stop_at:
+                break
+            response = DeleteEditView().post(SimpleNamespace(data={
+                'directory': directory, 'filename': filename, 'edit': str(top),
+            }))
+            if getattr(response, 'status_code', 200) >= 400:
+                return response
+            if self._top_edit(scan_dir, filename) == top:
+                # The step reported success but the edit is still there: stop rather than loop.
+                return Response({'error': f'Edit {top} of {filename} could not be deleted.'},
+                                status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            deleted.append(top)
+        else:
+            return Response({'error': f'Too many edits to delete for {filename}.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        if delete_raw:
+            response = DeleteExtractedScanView().post(SimpleNamespace(data={
+                'directory': directory, 'filename': filename,
+            }))
+            if getattr(response, 'status_code', 200) >= 400:
+                return response
+
+        print(f"\033[91mdeleted edits {deleted}{' and the RAW scan' if delete_raw else ''} of {filename}\033[0m")
+        return Response({'message': 'Edits deleted.', 'deleted_edits': deleted, 'raw_deleted': delete_raw},
+                        status=status.HTTP_200_OK)
 
 
 class DeleteEditView(APIView):

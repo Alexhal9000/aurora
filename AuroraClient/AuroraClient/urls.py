@@ -48,8 +48,10 @@ from pipeline.engineAuth import (
     EngineAuthStatusView,
     EngineAuthTakeOverView,
     EngineJobsView,
+    EngineWorkspaceView,
 )
 from pipeline.engineSharing import EngineSharingView
+from pipeline.engineTerminal import EngineReportView, EngineTerminalPageView, EngineTerminalView
 from pipeline.staticMediaViews import StaticMediaView
 from pipeline.aiModels.foundation_views import (
     FoundationModelCancelView,
@@ -67,7 +69,11 @@ urlpatterns = [
     path('engine-auth/heartbeat/', EngineAuthHeartbeatView.as_view(), name='engine_auth_heartbeat'),
     path('engine-auth/take-over/', EngineAuthTakeOverView.as_view(), name='engine_auth_take_over'),
     path('engine-jobs/', EngineJobsView.as_view(), name='engine_jobs'),
+    path('engine-workspace/', EngineWorkspaceView.as_view(), name='engine_workspace'),
     path('engine-sharing/', EngineSharingView.as_view(), name='engine_sharing'),
+    path('engine-terminal/', EngineTerminalView.as_view(), name='engine_terminal'),
+    path('terminal/', EngineTerminalPageView.as_view(), name='engine_terminal_page'),
+    path('engine-report/', EngineReportView.as_view(), name='engine_report'),
     path('upload/', FileUploadView.as_view(), name='upload_file'),
     path('list-directories/', ListDirectoriesView.as_view(), name='list_directories'),
     path('quick-access-paths/', QuickAccessPathsView.as_view(), name='quick_access_paths'),
@@ -116,6 +122,8 @@ urlpatterns = [
     path('get-landmark-histogram/', GetLandmarkHistogramView.as_view(), name='get_landmark_histogram'),
     path('align-to-reference/', AlignToReferenceView.as_view(), name='align_to_reference'),
     path('delete-edit/', DeleteEditView.as_view(), name='delete_edit'),
+    path('delete-extracted-scan/', DeleteExtractedScanView.as_view(), name='delete_extracted_scan'),
+    path('delete-edit-range/', DeleteEditRangeView.as_view(), name='delete_edit_range'),
     path('elastic-registration/', ElasticRegistrationView.as_view(), name='elastic_registration'),
     path('mesh-elastic-registration/', MeshElasticRegistrationView.as_view(), name='mesh_elastic_registration'),
     path('create-atlas/', CreateAtlasView.as_view(), name='create_atlas'),

@@ -355,6 +355,37 @@ def _service_installed() -> bool:
         return False
 
 
+def _paired_elsewhere(record: dict, pairing: dict) -> bool:
+    here = (record.get("lab_origin") or "").rstrip("/")
+    there = (pairing.get("lab_origin") or "").rstrip("/")
+    return bool(here and there and here != there)
+
+
+def _pairing_unusable(pairing: dict) -> bool:
+    """Paired with a lab website this Aurora no longer trusts (e.g. a dev site, after the
+    shared service took over a developer's pairing): it can never check in there."""
+    there = (pairing.get("lab_origin") or "").rstrip("/")
+    return bool(there) and there not in engineConfig.trusted_lab_origins()
+
+
+def member_folders_payload() -> dict:
+    """For the owner and managers: each member (by the lab's last list) and the folders
+    they are limited to (None = all shared folders, or none while restrict_new is on)."""
+    settings = networkFolders.member_folder_settings()
+    members = []
+    for member in networkMode.current_group().get("members", []):
+        if not isinstance(member, dict) or str(member.get("role") or "member") != "member":
+            continue
+        user_id = str(member.get("user_id") or "")
+        members.append({
+            "user_id": user_id,
+            "name": str(member.get("name") or ""),
+            "blocked": bool(member.get("blocked")),
+            "folders": settings["members"].get(user_id),
+        })
+    return {"restrict_new": settings["restrict_new"], "members": members}
+
+
 def status_payload(record: dict) -> dict:
     config = engineConfig.load_config()
     service = networkFolders.running_as_service()
@@ -377,6 +408,15 @@ def status_payload(record: dict) -> dict:
         "server_name": pairing.get("server_name") or "",
         "paired": bool(pairing),
         "lab_origin": record.get("lab_origin") or pairing.get("lab_origin") or "",
+        # Paired with a different lab website than the one this session came from (e.g. a
+        # dev site): check-ins go there, so the website you use never sees this computer.
+        "paired_lab_origin": pairing.get("lab_origin") or "",
+        "paired_elsewhere": _paired_elsewhere(record, pairing),
+        # Re-pairing from Settings replaces a pairing that cannot work anyway; a working one
+        # on the shared service changes owner only with admin rights (sudo aurora-tools pair --reset).
+        "can_repair": bool(pairing) and _paired_elsewhere(record, pairing)
+                      and (not service or _pairing_unusable(pairing)),
+        "paired_owner": (pairing.get("owner") or {}).get("name") or "",
         "role": session_role(record),
         "can_manage": can_manage(record),
         "is_local": not record.get("remote"),
@@ -394,6 +434,12 @@ def status_payload(record: dict) -> dict:
         "jobs_running": len(engineJobs.running()),
         "request_ttl_hours": REQUEST_TTL_SECONDS // 3600,
     }
+    if record.get("remote") and not payload["can_manage"]:
+        # A member sees only the folders given to them, not the names of everyone else's.
+        payload["folders"] = [str(folder) for folder in
+                              networkFolders.member_folders(record.get("user_id"))]
+    if payload["can_manage"] and shared:
+        payload["member_folders"] = member_folders_payload()
     if not service and not shared and payload["can_turn_on"] and not payload["direct_mode"] and _service_installed():
         # The shared service is set up but this desktop Aurora is running anyway
         # (developer run, or the service failed to start): do not offer a second one.
@@ -425,16 +471,17 @@ def _quit_soon(seconds: float) -> None:
     threading.Thread(target=stop, name="aurora-handover", daemon=True).start()
 
 
-def turn_on(folders: list, port: int) -> tuple:
-    """Run the admin side with the system's admin prompt on this screen."""
+def turn_on(folders: list, port: int, pair_owner: str = "") -> tuple:
+    """Run the admin side with the system's admin prompt on this screen. pair_owner: the
+    lab account of the person turning it on; the shared service then pairs only with it."""
     if sys.platform == "win32":
-        return _turn_on_windows(folders, port)
+        return _turn_on_windows(folders, port, pair_owner)
     if sys.platform == "darwin":
-        return _turn_on_mac(folders, port)
+        return _turn_on_mac(folders, port, pair_owner)
     command = ["pkexec", HELPER, "enable"]
     for folder in folders:
         command += ["--folder", folder]
-    command += ["--port", str(port)]
+    command += ["--port", str(port), *_owner_args(pair_owner)]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=600)
     except FileNotFoundError:
@@ -454,12 +501,17 @@ def _folder_args(folders: list) -> list:
     return [item for folder in folders for item in ("--folder", folder)]
 
 
-def _turn_on_windows(folders: list, port: int) -> tuple:
+def _owner_args(pair_owner: str) -> list:
+    owner = str(pair_owner or "")
+    return ["--pair-owner", owner] if owner.isdigit() else []
+
+
+def _turn_on_windows(folders: list, port: int, pair_owner: str = "") -> tuple:
     """UAC prompt, then the admin tool in its own (hidden) window; it reports back through
     a result file because an elevated process cannot be read from here."""
     result_file = Path(tempfile.gettempdir()) / f"aurora-sharing-{secrets.token_hex(6)}.json"
     args = ["-I", str(_admin_tool()), "network", "enable", *_folder_args(folders), "--port", str(port),
-            "--owner-home", str(Path.home()), "--result-file", str(result_file)]
+            *_owner_args(pair_owner), "--owner-home", str(Path.home()), "--result-file", str(result_file)]
     arg_line = " ".join(f'"{arg}"' for arg in args)
     quote = lambda text: "'" + str(text).replace("'", "''") + "'"  # noqa: E731 - PowerShell literal
     script = (f"$p = Start-Process -FilePath {quote(sys.executable)} -ArgumentList {quote(arg_line)} "
@@ -487,11 +539,12 @@ def _turn_on_windows(folders: list, port: int) -> tuple:
     return True, output
 
 
-def _turn_on_mac(folders: list, port: int) -> tuple:
+def _turn_on_mac(folders: list, port: int, pair_owner: str = "") -> tuple:
     """macOS administrator password window (osascript), then the admin tool as root."""
     python = os.path.realpath(sys.executable)   # the pinned, root-owned CPython behind the venv
     command = " ".join(shlex.quote(str(part)) for part in [
         python, "-I", MAC_ADMIN_TOOL, "network", "enable", *_folder_args(folders), "--port", str(port),
+        *_owner_args(pair_owner),
         "--owner", getpass.getuser(), "--owner-home", str(Path.home())])
     escaped = command.replace("\\", "\\\\").replace('"', '\\"')
     script = (f'do shell script "{escaped} 2>&1" with administrator privileges '
@@ -570,20 +623,56 @@ class EngineSharingView(APIView):
             logger.warning("Turning network sharing off, asked by %s", record.get("name"))
             return done()
 
-        if action in ("pair_start", "pair_confirm", "pair_cancel"):
+        if action in ("pair_start", "pair_confirm", "pair_cancel", "pair_auto_confirm"):
             if record.get("remote"):
                 return refuse("Pair this computer from Aurora at the computer itself.")
             try:
+                owner_id = networkMode.pair_owner_id() if service else ""
+                if owner_id and str(record.get("user_id") or "") != owner_id and action != "pair_cancel":
+                    # Sharing was turned on from Settings by someone else: only they pair it
+                    # from Aurora (an admin can still pair by code: sudo aurora-tools pair).
+                    return refuse("Only the person who turned sharing on can pair this computer from Aurora.")
+                if (action == "pair_confirm" and owner_id and data.get("accept")
+                        and networkMode.claimed_by_id() not in ("", owner_id)):
+                    return refuse("This code was used by another lab account; cancel and pair again.")
                 if action == "pair_start":
-                    if networkMode.pairing_state():
+                    pairing = networkMode.pairing_state() or {}
+                    if pairing and not _paired_elsewhere(record, pairing):
                         return refuse("This computer is already paired.")
+                    if pairing and service and not _pairing_unusable(pairing):
+                        # The shared service's owner changes only with admin rights.
+                        return refuse("This computer is paired with another lab website. To pair it with "
+                                      "this one, in a terminal: sudo aurora-tools pair --reset")
+                    # Desktop Aurora paired with another lab website (e.g. a test site): the old
+                    # pairing stays until the new one is confirmed.
                     networkMode.pair_start(record.get("lab_origin") or "", data.get("name") or "")
                 elif action == "pair_confirm":
                     networkMode.pair_confirm(bool(data.get("accept")))
+                elif action == "pair_auto_confirm":
+                    networkMode.pair_auto_confirm(record.get("user_id") or "", record.get("lab_origin") or "")
                 else:
                     networkMode.pair_cancel()
             except ValueError as exc:
                 return refuse(str(exc))
+            return done()
+
+        if action == "member_folders":
+            # Narrows what members see inside the shared folders; no OS permission changes.
+            if not shared:
+                return refuse("Turn sharing on first.")
+            members = data.get("members") if isinstance(data.get("members"), dict) else {}
+            restrict_new = data.get("restrict_new")
+            if restrict_new is None:
+                restrict_new = networkFolders.member_folder_settings()["restrict_new"]
+            try:
+                saved = networkFolders.save_member_folders(bool(restrict_new), members)
+            except ValueError as exc:
+                return refuse(str(exc))
+            except OSError as exc:
+                return refuse(f"Could not save: {exc}", status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.info("Member folders changed by %s: %s (new members %s)", record.get("name"),
+                        {k: v for k, v in saved["members"].items() if k in members},
+                        "see nothing until given folders" if saved["restrict_new"] else "see all shared folders")
             return done()
 
         if action == "cancel_request":
@@ -649,7 +738,7 @@ class EngineSharingView(APIView):
                 return refuse("Sharing is already set up on this computer; open Aurora from the app menu to use it.")
             if engineJobs.running():
                 return refuse("Wait for the running job to finish: Aurora restarts as a shared service.")
-            ok, detail = turn_on(folders, port)
+            ok, detail = turn_on(folders, port, record.get("user_id") or "")
             if not ok:
                 return refuse(detail)
             # Remember the choice for next time (this desktop config stays in local mode).

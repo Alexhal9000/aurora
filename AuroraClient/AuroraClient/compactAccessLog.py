@@ -68,6 +68,7 @@ BACKGROUND_ENDPOINTS = {
     ('GET', '/engine-jobs/'): 'job checks',
     ('GET', '/get-version/'): 'version checks',
     ('GET', '/engine-sharing/'): 'sharing status',
+    ('GET', '/engine-terminal/'): 'terminal viewer',
 }
 BACKGROUND_SUMMARY_EVERY_S = 3600.0
 # Error lines keep the query string (useful to see the scan), but long ones are clipped.
@@ -176,6 +177,19 @@ class CompactAccessLogGenerator:
         status = details.get('status')
         duration = details.get('time_taken')
 
+        endpoint_only = full_path.split('?', 1)[0]
+        if (status is not None and int(status) == 409
+                and (method, endpoint_only) in BACKGROUND_ENDPOINTS):
+            # "In use by someone else" (shared computer, one person at a time): a window that
+            # lost the computer keeps checking until its notice is closed. Expected, so it is
+            # counted with the background checks instead of printed every 2 s.
+            with self._lock:
+                if not self._background:
+                    self._background_since = _now_label()
+                    self._background_started = time.monotonic()
+                label = 'in use elsewhere'
+                self._background[label] = self._background.get(label, 0) + 1
+            return
         if status is not None and int(status) >= 400:
             marker = '✗' if int(status) >= 500 else '!'
             shown = full_path if len(full_path) <= ERROR_PATH_MAX else full_path[:ERROR_PATH_MAX] + '…'
@@ -331,6 +345,13 @@ def install():
         return  # already installed (module re-import)
 
     def compact_factory(stream):
+        # daphne picks sys.stdout before it imports the app; use the stream as it is now
+        # (engineTerminal keeps a copy of the lines for the terminal viewer).
+        # Windows/macOS service runner: sys.stdout was its log file when daphne picked it,
+        # and engineTerminal has wrapped that same file since.
+        if sys.stdout is not None and (stream is sys.__stdout__
+                                       or getattr(sys.stdout, '_stream', None) is stream):
+            stream = sys.stdout
         try:
             return CompactAccessLogGenerator(stream, mode=mode)
         except Exception:

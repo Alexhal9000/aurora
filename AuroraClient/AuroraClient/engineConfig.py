@@ -53,7 +53,9 @@ PRODUCTION_LAB_ORIGINS = frozenset({
 })
 DEV_LAB_ORIGINS = frozenset(
     f"http://{host}:{port}"
-    for host in ("127.0.0.1", "localhost")
+    # 0.0.0.0: a dev site run with runserver 0.0.0.0:8004 and opened at that address signs
+    # passes with it as issuer.
+    for host in ("127.0.0.1", "localhost", "0.0.0.0")
     for port in range(8000, 8005)
 )
 

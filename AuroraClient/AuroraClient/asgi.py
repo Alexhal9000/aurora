@@ -28,6 +28,14 @@ compactAccessLog.install()
 
 django_asgi_app = get_asgi_application()
 
+# Keep recent terminal lines for the read-only viewer (/terminal/). See engineTerminal.py.
+from pipeline import engineTerminal  # noqa: E402
+engineTerminal.install()
+# Django logs every 4xx as a warning ("Conflict: /engine-jobs/"). 409 here is the shared
+# computer's "in use by someone else" answer, expected while another window holds it.
+import logging  # noqa: E402
+logging.getLogger("django.request").addFilter(lambda record: getattr(record, "status_code", None) != 409)
+
 # Imported after Django setup: engineAuth pulls in DRF.
 from pipeline.engineAuth import EngineSessionWebsocketMiddleware  # noqa: E402
 from pipeline import networkMode  # noqa: E402

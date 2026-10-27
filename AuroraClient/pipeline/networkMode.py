@@ -318,7 +318,35 @@ def pair_poll() -> dict:
             _pair_flow["state"] = "claimed"
             who = status_data.get("claimed_by") or {}
             _pair_flow["claimed_by"] = {"name": str(who.get("name") or "")[:120], "email": str(who.get("email") or "")[:200]}
+            # Lab account id (not shown): lets the signed-in person's own claim confirm itself.
+            _pair_flow["claimed_by_id"] = str(who.get("id") or "")
         return _pair_public(_pair_flow)
+
+
+def pair_owner_id() -> str:
+    """Lab account that turned sharing on from Settings (see set_network_mode), or ''."""
+    return str(engineConfig._read_raw().get("pair_owner_id") or "")
+
+
+def claimed_by_id() -> str:
+    with _pair_lock:
+        return _pair_flow.get("claimed_by_id") or ""
+
+
+def pair_auto_confirm(user_id: str, lab_origin: str) -> dict:
+    """Pairing from Aurora Settings by the person signed in at this computer: their browser
+    claimed the code with their own lab sign-in, so when the lab says the claim came from
+    that same account, confirm it without asking "is this you?". Anyone else's claim still
+    waits for the manual yes/no (pair_confirm)."""
+    flow = pair_poll()
+    with _pair_lock:
+        claimed_id = _pair_flow.get("claimed_by_id") or ""
+        flow_lab = (_pair_flow.get("lab_origin") or "").rstrip("/")
+    if flow.get("state") != "claimed":
+        return flow
+    if not (user_id and claimed_id == str(user_id) and flow_lab == (lab_origin or "").rstrip("/")):
+        return flow
+    return pair_confirm(True)
 
 
 def pair_confirm(accept: bool) -> dict:
@@ -340,6 +368,12 @@ def pair_confirm(accept: bool) -> dict:
         if confirm.status_code != 200:
             _pair_flow.update(state="failed", error=str(result.get("error") or confirm.status_code))
             return _pair_public(_pair_flow)
+        if (pairing_state() or {}).get("lab_origin") not in (None, flow["lab_origin"]):
+            # Re-paired with another lab website: its group belongs to the old one.
+            try:
+                _group_path().unlink()
+            except OSError:
+                pass
         _write_private_json(_pairing_path(), {
             "lab_origin": flow["lab_origin"],
             "server_name": result.get("server_name"),
@@ -518,6 +552,9 @@ def check_in_once(lease: dict | None = None) -> bool:
     return True
 
 
+_lab_unreachable: dict = {}   # lab origin -> True while its check-ins fail to connect
+
+
 def _check_in_post(state: dict, config: dict, lease, activity, reports: list) -> bool:
     try:
         response = signed_post(state["lab_origin"], "/auroraServerCheckIn", {
@@ -534,8 +571,15 @@ def _check_in_post(state: dict, config: dict, lease, activity, reports: list) ->
             "jobs": [item for item, _ended in reports],
         })
     except Exception as exc:  # noqa: BLE001 - lab unreachable: keep last known group
-        logger.info("Aurora check-in skipped (lab unreachable): %s", exc)
+        # Said once per outage (the loop retries every POLL_SECONDS * 2), not every time.
+        if not _lab_unreachable.get(state["lab_origin"]):
+            _lab_unreachable[state["lab_origin"]] = True
+            logger.warning("Aurora check-in: the lab website at %s cannot be reached (%s). This "
+                           "computer is paired with it; retrying quietly every minute.",
+                           state["lab_origin"], type(exc).__name__)
         return False
+    if _lab_unreachable.pop(state["lab_origin"], None):
+        logger.info("Aurora check-in: the lab website at %s answers again.", state["lab_origin"])
     if response.status_code == 404:
         # Unpaired on the website: forget the pairing; sharing stops.
         logger.warning("This computer was unpaired on the lab website.")
@@ -646,7 +690,7 @@ def _shared_folders_for_status() -> list:
     return raw if isinstance(raw, list) and raw else [str(Path.home() / "Documents") + " (default)"]
 
 
-def set_network_mode(enable: bool, shared_folders=None, network_port=None) -> int:
+def set_network_mode(enable: bool, shared_folders=None, network_port=None, pair_owner=None) -> int:
     """aurora-tools network enable|disable: edit engine.json and make the certificate.
 
     Takes effect when Aurora restarts (the HTTPS listener starts with Daphne). The Linux
@@ -665,6 +709,10 @@ def set_network_mode(enable: bool, shared_folders=None, network_port=None) -> in
         changes["shared_folders"] = folders
     if network_port:
         changes["network_port"] = int(network_port)
+    if enable and pair_owner:
+        # Lab account of whoever turned sharing on from Settings: only they may pair it
+        # from Aurora (engineSharing). Headless setups pair with the code (aurora-tools pair).
+        changes["pair_owner_id"] = str(pair_owner)
     engineConfig.write_config(**changes)
     if enable:
         ensure_tls_certificate()
@@ -692,6 +740,7 @@ def main(argv=None) -> int:
     network.add_argument("action", choices=("enable", "disable"))
     network.add_argument("--folder", action="append", help="folder to share (repeatable; default ~/Documents)")
     network.add_argument("--port", type=int, help="HTTPS port for other computers (default 8021)")
+    network.add_argument("--pair-owner", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING)
@@ -704,7 +753,7 @@ def main(argv=None) -> int:
     if args.command == "check-in":
         return 0 if check_in_once() else 1
     if args.command == "network":
-        return set_network_mode(args.action == "enable", args.folder, args.port)
+        return set_network_mode(args.action == "enable", args.folder, args.port, args.pair_owner)
     if args.command == "tls":
         if engineConfig.is_network_mode():
             ensure_tls_certificate()

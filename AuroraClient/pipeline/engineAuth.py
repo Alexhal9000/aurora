@@ -88,6 +88,14 @@ PUBLIC_PATH_PREFIXES = (
     "/get-version/",    # lab splash detection: version + engine_id only
     "/engine-auth/",    # sign-in / status / sign-out
     "/docs/",           # read-only bundled documentation (lab docs page reads it)
+    "/terminal/",       # terminal viewer page shell; its lines need a session (engineTerminal)
+)
+
+# Signed-in routes that do not take the one-person lease: watching the terminal must not
+# take the computer from whoever is using it, nor count as using it.
+LEASE_FREE_PATH_PREFIXES = (
+    "/engine-terminal/",
+    "/engine-report/",   # the report button works even while someone else uses Aurora
 )
 
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -561,6 +569,8 @@ def _session_payload(record: Optional[dict]) -> dict:
             # Opened from another computer: the SPA has no lab token then and takes the
             # name and level from here (the lab token never leaves the lab for a server).
             "network": bool(record.get("remote")),
+            # The lab website this session was signed by (developer runs move to the dev one).
+            "lab_origin": record.get("lab_origin") or "",
         })
     return payload
 
@@ -570,7 +580,21 @@ def engine_identity() -> dict:
     the shared background Aurora (1.9.4 network sharing), which launchers and the Settings
     hand-over wait for."""
     return {"engine_id": engineConfig.engine_id(), "engine_auth": PASS_VERSION,
-            "service": os.environ.get("AURORA_SERVICE") == "1"}
+            "service": os.environ.get("AURORA_SERVICE") == "1",
+            "dev_lab": dev_lab_origin()}
+
+
+def dev_lab_origin() -> str:
+    """Developer run (run_aurora.sh): the local dev lab site the page should use for
+    everything (sign-in, pairing, reports, My Aurora servers), or "" (installed Aurora, or
+    AURORA_DEV_LAB_URL=off)."""
+    if not engineSharing.dev_mode():
+        return ""
+    origin = os.environ.get("AURORA_DEV_LAB_URL", "").strip().rstrip("/")
+    if not origin or origin == "off":
+        return ""
+    origin = origin.replace("://0.0.0.0:", "://127.0.0.1:")
+    return origin if origin in engineConfig.trusted_lab_origins() else ""
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +645,9 @@ class EngineSessionMiddleware:
         if engineSharing.refuses_member(record):
             _end_session_key(session_key, engineSharing.PAUSED_MESSAGE)
             return JsonResponse({"error": engineSharing.PAUSED_MESSAGE, "code": "engine_session_ended"}, status=401)
+        if any(request.path.startswith(prefix) for prefix in LEASE_FREE_PATH_PREFIXES):
+            request.aurora_session = record
+            return self.get_response(request)
         conflict = claim_lease(session_key, record)
         if conflict is not None:
             return _in_use_response(conflict)
@@ -892,3 +919,71 @@ class EngineJobsView(APIView):
                 if not limited or job["user_id"] == user_id
             ]
         return Response(payload, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# Workspace: where each person was working, kept by the engine
+# ---------------------------------------------------------------------------
+
+_workspace_lock = threading.Lock()
+
+
+def _workspace_path() -> Path:
+    return engineConfig.config_dir() / "workspace.json"
+
+
+def _read_workspace() -> dict:
+    try:
+        data = json.loads(_workspace_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+class EngineWorkspaceView(APIView):
+    """GET/POST /engine-workspace/ {current_path} — the folder each lab account last had
+    open on this engine. The browser keeps its own copy too, but on a shared computer the
+    engine's copy wins when it is newer: after a take-over from another computer, Aurora
+    opens where that person left off. Only a path string is kept; listing it is still
+    subject to the shared-folder rules of every other view."""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request, *args, **kwargs):
+        record = getattr(request, "aurora_session", None)
+        if record is None:
+            return Response({"code": "engine_session_required"}, status=status.HTTP_401_UNAUTHORIZED)
+        with _workspace_lock:
+            entry = _read_workspace().get(str(record.get("user_id", ""))) or {}
+        return Response({"current_path": entry.get("current_path") or "",
+                         "updated_at": entry.get("updated_at") or 0}, status=status.HTTP_200_OK)
+
+    def post(self, request, *args, **kwargs):
+        record = getattr(request, "aurora_session", None)
+        if record is None:
+            return Response({"code": "engine_session_required"}, status=status.HTTP_401_UNAUTHORIZED)
+        data = request.data if hasattr(request.data, "get") else {}
+        path = data.get("current_path")
+        if not isinstance(path, str) or not path or len(path) > 4096 or "\x00" in path:
+            return Response({"error": "current_path must be a folder path."}, status=status.HTTP_400_BAD_REQUEST)
+        user_id = str(record.get("user_id", ""))
+        if not user_id:
+            return Response({"error": "No lab account on this session."}, status=status.HTTP_400_BAD_REQUEST)
+        now = time.time()
+        with _workspace_lock:
+            workspace = _read_workspace()
+            workspace[user_id] = {"current_path": path, "updated_at": now}
+            # Bounded: the 200 most recently active accounts.
+            if len(workspace) > 200:
+                keep = sorted(workspace.items(), key=lambda item: item[1].get("updated_at", 0))[-200:]
+                workspace = dict(keep)
+            target = _workspace_path()
+            tmp = target.with_suffix(".tmp")
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp.write_text(json.dumps(workspace) + "\n", encoding="utf-8")
+                os.replace(tmp, target)
+            except OSError as exc:
+                return Response({"error": f"Could not save: {exc}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({"current_path": path, "updated_at": now}, status=status.HTTP_200_OK)

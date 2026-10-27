@@ -24,7 +24,8 @@ takes to start a worker would cost more than the call.
 Temp files (the system temp folder is RAM on many Linux machines, ~1.5 GB per warp):
   * every worker run folder is named aurora-ants-<engine pid>-*, so a folder whose engine
     is no longer running is known to be stale (sweep_stale_temp: project open and every
-    registration);
+    registration). A running engine's folders are never swept, not even empty ones: a
+    run folder stays empty until ANTs writes its transforms at the end;
   * remove_temp_outputs(paths) deletes a registration's outputs once the caller has
     copied what it needs;
   * a view wrapped in @temp_scoped removes, when it returns or fails, every run folder
@@ -130,10 +131,15 @@ def _pid_alive(pid: int) -> bool:
 
 def sweep_stale_temp() -> int:
     """
-    Remove ANTs worker run folders nobody can still need: empty ones, and ones whose
-    engine (pid in the name) is no longer running, e.g. after a kill or a crash in the
-    middle of a registration. Folders of a running engine, this one included, are left
-    alone. Old-style folders without a pid are removed only once they are a day old.
+    Remove ANTs worker run folders nobody can still need: ones whose engine (pid in the
+    name) is no longer running, e.g. after a kill or a crash in the middle of a
+    registration. Folders of a running engine, this one included, are always left alone,
+    EVEN WHEN EMPTY: a live run folder stays empty until ANTs writes its transforms at the
+    very end of the registration, so removing empty folders deleted folders of runs still
+    in progress (another request, a page load or a take-over from a second computer runs
+    this sweep) and the worker then failed to write its Warp files after minutes of work.
+    A running engine's folders are removed by the request that made them (temp_scope /
+    registration). Old-style folders without a pid are removed when empty or a day old.
     Returns the number of folders removed.
     """
     removed = 0
@@ -144,16 +150,16 @@ def sweep_stale_temp() -> int:
     for entry in entries:
         if not entry.is_dir():
             continue
-        try:
-            entry.rmdir()  # only succeeds when empty
-            removed += 1
-            continue
-        except OSError:
-            pass
         match = _RUN_DIR_PID_RE.match(entry.name)
         if match:
             stale = not _pid_alive(int(match.group(1)))
         else:
+            try:
+                entry.rmdir()  # only succeeds when empty
+                removed += 1
+                continue
+            except OSError:
+                pass
             try:
                 stale = time.time() - entry.stat().st_mtime > 24 * 3600
             except OSError:
@@ -252,11 +258,22 @@ def temp_scope():
 
 
 def temp_scoped(view_method):
-    """Decorator for views that run registrations: their ANTs temp files never outlive the request."""
+    """
+    Decorator for views that run registrations: their ANTs temp files never outlive the
+    request. A failed worker (AntsWorkerError) is answered with a JSON 500 whose "error"
+    is the worker's readable reason (out of memory, temp folder deleted, ANTs error), so
+    the tool and the job history show it instead of a bare "Request failed (500)".
+    """
     @functools.wraps(view_method)
     def wrapper(*args, **kwargs):
-        with temp_scope():
-            return view_method(*args, **kwargs)
+        try:
+            with temp_scope():
+                return view_method(*args, **kwargs)
+        except AntsWorkerError as exc:
+            traceback.print_exc()
+            from rest_framework import status
+            from rest_framework.response import Response
+            return Response({"error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     return wrapper
 
 
@@ -422,6 +439,11 @@ def registration(return_images: bool = False, **kwargs) -> dict:
             outcome = None
         if returncode != 0 or outcome is None:
             detail = (outcome or {}).get("error") if isinstance(outcome, dict) else None
+            if not detail and not os.path.isdir(work_dir):
+                # The worker cannot write its transforms or result into a missing folder.
+                detail = (f"its temporary folder {work_dir} was deleted while it was running "
+                          f"(by another program or a system temp cleanup), so the result "
+                          f"could not be saved. Please run the registration again")
             raise AntsWorkerError(
                 f"ANTs registration failed: {detail or _describe_exit(returncode)}."
             )
@@ -482,8 +504,13 @@ def _worker_main(result_path: str) -> int:
         outcome = {"result": _pack({key: value for key, value in result.items() if key in keep})}
     except Exception as exc:  # noqa: BLE001 - reported to the engine
         outcome = {"error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()}
-    with open(result_path, "wb") as handle:
-        pickle.dump(outcome, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    try:
+        with open(result_path, "wb") as handle:
+            pickle.dump(outcome, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    except OSError as exc:
+        # Run folder gone (see sweep_stale_temp): the engine explains it from the exit code.
+        print(f"[ANTs worker] could not write the result: {exc}", file=sys.stderr, flush=True)
+        return 2
     return 0
 
 
