@@ -28,17 +28,28 @@ The four rules (every method that writes project data follows them)
        with SubjectTransaction(scan_dir, 'crop'):
            ...
 
-   On entry the subject folder is journalled in "<scan_dir>/.aurora_txn/": a listing
-   of its files, a real copy of every JSON file, and a hard link to every other file
-   (nothing on filesystems without hard links, e.g. exFAT). Because rule 1 always
-   replaces files rather than rewriting them, a hard link keeps the original content.
-   A file that must be changed in place, or any existing non-JSON file on exFAT, needs
-   txn.preserve(path) before it is touched. Deleting the journal
-   file is the commit. If the method raises, or the engine dies before the commit, the
-   rollback deletes every file that was not there before and puts back every file that
-   changed, so the subject is byte-for-byte as before. Deletes and renames that are part
-   of the operation go through txn.remove(path) / txn.rename(src, dst) so they can be
-   undone too.
+   On entry the subject folder is journalled in "<scan_dir>/.aurora_txn/journal.json"
+   (journal version 2): the names of its files, the size and modification
+   time of each data file, and, in a folder of its own for this one transaction
+   (".aurora_txn/<id>/"), a real copy of every JSON file. Nothing else is copied or
+   linked up front. Instead the journal is an undo log: just before an existing file is
+   replaced, deleted or renamed, the original is moved into ".aurora_txn/<id>/held/" by
+   a rename (instant for any size, on any filesystem) and the step is logged first.
+   atomic_output does this by itself, so every atomic_* helper is covered; other writers
+   use tracked_replace(src, dst), tracked_remove(path), tracked_rename(src, dst) or
+   txn.remove / txn.rename. A file that must be changed IN PLACE needs txn.preserve(path)
+   (a copy) before it is touched. Deleting the journal file is the commit. If the method
+   raises, or the engine dies before the commit, the rollback replays the log newest
+   first, deletes every file that was not there before and puts back every JSON file,
+   so the subject is byte-for-byte as before. A data file changed any other way (a raw
+   os.replace / os.remove) cannot be undone: the commit prints a warning naming it, so
+   the writer can be fixed.
+
+   Why no hard links (1.9.4 / 1.9.5 linked every file up front): a hard link carries the
+   original's owner, permissions and Windows read-only flag, some network storage
+   (SMB) refuses them, and on NFS a linked file still open somewhere leaves a ".nfsXXXX"
+   file behind, so journal folders could not always be deleted. Journals written by those
+   versions are still recovered (_rollback_v1).
 
 4. LINKED SUBJECTS COMMIT TOGETHER. When one operation changes several subjects that
    must stay in step (linked scans replaying an edit on their siblings), wrap them in
@@ -48,12 +59,30 @@ The four rules (every method that writes project data follows them)
 
 Recovery
 --------
-recover_project(directory) runs when a project is opened (GetProjectSettingsView) and
+recover_project(directory) runs when a project is opened (GetProjectSettingsView), before
+the first POST naming the project after an engine start (RecoverInterruptedWork, so a
+batch view's "already done?" checks never see a dead run's half-written outputs), and
 SubjectTransaction recovers a subject itself before starting on it. A journal belongs
-to a live run only when it carries this process's ENGINE_BOOT_ID and is registered as
-active here; anything else is left over from a dead engine and is rolled back (or
-forward, for a committed linked group). Leftover hidden temp files and orphaned
+to a live run when it carries this process's ENGINE_BOOT_ID and is registered as
+active here, or when the other engine process on this computer that wrote it is still
+running (_live_foreign_owner); anything else is left over from a dead engine and is
+rolled back (or forward, for a committed linked group). Leftover hidden temp files and orphaned
 ".nii.removal_mask.gz" files are swept as well.
+
+Journal folders that cannot be deleted
+--------------------------------------
+Deleting ".aurora_txn" can still fail: a sync client (OneDrive, Dropbox) or antivirus
+holding a file open on Windows, storage that lets Aurora create files but not delete
+them (some network mounts), or a folder made by another account (desktop Aurora vs the
+aurora-tools sharing service). Such a leftover never blocks a tool:
+  - every transaction writes into a new ".aurora_txn/<id>/" folder, so it never writes
+    onto a leftover file;
+  - a ".aurora_txn" folder that will not go, or that this account cannot write in, is
+    renamed aside to ".aurora_txn-stale-<id>" and swept on project open; if even that
+    fails, the engine log prints a command that gives this account the rights it needs
+    (_print_cleanup_help);
+  - a rollback first renames journal.json to rollback.json: if it cannot, it stops
+    before touching the subject, and once done it can never be replayed over newer work.
 
 Adding a new derivative file to a method? Write it inside that method's transaction,
 through an atomic_* helper. If it is a regenerable cache outside any transaction, an
@@ -71,6 +100,9 @@ import gzip
 import json
 import os
 import shutil
+import socket
+import stat
+import sys
 import threading
 import time
 import uuid
@@ -81,6 +113,11 @@ ENGINE_BOOT_ID = uuid.uuid4().hex
 TEMP_MARKER = '.csp-tmp-'
 TXN_DIRNAME = '.aurora_txn'
 TXN_JOURNAL = 'journal.json'
+# journal.json is renamed to this while it is being rolled back (see _claim_journal).
+TXN_ROLLBACK = 'rollback.json'
+# A ".aurora_txn" folder that could not be deleted or written in is renamed to
+# ".aurora_txn-stale-<id>" so the next transaction starts clean (swept on project open).
+TXN_STALE_PREFIX = TXN_DIRNAME + '-stale-'
 GROUP_DIRNAME = '.aurora_txn_groups'
 # Project-level folder that whole subject folders are moved into before they are deleted.
 TRASH_DIRNAME = '.aurora_trash'
@@ -101,6 +138,27 @@ _KNOWN_EXTENSIONS = (
 # ---------------------------------------------------------------------------
 # Rule 1: atomic files
 # ---------------------------------------------------------------------------
+
+def _read_umask():
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+# Mode a plain open() gives a new file in this process (0o666 minus the umask). Writers
+# that create their temp file with tempfile.mkstemp (always 0600) set it afterwards: with
+# the shared service, a 0600 file in a shared folder is unreadable for the other account
+# (desktop Aurora vs the aurora-tools service), because its access-list mask becomes empty.
+NEW_FILE_MODE = 0o666 & ~_read_umask()
+
+
+def match_new_file_mode(path):
+    """Give a mkstemp temp file the mode open() would have given it (see NEW_FILE_MODE)."""
+    try:
+        os.chmod(path, NEW_FILE_MODE)
+    except OSError:
+        pass
+
 
 def _temp_sibling(path):
     """Hidden temp path in the target's folder that keeps a writer-recognisable extension."""
@@ -181,6 +239,11 @@ def atomic_output(path):
         if not os.path.exists(tmp):
             raise FileNotFoundError(f"atomic_output: writer did not create {tmp}")
         _fsync_path(tmp)
+        txn = _active_txn_for(path)
+        if txn is not None:
+            # CRASH-SAFE PROTOCOL: the file being replaced is moved into the open
+            # transaction (rule 3), so a rollback can put it back.
+            txn.stash(path)
         _replace_with_retry(tmp, path)
         fsync_dir(directory)
     except BaseException:
@@ -330,8 +393,31 @@ def _visible_entries(scan_dir):
     return sorted(name for name in names if not name.startswith('.'))
 
 
+# Journal keys that hold paths of kept / removed files. On disk they are relative to the
+# subject folder, so recovery still works when the project is reached through another
+# path (a storage server mounted elsewhere, another computer, a new drive letter).
+# In memory they are absolute. Journals from 1.9.4/1.9.5 hold absolute paths, still read.
+def _journal_paths(journal, convert):
+    out = dict(journal)
+    if 'kept' in journal:
+        out['kept'] = {name: convert(path) for name, path in (journal.get('kept') or {}).items()}
+    if 'removed' in journal:
+        out['removed'] = [[name, convert(path)] for name, path in (journal.get('removed') or [])]
+    if 'json_kept' in journal:
+        out['json_kept'] = {name: convert(path) for name, path in (journal.get('json_kept') or {}).items()}
+    if 'log' in journal:
+        # [op, name, held file] for stash / remove / copy; [op, src name, dst name] for rename.
+        out['log'] = [step if step[0] == 'rename' else [step[0], step[1], convert(step[2])]
+                      for step in journal.get('log') or []]
+    if journal.get('work_dir'):
+        out['work_dir'] = convert(journal['work_dir'])
+    return out
+
+
 def _write_journal(txn_dir, journal):
-    atomic_write_json(os.path.join(txn_dir, TXN_JOURNAL), journal, indent=1)
+    scan_dir = os.path.dirname(txn_dir)
+    on_disk = _journal_paths(journal, lambda path: os.path.relpath(path, scan_dir))
+    atomic_write_json(os.path.join(txn_dir, TXN_JOURNAL), on_disk, indent=1)
 
 
 class SubjectTransaction:
@@ -354,10 +440,14 @@ class SubjectTransaction:
         self.group_id = group_id
         self.group_marker = group_marker
         self.txn_dir = os.path.join(self.scan_dir, TXN_DIRNAME)
+        # This transaction's own folder for kept and removed files (see _begin).
+        self.work_dir = os.path.join(self.txn_dir, uuid.uuid4().hex[:12])
         self._outer = None
         self._lock = None
         self._journal = None
-        self._linked = True
+        # Journal changes can come from more than one thread (a worker pool writing outputs
+        # of the subject through atomic_output), so they are serialised.
+        self._journal_lock = threading.Lock()
         self._finished = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -415,44 +505,82 @@ class SubjectTransaction:
 
     def _begin(self):
         os.makedirs(self.scan_dir, exist_ok=True)
-        os.makedirs(os.path.join(self.txn_dir, 'keep'), exist_ok=True)
+        _open_work_dir(self.scan_dir, self.work_dir)
+        try:
+            self._journal_subject()
+        except BaseException:
+            # Nothing in the subject has been touched yet: only this attempt's folder goes.
+            _drop_txn_dir(self.work_dir)
+            _drop_txn_dir_if_empty(self.txn_dir)
+            raise
+
+    def _journal_subject(self):
+        """
+        Journal version 2: the names of the subject's files, a real copy of every JSON file
+        and the size and modification time of every other file. Data files are not copied
+        or linked up front: whatever the tool replaces, deletes or renames is moved into
+        this transaction's folder by a rename at that moment (stash / remove / rename), so
+        the cost is the same for a 2 GB scan as for a text file, and no hard links are made.
+        """
         entries = _visible_entries(self.scan_dir)
-        kept = {}
-        self._linked = True
+        json_kept = {}
+        stats = {}
+        os.makedirs(os.path.join(self.work_dir, 'held'), exist_ok=True)
         for index, name in enumerate(entries):
             path = os.path.join(self.scan_dir, name)
             if not os.path.isfile(path):
                 continue
-            keep_path = os.path.join(self.txn_dir, 'keep', f"{index:05d}")
             if name.lower().endswith('.json'):
                 # Always a real copy: JSON is small, and some writers still rewrite it in
-                # place (open(path, 'w')), which would change a hard link's content too.
-                shutil.copy2(path, keep_path)
-                kept[name] = keep_path
-                continue
-            if self._linked:
+                # place (open(path, 'w')). copyfile, not copy2: the copy is ours to delete
+                # later, so it must not take a read-only flag or another account's mode.
+                keep_path = os.path.join(self.work_dir, 'keep', f"{index:05d}")
                 try:
-                    os.link(path, keep_path)
-                    kept[name] = keep_path
-                    continue
-                except OSError:
-                    self._linked = False  # e.g. exFAT/FAT32: only JSON is kept up front
+                    shutil.copyfile(path, keep_path)
+                except PermissionError as exc:
+                    raise PermissionError(
+                        f"Aurora cannot read {path} ({exc.strerror}), so it cannot protect "
+                        f"{os.path.basename(self.scan_dir)} against a crash. The file was probably "
+                        "made by another account (for example the shared Aurora service); "
+                        "give this account read access to it."
+                    ) from exc
+                json_kept[name] = keep_path
+                continue
+            info = os.stat(path)
+            stats[name] = [info.st_size, info.st_mtime_ns]
         self._journal = {
-            'version': 1,
+            'version': 2,
             'boot_id': ENGINE_BOOT_ID,
             'pid': os.getpid(),
+            'host': socket.gethostname(),
             'operation': self.operation,
             'started_at': time.time(),
             'group_id': self.group_id,
             'group_marker': self.group_marker,
             'entries': entries,
-            'kept': kept,          # name -> journal copy of its original
-            'removed': [],         # [name, journal path] moved out as part of the operation
-            'renames': [],         # [src name, dst name] in the order they happened
-            'hard_links': self._linked,
+            'json_kept': json_kept,  # name -> copy of the JSON file as it was
+            'stats': stats,          # name -> [size, mtime_ns] of every other file
+            'log': [],               # undo log, replayed newest first by a rollback
+            'work_dir': self.work_dir,
         }
         _write_journal(self.txn_dir, self._journal)
         fsync_dir(self.scan_dir)
+
+    def _held_path(self):
+        return os.path.join(self.work_dir, 'held', f"{len(self._journal['log']):05d}")
+
+    def _log(self, step):
+        """Record a step BEFORE doing it: the rollback skips steps that never happened."""
+        self._journal['log'].append(step)
+        _write_journal(self.txn_dir, self._journal)
+
+    def _logged_names(self):
+        names = set()
+        for step in self._journal['log']:
+            names.add(step[1])
+            if step[0] == 'rename':
+                names.add(step[2])
+        return names
 
     # -- operations that must be reversible --------------------------------
     def _name(self, path):
@@ -465,23 +593,43 @@ class SubjectTransaction:
         """
         Keep a real copy of an existing file this transaction will change IN PLACE
         (anything not replaced through an atomic_* helper, e.g. a library that rewrites
-        the file it was given). The up-front hard link would see such a change, a copy
-        does not. Files only ever replaced atomically need no call.
+        the file it was given). Files replaced through atomic_output, tracked_replace,
+        tracked_remove or tracked_rename need no call. JSON files are always copied.
         """
         if self._outer is not None:
             return self._outer.preserve(path)
         name = self._name(path)
-        if not os.path.isfile(path):
+        if not os.path.isfile(path) or name in self._journal['json_kept'] or name not in self._journal['entries']:
             return
-        previous = self._journal['kept'].get(name)
-        if previous and not os.path.samefile(previous, path):
-            return  # already an independent copy
-        keep_path = os.path.join(self.txn_dir, 'keep', f"p{len(self._journal['kept']):05d}")
-        shutil.copy2(path, keep_path)
-        self._journal['kept'][name] = keep_path
-        _write_journal(self.txn_dir, self._journal)
-        if previous:
-            _silent_remove(previous)
+        with self._journal_lock:
+            if name in self._logged_names():
+                return  # its original is already held (or it is this run's own output)
+            held = self._held_path()
+            self._log(['copy', name, held])
+            shutil.copyfile(path, held)
+
+    def stash(self, path):
+        """
+        Move the existing file at `path` into the journal because it is about to be
+        replaced (atomic_output and tracked_replace call this). Only the first change of
+        an original file is kept; this run's own outputs, and files outside the subject
+        folder's top level, need nothing. Returns True when the file was moved away.
+        """
+        if self._outer is not None:
+            return self._outer.stash(path)
+        try:
+            name = self._name(path)
+        except ValueError:
+            return False  # e.g. debug_alignment/...: sub-folders are not journalled
+        if not os.path.lexists(path) or name not in self._journal['entries'] or name in self._journal['json_kept']:
+            return False
+        with self._journal_lock:
+            if name in self._logged_names():
+                return False
+            held = self._held_path()
+            self._log(['stash', name, held])
+            os.replace(path, held)
+        return True
 
     def remove(self, path):
         """Delete a file as part of the operation (undone by a rollback)."""
@@ -490,22 +638,43 @@ class SubjectTransaction:
         name = self._name(path)
         if not os.path.lexists(path):
             return
-        held = os.path.join(self.txn_dir, 'removed', f"{len(self._journal['removed']):05d}")
-        os.makedirs(os.path.dirname(held), exist_ok=True)
-        self._journal['removed'].append([name, held])
-        _write_journal(self.txn_dir, self._journal)
-        os.replace(path, held)
+        with self._journal_lock:
+            held = self._held_path()
+            self._log(['remove', name, held])
+            os.replace(path, held)
 
     def rename(self, src, dst):
         """Rename inside the subject folder (undone by a rollback)."""
         if self._outer is not None:
             return self._outer.rename(src, dst)
         src_name, dst_name = self._name(src), self._name(dst)
-        if os.path.exists(dst):
+        if os.path.lexists(dst):
             self.remove(dst)
-        self._journal['renames'].append([src_name, dst_name])
-        _write_journal(self.txn_dir, self._journal)
-        os.replace(src, dst)
+        with self._journal_lock:
+            self._log(['rename', src_name, dst_name])
+            os.replace(src, dst)
+
+    def _unprotected_changes(self):
+        """
+        Data files that changed, or went away, without going through the helpers above
+        (a raw os.replace / os.remove / in-place write). A rollback cannot undo those;
+        they are reported so the writer can be fixed.
+        """
+        logged = self._logged_names()
+        changed = []
+        for name, (size, mtime_ns) in (self._journal.get('stats') or {}).items():
+            if name in logged:
+                continue
+            try:
+                info = os.stat(os.path.join(self.scan_dir, name))
+            except FileNotFoundError:
+                changed.append(name)
+                continue
+            except OSError:
+                continue
+            if info.st_size != size or info.st_mtime_ns != mtime_ns:
+                changed.append(name)
+        return changed
 
     # -- outcome -------------------------------------------------------------
     def commit(self):
@@ -515,9 +684,21 @@ class SubjectTransaction:
             # The operation deleted the whole subject (remove_subject_folder): nothing to commit.
             self._finished = True
             return
+        unprotected = self._unprotected_changes()
+        if unprotected:
+            print(f"[crash-safe] warning: '{self.operation}' changed {', '.join(sorted(unprotected))} in "
+                  f"{os.path.basename(self.scan_dir)} without the crash-safe helpers; a crash during "
+                  "it could not have undone that (see pipeline/crashSafety.py)")
         fsync_dir(self.scan_dir)
         journal_path = os.path.join(self.txn_dir, TXN_JOURNAL)
-        os.remove(journal_path)          # <- the commit point
+        try:
+            _remove_with_retry(journal_path)          # <- the commit point
+        except OSError as exc:
+            raise PermissionError(
+                f"'{self.operation}' finished on {os.path.basename(self.scan_dir)}, but Aurora could "
+                f"not mark it as done ({journal_path}: {exc.strerror}), so it will be undone the "
+                "next time this subject is used. " + _ACCESS_HINT
+            ) from exc
         _drop_txn_dir(self.txn_dir)
         self._finished = True
 
@@ -527,20 +708,142 @@ class SubjectTransaction:
         if not os.path.isdir(self.scan_dir):
             self._finished = True
             return
-        _rollback_from_journal(self.scan_dir, self._journal)
+        with self._journal_lock:
+            _rollback_from_journal(self.scan_dir, self._journal)
         self._finished = True
+
+
+# Added to the permission errors below: what usually causes them and what fixes them.
+_ACCESS_HINT = (
+    "Usually another program is holding a file in its hidden .aurora_txn folder (a sync "
+    "client such as OneDrive or Dropbox, or antivirus), or the folder was made by another "
+    "account (for example the shared Aurora service). Pause syncing for the project or "
+    "give this account full access to the project folder, then try again."
+)
+
+
+def _remove_with_retry(path, retries=6, delay=0.05):
+    """os.remove, retried: on Windows a reader (sync client, antivirus) holding `path` makes it fail briefly."""
+    for attempt in range(retries):
+        try:
+            os.remove(path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay * (attempt + 1))
+
+
+def _clear_readonly_and_retry(function, path, exc):
+    """
+    shutil.rmtree onexc: Windows will not delete a read-only file, so clear the flag and
+    try again. Only on a file with no other name: a hard link from a 1.9.4 / 1.9.5 journal
+    shares the flag with the subject's own file, which must stay read-only.
+    """
+    try:
+        info = os.lstat(path)
+        if os.name == 'nt' and not info.st_mode & stat.S_IWRITE and info.st_nlink <= 1:
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+            return
+    except OSError:
+        pass
+    raise exc
+
+
+def _set_aside(txn_dir):
+    """
+    Rename a ".aurora_txn" folder that will not go away to ".aurora_txn-stale-<id>"
+    (swept on project open), so the next transaction does not trip over it. Renaming
+    needs write access to the subject folder only. Returns True when the name is free.
+    """
+    if os.path.basename(txn_dir) != TXN_DIRNAME:
+        return False
+    stale = os.path.join(os.path.dirname(txn_dir), f"{TXN_STALE_PREFIX}{uuid.uuid4().hex[:8]}")
+    try:
+        os.replace(txn_dir, stale)
+    except OSError as exc:
+        print(f"[crash-safe] could not remove or set aside {txn_dir}: {exc}")
+        return False
+    print(f"[crash-safe] {txn_dir} could not be deleted; renamed to {os.path.basename(stale)}")
+    return True
 
 
 def _drop_txn_dir(txn_dir):
     for attempt in range(5):
         try:
-            shutil.rmtree(txn_dir)
+            shutil.rmtree(txn_dir, onexc=_clear_readonly_and_retry)
             return
         except FileNotFoundError:
             return
         except OSError:
             time.sleep(0.1 * (attempt + 1))
     shutil.rmtree(txn_dir, ignore_errors=True)
+    if os.path.lexists(txn_dir):
+        _set_aside(txn_dir)
+
+
+def _drop_txn_dir_if_empty(txn_dir):
+    try:
+        os.rmdir(txn_dir)
+    except OSError:
+        pass
+
+
+def _no_write_access(folder, exc):
+    import getpass
+    try:
+        account = getpass.getuser()
+    except Exception:
+        account = 'this account'
+    return PermissionError(
+        f"Aurora (running as {account}) cannot write in {folder} ({exc.strerror}), so it cannot "
+        "start this tool safely. " + _ACCESS_HINT
+    )
+
+
+def _open_work_dir(scan_dir, work_dir):
+    """
+    Create a transaction's own folder, `.aurora_txn/<id>/keep`. A `.aurora_txn` this
+    account cannot write in, left behind by another account with no journal in it, is
+    renamed aside first (see the module docstring).
+    """
+    txn_dir = os.path.dirname(work_dir)
+    keep_dir = os.path.join(work_dir, 'keep')
+    try:
+        os.makedirs(keep_dir)
+        return
+    except PermissionError as exc:
+        first_error = exc
+    has_journal = any(os.path.lexists(os.path.join(txn_dir, name)) for name in (TXN_JOURNAL, TXN_ROLLBACK))
+    if not os.path.isdir(txn_dir) or has_journal or not _set_aside(txn_dir):
+        raise _no_write_access(txn_dir if os.path.isdir(txn_dir) else scan_dir, first_error) from first_error
+    try:
+        os.makedirs(keep_dir)
+    except PermissionError as exc:
+        raise _no_write_access(scan_dir, exc) from exc
+
+
+def _claim_journal(scan_dir, txn_dir):
+    """
+    Rename journal.json to rollback.json before a rollback changes anything. If that is
+    not possible the rollback stops here, with the subject untouched: a rollback whose
+    journal stayed behind would run again later and delete everything made since. After
+    a crash halfway through, rollback.json is the journal and rolling back again
+    finishes the job (every step is safe to repeat).
+    """
+    journal_path = os.path.join(txn_dir, TXN_JOURNAL)
+    if not os.path.lexists(journal_path):
+        return  # already claimed (an interrupted rollback being finished)
+    try:
+        _replace_with_retry(journal_path, os.path.join(txn_dir, TXN_ROLLBACK))
+    except OSError as exc:
+        raise PermissionError(
+            f"Aurora cannot undo the interrupted work in {os.path.basename(scan_dir)}: "
+            f"{journal_path} cannot be changed ({exc.strerror}). Nothing was touched. " + _ACCESS_HINT
+        ) from exc
 
 
 def _remove_entry(path):
@@ -552,9 +855,92 @@ def _remove_entry(path):
 
 def _rollback_from_journal(scan_dir, journal):
     """Put `scan_dir` back to the state recorded in `journal`, then drop the journal."""
+    if journal.get('version', 1) >= 2:
+        return _rollback_v2(scan_dir, journal)
+    return _rollback_v1(scan_dir, journal)
+
+
+def _restore(held, target):
+    """Move a held original back over `target`; a step that never happened has no held file."""
+    if os.path.lexists(held):
+        _replace_with_retry(held, target)
+
+
+def _rollback_v2(scan_dir, journal):
+    """
+    Undo a version-2 journal. Every step is safe to repeat, so a crash during the rollback
+    is finished by the next one:
+      1. replay the undo log newest first (put back what was stashed, removed or
+         rewritten, undo renames);
+      2. delete everything that was not there before (this run's new outputs);
+      3. put back every JSON file as it was.
+    """
+    txn_dir = os.path.join(scan_dir, TXN_DIRNAME)
+    entries = set(journal.get('entries') or [])
+    _claim_journal(scan_dir, txn_dir)
+
+    for step in reversed(journal.get('log') or []):
+        op = step[0]
+        if op == 'rename':
+            src, dst = os.path.join(scan_dir, step[1]), os.path.join(scan_dir, step[2])
+            if os.path.lexists(dst):
+                # Anything at `src` now was written after the rename: new output, replaced.
+                _replace_with_retry(dst, src)
+        elif op in ('stash', 'remove', 'copy'):
+            _restore(step[2], os.path.join(scan_dir, step[1]))
+
+    for name in _visible_entries(scan_dir):
+        if name not in entries:
+            _remove_entry(os.path.join(scan_dir, name))
+    for name in os.listdir(scan_dir):
+        if is_csp_temp_name(name):
+            _silent_remove(os.path.join(scan_dir, name))
+
+    for name, keep_path in (journal.get('json_kept') or {}).items():
+        _restore(keep_path, os.path.join(scan_dir, name))
+
+    lost = []
+    restored = {step[1] for step in journal.get('log') or []}  # put back from the log above
+    for name, (size, mtime_ns) in (journal.get('stats') or {}).items():
+        if name in restored:
+            continue
+        try:
+            info = os.stat(os.path.join(scan_dir, name))
+            if info.st_size != size or info.st_mtime_ns != mtime_ns:
+                lost.append(name)
+        except FileNotFoundError:
+            lost.append(name)
+        except OSError:
+            pass
+    if lost:
+        print(f"[crash-safe] warning: could not undo changes to {', '.join(sorted(lost))} in "
+              f"{os.path.basename(scan_dir)} (changed without the crash-safe helpers)")
+    _finish_rollback(scan_dir, txn_dir, entries, journal)
+
+
+def _finish_rollback(scan_dir, txn_dir, entries, journal):
+    fsync_dir(scan_dir)
+    try:
+        _remove_with_retry(os.path.join(txn_dir, TXN_ROLLBACK))
+    except OSError as exc:
+        print(f"[crash-safe] could not remove {os.path.join(txn_dir, TXN_ROLLBACK)}: {exc}")
+    _drop_txn_dir(txn_dir)
+    if not entries:
+        # The folder was created for this operation (e.g. a scan being extracted):
+        # with its outputs gone it goes too, so no empty half-subject is left behind.
+        try:
+            os.rmdir(scan_dir)
+        except OSError:
+            pass
+    print(f"[crash-safe] rolled back interrupted '{journal.get('operation')}' on {os.path.basename(scan_dir)}")
+
+
+def _rollback_v1(scan_dir, journal):
+    """Undo a journal written by 1.9.4 / 1.9.5 (hard links or copies of the originals in `kept`)."""
     txn_dir = os.path.join(scan_dir, TXN_DIRNAME)
     entries = set(journal.get('entries') or [])
     kept = journal.get('kept') or {}
+    _claim_journal(scan_dir, txn_dir)
 
     # 1. Undo renames, newest first (so chains like N -> N+1 unwind correctly).
     for src_name, dst_name in reversed(journal.get('renames') or []):
@@ -590,25 +976,63 @@ def _rollback_from_journal(scan_dir, journal):
             pass
         os.replace(keep_path, target)
 
-    fsync_dir(scan_dir)
-    _silent_remove(os.path.join(txn_dir, TXN_JOURNAL))
-    _drop_txn_dir(txn_dir)
-    if not entries:
-        # The folder was created for this operation (e.g. a scan being extracted):
-        # with its outputs gone it goes too, so no empty half-subject is left behind.
-        try:
-            os.rmdir(scan_dir)
-        except OSError:
-            pass
-    print(f"[crash-safe] rolled back interrupted '{journal.get('operation')}' on {os.path.basename(scan_dir)}")
+    _finish_rollback(scan_dir, txn_dir, entries, journal)
 
 
 def _load_journal(txn_dir):
-    try:
-        with open(os.path.join(txn_dir, TXN_JOURNAL), 'r') as handle:
-            return json.load(handle)
-    except (OSError, ValueError):
+    """
+    The journal of the transaction left in `txn_dir` (journal.json, or rollback.json for
+    a rollback that was cut short), else None. A journal that exists but cannot be read
+    is an error, not "no journal": treating it as committed would keep a dead run's
+    half-written outputs.
+    """
+    for name in (TXN_JOURNAL, TXN_ROLLBACK):
+        path = os.path.join(txn_dir, name)
+        try:
+            with open(path, 'r') as handle:
+                journal = json.load(handle)
+            scan_dir = os.path.dirname(os.path.abspath(txn_dir))
+            return _journal_paths(journal, lambda p: p if os.path.isabs(p) else os.path.join(scan_dir, p))
+        except FileNotFoundError:
+            continue
+        except PermissionError as exc:
+            raise PermissionError(
+                f"Aurora cannot read {path} ({exc.strerror}), the record of interrupted work in "
+                f"{os.path.basename(os.path.dirname(txn_dir))}. " + _ACCESS_HINT
+            ) from exc
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def _live_foreign_owner(journal):
+    """
+    Pid of the other engine process on this computer that wrote `journal` and is still
+    running, else None. A journal is only a leftover when its engine is gone; the boot id
+    alone cannot tell, because two engines (each with its own boot id) can work on one
+    project. The process must have started before the journal did, so a pid reused by an
+    unrelated program after a reboot does not count.
+    """
+    pid = journal.get('pid')
+    if journal.get('boot_id') == ENGINE_BOOT_ID or not isinstance(pid, int) or pid == os.getpid():
         return None
+    host = journal.get('host')
+    if host and host != socket.gethostname():
+        return None  # written on another computer (shared drive): cannot be checked here
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        process = psutil.Process(pid)
+        started = float(journal.get('started_at') or 0)
+        if process.create_time() > started + 1:
+            return None
+    except psutil.AccessDenied:
+        return pid  # another account's process (macOS): it exists, so assume it is live
+    except Exception:  # no such process: the journal is a leftover
+        return None
+    return pid
 
 
 def recover_subject(scan_dir, force=False):
@@ -633,6 +1057,16 @@ def recover_subject(scan_dir, force=False):
         _drop_txn_dir(txn_dir)
         return 'committed'
     if journal.get('boot_id') == ENGINE_BOOT_ID and is_subject_active(scan_dir) and not force:
+        return None
+    owner = _live_foreign_owner(journal)
+    if owner:
+        # Another engine on this computer (e.g. the shared service next to a desktop or
+        # dev Aurora) is still working on this subject: its journal is not a leftover.
+        if force:
+            raise RuntimeError(
+                f"{os.path.basename(scan_dir)} is being changed by another Aurora engine "
+                f"(process {owner}); try again when it has finished."
+            )
         return None
     marker = journal.get('group_marker')
     if marker and os.path.exists(marker):
@@ -759,16 +1193,148 @@ def _sweep_stale_files(folder, now):
     return removed
 
 
+def _sweep_stale_txn_dirs(folder, stuck):
+    """
+    Journal folders set aside by _set_aside (no journal in them: only kept copies and
+    links). Ones that still will not go are added to `stuck` as (path, error).
+    """
+    removed = 0
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith(TXN_STALE_PREFIX):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+            removed += 1
+        except OSError as exc:
+            stuck.append((path, exc))  # tried again on the next project open
+    return removed
+
+
+# Projects whose cleanup help was printed since this engine started (once is enough).
+_CLEANUP_HELP_SHOWN = set()
+
+
+def _permission_fix_command(directory, account):
+    """Terminal command that gives `account` read, write and delete rights on `directory`."""
+    if os.name == 'nt':
+        return [f'icacls "{directory}" /grant "{account}:(OI)(CI)M" /T /C']
+    import shlex
+    folder = shlex.quote(directory)
+    if sys.platform == 'darwin':
+        rights = ("list,add_file,search,add_subdirectory,delete_child,read,write,append,"
+                  "execute,delete,readattr,writeattr,readextattr,writeextattr,file_inherit,directory_inherit")
+        return [f'sudo chmod -R +a {shlex.quote(f"{account} allow {rights}")} {folder}']
+    # Network mounts (NFS, SMB) often refuse ACLs ("Operation not supported"): plain modes then.
+    return [f'sudo setfacl -R -m u:{account}:rwX,d:u:{account}:rwx {folder} 2>/dev/null '
+            f'|| sudo chmod -R u+rwX {folder}']
+
+
+def _print_cleanup_help(directory, stuck):
+    """
+    Tell the person, in the engine log, that journal folders cannot be deleted here, with
+    a command to copy into a terminal. Once that command has run, the next project open
+    cleans them up by itself, so nothing is ever deleted by hand.
+    """
+    if not stuck or _key(directory) in _CLEANUP_HELP_SHOWN:
+        return
+    _CLEANUP_HELP_SHOWN.add(_key(directory))
+    import getpass
+    try:
+        account = getpass.getuser()
+    except Exception:
+        account = os.environ.get('USERNAME') or os.environ.get('USER') or 'YOUR_ACCOUNT'
+    path, exc = stuck[0]
+    terminal = 'an administrator PowerShell or Command Prompt' if os.name == 'nt' else 'a terminal'
+    lines = [
+        f"[crash-safe] Aurora (account {account}) cannot delete {len(stuck)} old crash-safety folder(s) in {directory}.",
+        f"[crash-safe]   First one: {path} ({getattr(exc, 'strerror', None) or exc})",
+        "[crash-safe]   They do not stop any tool, but this folder does not let Aurora delete files, so they pile up.",
+        f"[crash-safe]   To fix it, close Aurora, run this in {terminal} on this computer, then open the project again:",
+    ]
+    lines += [f"      {command}" for command in _permission_fix_command(directory, account)]
+    lines += [
+        "[crash-safe]   If it still fails and the project is on a network drive or storage server (NFS, SMB),",
+        "[crash-safe]   the server or its mount options decide who may delete files: ask whoever manages it",
+        f"[crash-safe]   to give {account} write and delete rights on that folder.",
+    ]
+    print('\n'.join(lines))
+
+
+# Projects this engine has recovered since it started (normalised paths). A running
+# engine leaves no journal of its own behind (a failed transaction rolls back on the
+# spot), so one pass per project per engine start covers everything a dead engine left.
+_RECOVERED_PROJECTS = set()
+# One recovery at a time: two requests opening the same project must not both roll the
+# same subject back.
+_RECOVERY_LOCK = threading.RLock()
+
+
 def recover_project(directory):
     """
     Bring every subject of a project back to a consistent state after a crash.
     Safe to call at any time: live transactions of this engine are left alone.
     Returns a summary dict (also printed).
     """
-    summary = {'rolled_back': 0, 'rolled_forward': 0, 'committed': 0, 'swept': 0}
     if not directory or not os.path.isdir(directory):
-        return summary
+        return {'rolled_back': 0, 'rolled_forward': 0, 'committed': 0, 'swept': 0}
+    with _RECOVERY_LOCK:
+        summary = _recover_project(directory)
+        _RECOVERED_PROJECTS.add(_key(directory))
+    return summary
+
+
+def recover_project_once(directory):
+    """
+    recover_project, unless this engine already did it for `directory` since it started.
+
+    Project open (GetProjectSettingsView) is not enough on its own: after an engine
+    restart the browser page can still be open and send a batch request straight away
+    (e.g. align to reference again after a run was cut short). Its "already done?"
+    checks would then see the half-written outputs of the dead run, which only the
+    rollback removes. RecoverInterruptedWork runs this before every such request.
+    """
+    if not isinstance(directory, str) or not directory:
+        return None
+    directory = os.path.expanduser(directory)
+    if _key(directory) in _RECOVERED_PROJECTS or not os.path.isdir(directory):
+        return None
+    return recover_project(directory)
+
+
+class RecoverInterruptedWork:
+    """
+    DRF permission class (settings.REST_FRAMEWORK, after NetworkPathPermission, so only
+    folders the caller may use are touched). It never refuses a request: for a POST
+    naming a project `directory` it first finishes or undoes what a dead engine left in
+    that project, once per engine start (recover_project_once).
+
+    Duck-typed (has_permission / has_object_permission) so this module keeps no Django
+    or DRF import.
+    """
+
+    def has_permission(self, request, view):
+        if request.method == 'POST':
+            data = getattr(request, 'data', None)
+            directory = data.get('directory') if hasattr(data, 'get') else None
+            try:
+                recover_project_once(directory)
+            except Exception as exc:  # never block a request
+                print(f"[crash-safe] could not recover {directory}: {exc}")
+        return True
+
+    def has_object_permission(self, request, view, obj):
+        return True
+
+
+def _recover_project(directory):
+    summary = {'rolled_back': 0, 'rolled_forward': 0, 'committed': 0, 'swept': 0}
     now = time.time()
+    stuck = []  # (journal folder, error) that this account cannot delete
     for scan_dir in _subject_dirs(directory):
         if is_subject_active(scan_dir):
             continue
@@ -779,7 +1345,11 @@ def recover_project(directory):
             outcome = None
         if outcome:
             summary[outcome] += 1
+        txn_dir = os.path.join(scan_dir, TXN_DIRNAME)
+        if os.path.isdir(txn_dir) and _load_journal_quietly(txn_dir) is None and not is_subject_active(scan_dir):
+            stuck.append((txn_dir, PermissionError('could not be deleted or renamed')))
         summary['swept'] += _sweep_stale_files(scan_dir, now)
+        summary['swept'] += _sweep_stale_txn_dirs(scan_dir, stuck)
     trash_dir = os.path.join(directory, TRASH_DIRNAME)
     if os.path.isdir(trash_dir):
         # Subject folders whose deletion was cut short (remove_subject_folder).
@@ -793,7 +1363,16 @@ def recover_project(directory):
             shutil.rmtree(groups_dir, ignore_errors=True)
     if any(summary.values()):
         print(f"[crash-safe] project recovery for {directory}: {summary}")
+    _print_cleanup_help(directory, stuck)
     return summary
+
+
+def _load_journal_quietly(txn_dir):
+    """_load_journal, with an unreadable journal counted as present (it is not garbage)."""
+    try:
+        return _load_journal(txn_dir)
+    except PermissionError:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -939,20 +1518,33 @@ def request_subjects(request, *keys, linked=False):
 
 
 def _active_txn_for(path):
-    """The transaction this thread has open on the folder that holds `path`, if any."""
+    """
+    The transaction open on the subject folder that holds `path`, if any. Any thread:
+    a worker pool writing a subject's outputs for the transaction's thread is covered
+    too (one transaction per subject at a time, see SubjectTransaction).
+    """
     key = _key(os.path.dirname(os.path.abspath(path)))
     with _REGISTRY_LOCK:
         entry = _ACTIVE.get(key)
-    if entry and entry['thread'] == threading.get_ident():
-        return entry['txn']
-    return None
+    return entry['txn'] if entry else None
+
+
+def tracked_replace(src, dst):
+    """
+    os.replace(src, dst) over an existing subject file, undoable: the open transaction
+    keeps the file being replaced (by a rename, not a copy). Outside a transaction it is a
+    plain os.replace. atomic_output does this itself.
+    """
+    txn = _active_txn_for(dst)
+    if txn is not None:
+        txn.stash(dst)
+    _replace_with_retry(src, dst)
 
 
 def tracked_rename(src, dst):
     """
-    os.replace(src, dst) that the open transaction can undo. On disks without hard links
-    (exFAT/FAT32) a plain rename of a data file could not be rolled back; this records it.
-    Outside a transaction it is a plain os.replace.
+    os.replace(src, dst) that the open transaction can undo (a renamed original must
+    come back under its own name). Outside a transaction it is a plain os.replace.
     """
     txn = _active_txn_for(src)
     if txn is not None and os.path.dirname(os.path.abspath(src)) == os.path.dirname(os.path.abspath(dst)):

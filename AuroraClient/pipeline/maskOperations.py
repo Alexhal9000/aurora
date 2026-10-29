@@ -36,6 +36,7 @@ from .crashSafety import (
     subject_transaction,
     tracked_rename,
     tracked_remove,
+    tracked_replace,
     atomic_nib_save,
     atomic_write_json,
     atomic_copy,
@@ -1268,7 +1269,7 @@ def _backup_and_apply_mask_to_elastic(
         try:
             # Overwrite path: start from the original unmasked elastic if a prior backup exists.
             if os.path.isfile(backup_path):
-                os.replace(backup_path, img_path)
+                tracked_replace(backup_path, img_path)  # CRASH-SAFE PROTOCOL: keeps the replaced image
                 print(f"Restored elastic from backup before re-masking: {stem}")
             atomic_copy(img_path, backup_path)
 

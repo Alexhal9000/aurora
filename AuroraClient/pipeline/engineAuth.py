@@ -33,8 +33,11 @@ not come from this computer itself:
   session holds it while it keeps beating or working, and frees it after
   LEASE_GRACE_SECONDS idle. Others get 409 engine_in_use; the same person on another
   device may take over (/engine-auth/take-over/).
-* Network sessions last NETWORK_SESSION_SECONDS (12 h), bounding how long a session can
-  outlive a removal when the lab is unreachable.
+* Sessions end after a time without real use (requests; the tab heartbeat and background
+  reads never count): NETWORK_SESSION_SECONDS (12 h) for every session while network mode
+  is on, whether opened here or from another computer, and LOCAL_SESSION_SECONDS (7 d) with
+  sharing off. A session ended for idling in network mode tells its tab it was signed off.
+  Removals still end sessions at the next check-in.
 """
 
 from __future__ import annotations
@@ -68,12 +71,15 @@ PASS_VERSION = 1
 # Lab passes live 60 s; allow some clock drift between this machine and the lab server.
 CLOCK_SKEW_SECONDS = 300
 MAX_PASS_LIFETIME_SECONDS = 300
-# Sessions opened at this computer slide: they end after LOCAL_SESSION_SECONDS unused,
-# not after a fixed time (see renew_session). Network sessions keep a fixed lifetime.
+# Sessions slide: they end after this long without real use (see renew_session), not after
+# a fixed time. Network mode on: NETWORK_SESSION_SECONDS for all; off: LOCAL_SESSION_SECONDS.
 LOCAL_SESSION_SECONDS = 7 * 24 * 3600
 NETWORK_SESSION_SECONDS = 12 * 3600
 # Renewal is written to disk (and the cookie re-sent) at most this often, not per request.
 SESSION_RENEW_INTERVAL_SECONDS = 3600
+# Shown by the tab whose network session ended for lack of use (engine_session_ended).
+NETWORK_IDLE_MESSAGE = ("Signed off from this computer after 12 hours without use. "
+                        "Your lab account is still signed in; choose Open again to continue.")
 # A lease holder that has neither beaten nor made a request for this long (tab closed,
 # laptop asleep, connection lost) frees the computer for the next person.
 LEASE_GRACE_SECONDS = 10 * 60
@@ -96,6 +102,12 @@ PUBLIC_PATH_PREFIXES = (
 LEASE_FREE_PATH_PREFIXES = (
     "/engine-terminal/",
     "/engine-report/",   # the report button works even while someone else uses Aurora
+)
+# Reads that do not use the computer: they neither need the lease nor refresh it (the
+# header's servers icon asks /engine-sharing/ every minute, which must not keep an idle
+# tab holding the computer, and must still answer while someone else holds it).
+LEASE_FREE_READ_PREFIXES = (
+    "/engine-sharing/",
 )
 
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -345,7 +357,8 @@ def create_session(claims: dict, remote: bool = False) -> tuple:
         "lab_origin": claims.get("iss"),
         "remote": bool(remote),
         "created_at": now,
-        "expires_at": now + (NETWORK_SESSION_SECONDS if remote else LOCAL_SESSION_SECONDS),
+        "last_used": now,
+        "expires_at": now + _idle_limit(),
     }
     with _sessions_lock:
         _load_sessions()
@@ -366,34 +379,47 @@ def get_session(session_id: Optional[str]) -> Optional[dict]:
         record = _sessions.get(key)
         if record is None:
             return None
-        if record.get("expires_at", 0) <= time.time():
+        now = time.time()
+        network = engineConfig.is_network_mode()
+        # A session from before sharing was turned on may hold a 7 day expiry; in network
+        # mode its last use decides, like every other session.
+        idle = network and now - record.get("last_used", record.get("created_at", 0)) > NETWORK_SESSION_SECONDS
+        if record.get("expires_at", 0) <= now or idle:
             del _sessions[key]
             _save_sessions()
+            if network:
+                with _ended_lock:
+                    _ended_reasons[key] = NETWORK_IDLE_MESSAGE
             return None
         return record
 
 
-def renew_session(session_id: Optional[str]) -> bool:
-    """Sliding expiry: a request or tab heartbeat from a local session pushes its end to
-    LOCAL_SESSION_SECONDS from now, so it only ends after that long unused.
+def _idle_limit() -> int:
+    """How long a session may go without real use: 12 h in network mode, else 7 days."""
+    return NETWORK_SESSION_SECONDS if engineConfig.is_network_mode() else LOCAL_SESSION_SECONDS
 
-    Network sessions are left alone: their fixed NETWORK_SESSION_SECONDS bounds how long a
-    session can outlive a removal while the lab is unreachable. Returns True when the
-    record was renewed, so the caller re-sends the cookie with the new max_age.
+
+def renew_session(session_id: Optional[str], heartbeat: bool = False) -> bool:
+    """Sliding expiry: real use pushes a session's end to _idle_limit() from now.
+
+    The tab heartbeat never counts (heartbeat=True does nothing): an Aurora page left open
+    but unused ends like a closed one. Written at most every SESSION_RENEW_INTERVAL_SECONDS,
+    so a session ends between (limit - 1 h) and limit after its last use. Returns True when
+    the record was renewed, so the caller re-sends the cookie with the new max_age.
     """
-    if not session_id:
+    if not session_id or heartbeat:
         return False
     key = _hash_session_id(session_id)
     now = time.time()
     with _sessions_lock:
         _load_sessions()
         record = _sessions.get(key)
-        if record is None or record.get("remote") or record.get("expires_at", 0) <= now:
+        if record is None or record.get("expires_at", 0) <= now:
             return False
-        new_expiry = now + LOCAL_SESSION_SECONDS
-        if new_expiry - record.get("expires_at", 0) < SESSION_RENEW_INTERVAL_SECONDS:
+        if now - record.get("last_used", record.get("created_at", 0)) < SESSION_RENEW_INTERVAL_SECONDS:
             return False
-        record["expires_at"] = new_expiry
+        record["last_used"] = now
+        record["expires_at"] = now + _idle_limit()
         _save_sessions()
     return True
 
@@ -487,6 +513,17 @@ def release_lease(session_key: str) -> None:
     with _lease_lock:
         if _lease is not None and _lease["session"] == session_key:
             _lease = None
+
+
+def lease_holder() -> Optional[dict]:
+    """Who holds the computer now ({"user_id", "name", "since"}), or None when the lease is
+    free: nobody holds it, or the holder has been idle past the grace period (the next
+    claim_lease would take it)."""
+    with _lease_lock:
+        holder = _lease
+    if holder is None or engineActivity.session_idle_seconds(holder["session"]) > LEASE_GRACE_SECONDS:
+        return None
+    return {"user_id": holder["user_id"], "name": holder["name"], "since": holder["since"]}
 
 
 def claim_lease(session_key: str, record: dict, take_over: bool = False) -> Optional[dict]:
@@ -645,7 +682,10 @@ class EngineSessionMiddleware:
         if engineSharing.refuses_member(record):
             _end_session_key(session_key, engineSharing.PAUSED_MESSAGE)
             return JsonResponse({"error": engineSharing.PAUSED_MESSAGE, "code": "engine_session_ended"}, status=401)
-        if any(request.path.startswith(prefix) for prefix in LEASE_FREE_PATH_PREFIXES):
+        if any(request.path.startswith(prefix) for prefix in LEASE_FREE_PATH_PREFIXES) or (
+            request.method in SAFE_METHODS
+            and any(request.path.startswith(prefix) for prefix in LEASE_FREE_READ_PREFIXES)
+        ):
             request.aurora_session = record
             return self.get_response(request)
         conflict = claim_lease(session_key, record)
@@ -843,6 +883,11 @@ class EngineAuthHeartbeatView(APIView):
         session_id = request.COOKIES.get(SESSION_COOKIE)
         record = get_session(session_id)
         if record is None:
+            # Same answer as the middleware, so the tab says why (kick, removal) when known.
+            reason = _ended_reason(session_id)
+            if reason:
+                return Response({"authenticated": False, "code": "engine_session_ended", "error": reason},
+                                status=status.HTTP_401_UNAUTHORIZED)
             return Response(
                 {"authenticated": False, "code": "engine_session_required"},
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -856,8 +901,9 @@ class EngineAuthHeartbeatView(APIView):
                 return _in_use_response(conflict)
         engineActivity.heartbeat(session_key, record, leaving=leaving)
         response = Response(_session_payload(record), status=status.HTTP_200_OK)
-        # An open tab counts as use, so a signed-in Aurora left open never expires.
-        if not leaving and renew_session(session_id):
+        # An open tab is not use: renew_session ignores heartbeats (sessions end after
+        # 12 h / 7 d without real requests).
+        if not leaving and renew_session(session_id, heartbeat=True):
             _set_session_cookie(request, response, session_id, record)
         return response
 

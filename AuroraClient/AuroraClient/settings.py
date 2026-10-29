@@ -124,8 +124,13 @@ MIDDLEWARE = [
 
 # People opening a shared server from another computer stay inside its shared folders
 # (pipeline/networkFolders.py). A no-op in local mode and for this computer's own user.
+# Then, for a request naming a project, undo what a dead engine left there before the
+# view looks at it (pipeline/crashSafety.py, RecoverInterruptedWork; never refuses).
 REST_FRAMEWORK = {
-    'DEFAULT_PERMISSION_CLASSES': ['pipeline.networkFolders.NetworkPathPermission'],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'pipeline.networkFolders.NetworkPathPermission',
+        'pipeline.crashSafety.RecoverInterruptedWork',
+    ],
 }
 
 ROOT_URLCONF = 'AuroraClient.urls'

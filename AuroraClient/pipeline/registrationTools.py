@@ -6,6 +6,7 @@ from django.http import FileResponse
 from rest_framework.parsers import MultiPartParser, FormParser
 import json
 import os
+import threading
 from rest_framework import status
 import shutil
 import glob
@@ -107,30 +108,112 @@ def save_projection_png(rgba, projection_file):
     )
 
 
-def _ensure_vtk_headless():
-    """Prefer OSMesa only on headless Linux.
+# Whether VTK may render in this engine: None = not probed yet, '' = it may not, else the
+# off-screen window that works ('default' = VTK's own choice). Probed once per engine.
+_VTK_WINDOW = None
+_VTK_WINDOW_LOCK = threading.Lock()
 
-    Windows/macOS do not use the X11 DISPLAY variable. Forcing
-    vtkOSOpenGLRenderWindow there looks for osmesa.dll / OSMesa and can
-    access-violate (Windows exit 0xC0000005) instead of raising a Python
-    exception — which kills Daphne before the numpy fallback can run.
+# One tiny off-screen render, run in a child process: a VTK window that cannot open
+# (a missing libOSMesa / libEGL, no window server for a background service) segfaults
+# the whole process instead of raising. In 1.9.4/1.9.5 this killed the shared Linux
+# service right after rigid alignment, while it rendered the new edit's projection.
+_VTK_PROBE = (
+    "import pyvista as pv; pv.OFF_SCREEN = True; "
+    "p = pv.Plotter(off_screen=True, window_size=[32, 32]); "
+    "p.add_mesh(pv.Sphere()); p.screenshot(return_img=True); p.close()"
+)
+
+
+def _shared_engine():
+    """Network sharing is on for this engine (the service, or a developer's run_aurora.sh
+    shared in place)."""
+    try:
+        from AuroraClient import engineConfig
+        return engineConfig.is_network_mode()
+    except Exception:  # config unreadable: treat as not shared
+        return False
+
+
+def _needs_vtk_probe():
+    """Desktop sessions render as before; only engines without a desktop are probed:
+    headless Linux, and the shared service on any system (Windows session 0 and a
+    macOS launchd daemon have no window server either). A shared developer engine is
+    probed the same way, so sharing from run_aurora.sh renders like the service does
+    (the probe never uses the display, see _probe_vtk_window)."""
+    if os.environ.get('AURORA_SERVICE') == '1' or _shared_engine():
+        return True
+    return sys.platform.startswith('linux') and not os.environ.get('DISPLAY')
+
+
+def _probe_vtk_window():
+    """First off-screen window that renders in a child process, or ''.
+
+    Linux: EGL first. VTK's own choice (VTK >= 9.4 tries X, then EGL, then OSMesa at
+    run time) also works there, but warns "bad X server connection" on every render
+    first; OSMesa is the last resort. Windows/macOS: VTK's own window only.
+    AURORA_PROJECTION_FALLBACK=1 skips VTK without probing.
     """
-    if sys.platform.startswith('linux') and not os.environ.get('DISPLAY'):
-        os.environ.setdefault('VTK_DEFAULT_OPENGL_WINDOW', 'vtkOSOpenGLRenderWindow')
-        return
+    import subprocess
+    candidates = ['default']
+    if sys.platform.startswith('linux'):
+        candidates = ['vtkEGLRenderWindow', 'default', 'vtkOSOpenGLRenderWindow']
+    for window in candidates:
+        env = dict(os.environ)
+        env.pop('VTK_DEFAULT_OPENGL_WINDOW', None)
+        # Test without a display, as the service has none: a window that only works
+        # through this desktop session's X/Wayland would not work there.
+        for name in ('DISPLAY', 'WAYLAND_DISPLAY'):
+            env.pop(name, None)
+        if window != 'default':
+            env['VTK_DEFAULT_OPENGL_WINDOW'] = window
+        try:
+            result = subprocess.run(
+                [sys.executable, '-c', _VTK_PROBE],
+                env=env, capture_output=True, timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"VTK off-screen probe ({window}) could not run: {exc}")
+            continue
+        if result.returncode == 0:
+            print(f"VTK off-screen rendering works here ({window} window).")
+            return window
+        print(f"VTK off-screen rendering ({window} window) failed, exit {result.returncode}.")
+    print(
+        "VTK cannot render without a desktop here (on Linux, install libegl1); projections "
+        "use the numpy fallback and mesh previews are skipped."
+    )
+    return ''
 
-    # Clear stale OSMesa preference left by older Aurora builds that always
-    # forced vtkOSOpenGLRenderWindow whenever DISPLAY was unset.
-    if (
-        not sys.platform.startswith('linux')
-        and os.environ.get('VTK_DEFAULT_OPENGL_WINDOW') == 'vtkOSOpenGLRenderWindow'
-    ):
-        os.environ.pop('VTK_DEFAULT_OPENGL_WINDOW', None)
+
+def _ensure_vtk_headless():
+    """Prepare VTK for an off-screen render; False when VTK must not render here.
+
+    Desktop sessions keep VTK's normal window. Engines without one are probed once
+    (_probe_vtk_window) so a VTK crash can only take down the probe's child process.
+    Old builds forced vtkOSOpenGLRenderWindow whenever DISPLAY was unset; that needs
+    libOSMesa, which recent Mesa no longer ships, and on Windows/macOS it looks for
+    osmesa.dll / OSMesa and can access-violate (Windows exit 0xC0000005).
+    """
+    global _VTK_WINDOW
+    if not _needs_vtk_probe():
+        if os.environ.get('VTK_DEFAULT_OPENGL_WINDOW') == 'vtkOSOpenGLRenderWindow':
+            os.environ.pop('VTK_DEFAULT_OPENGL_WINDOW', None)  # stale, see above
+        return True
+    with _VTK_WINDOW_LOCK:
+        if _VTK_WINDOW is None:
+            _VTK_WINDOW = _probe_vtk_window()
+            if _VTK_WINDOW == 'default':
+                os.environ.pop('VTK_DEFAULT_OPENGL_WINDOW', None)
+            elif _VTK_WINDOW:
+                os.environ['VTK_DEFAULT_OPENGL_WINDOW'] = _VTK_WINDOW
+    return bool(_VTK_WINDOW)
 
 
 def _prefer_vtk_projection():
     """Whether to attempt VTK/PyVista projection rendering."""
-    return os.environ.get('AURORA_PROJECTION_FALLBACK', '').strip().lower() not in ('1', 'true', 'yes')
+    if os.environ.get('AURORA_PROJECTION_FALLBACK', '').strip().lower() in ('1', 'true', 'yes'):
+        return False
+    return _ensure_vtk_headless()
 
 
 def _window_volume_for_projection(image_data_8bit):
@@ -219,7 +302,8 @@ def _generate_lossy_isometric_projection_png_vtk(
     rgb=(255, 255, 255),
     view_sign=PROJECTION_VTK_VIEW_SIGN,
 ):
-    _ensure_vtk_headless()
+    if not _ensure_vtk_headless():
+        raise RuntimeError("VTK off-screen rendering is not available here")
     import pyvista as pv
 
     pv.OFF_SCREEN = True
@@ -662,7 +746,7 @@ class RegistrationTools():
     # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
     # here is covered by the transaction that the calling view or batch loop opens. Adding a
     # new derivative file? Use an atomic_* helper and keep it inside that transaction.
-    def calculate_affine_transform_as_field(self, fixed_image_data, moving_image_data):
+    def calculate_affine_transform_as_field(self, fixed_image_data, moving_image_data, progress=None):
         """
         Calculate an affine transformation between fixed and moving images and convert it to a displacement field.
 
@@ -682,6 +766,7 @@ class RegistrationTools():
         Args:
             fixed_image_data: Fixed ANTs image
             moving_image_data: Moving ANTs image
+            progress: optional callable(state), live ANTs progress (see antsWorker.registration)
             
         Returns:
             Path to displacement field .nii.gz file and the affine matrix
@@ -701,7 +786,8 @@ class RegistrationTools():
             grad_step=0.3,
             aff_metric='GC',
             initial_transform=["Identity"],
-            verbose=True
+            verbose=True,
+            progress=progress,
         )
 
         # Get path to the resulting .mat affine transformation file

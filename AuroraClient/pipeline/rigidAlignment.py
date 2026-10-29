@@ -4121,7 +4121,17 @@ class AlignToReferenceView(APIView):
             return Response({'error': f'Unknown alignment method: {method}'}, status=status.HTTP_400_BAD_REQUEST)
 
         if not scan_names:
-            return Response({'error': 'No eligible moving scans are available for alignment.'}, status=status.HTTP_400_BAD_REQUEST)
+            # Say why, so "nothing to do" is not mistaken for a failure: usually every
+            # subject already has an aligned (or elastic) edit from an earlier run.
+            if scans_to_remove:
+                message = (
+                    'Every subject is already aligned to the reference (or has an elastic '
+                    'registration), so there is nothing to align. Delete a subject\'s aligned '
+                    'edit to align it again.'
+                )
+            else:
+                message = 'No eligible moving scans are available for alignment.'
+            return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
 
         # Initialize WebSocket progress tracking
         total_scans = len(scan_names)

@@ -5,6 +5,8 @@ import shutil
 from .crashSafety import (
     atomic_write_json,
     atomic_copy,
+    tracked_remove,
+    tracked_rename,
 )
 
 # Subject name used after promoting population atlas into extracted/ as the project reference.
@@ -84,7 +86,8 @@ def rename_atlas_files_in_folder(folder_path):
             raise FileExistsError(f"Cannot rename {entry} to {new_name}: destination exists")
         renames.append((old_path, new_path))
     for old_path, new_path in renames:
-        os.rename(old_path, new_path)
+        # CRASH-SAFE PROTOCOL: undoable inside the caller's transaction (rule 3).
+        tracked_rename(old_path, new_path)
 
 
 def read_selected_reference(directory):
@@ -153,7 +156,7 @@ def delete_stale_average_files(folder_path):
             continue
         path = os.path.join(folder_path, entry)
         if os.path.isfile(path):
-            os.remove(path)
+            tracked_remove(path)  # CRASH-SAFE PROTOCOL: undoable inside a transaction
             removed.append(entry)
     return removed
 

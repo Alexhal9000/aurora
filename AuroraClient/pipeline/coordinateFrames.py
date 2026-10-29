@@ -9,6 +9,8 @@ import time
 
 import numpy as np
 
+from .crashSafety import match_new_file_mode
+
 MESH_MAX_VOXEL_CUBE = 512
 MESH_REFERENCE_PRISM_PADDING_FRACTION = 0.1
 PLY_REFERENCE_VOXEL_SIZE_KEY = "ply_reference_voxel_size"
@@ -45,6 +47,7 @@ def atomic_write_json(json_path, payload, retries=5, delay=0.05):
             suffix=".tmp",
             dir=directory,
         )
+        match_new_file_mode(tmp_path)  # mkstemp makes 0600: keep shared folders readable
         try:
             with os.fdopen(fd, "w") as jf:
                 json.dump(payload, jf, indent=4)

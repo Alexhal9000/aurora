@@ -386,6 +386,17 @@ def member_folders_payload() -> dict:
     return {"restrict_new": settings["restrict_new"], "members": members}
 
 
+def _in_use_by_other(record: dict) -> bool:
+    """Someone other than the person asking holds the computer (the lease) or has a job
+    running on it. The same person on another device or browser does not count."""
+    from pipeline import engineAuth  # engineAuth imports this module
+    user_id = str(record.get("user_id", ""))
+    holder = engineAuth.lease_holder()
+    if holder is not None and holder["user_id"] != user_id:
+        return True
+    return any(str(job.get("user_id") or "") not in ("", user_id) for job in engineJobs.running())
+
+
 def status_payload(record: dict) -> dict:
     config = engineConfig.load_config()
     service = networkFolders.running_as_service()
@@ -432,6 +443,8 @@ def status_payload(record: dict) -> dict:
         "pairing_flow": networkMode.pair_poll() if not record.get("remote") else {},
         "helper_installed": linux_helper,
         "jobs_running": len(engineJobs.running()),
+        # Header servers icon: yellow while someone else is using this shared computer.
+        "in_use_by_other": shared and _in_use_by_other(record),
         "request_ttl_hours": REQUEST_TTL_SECONDS // 3600,
     }
     if record.get("remote") and not payload["can_manage"]:
@@ -639,13 +652,17 @@ class EngineSharingView(APIView):
                     pairing = networkMode.pairing_state() or {}
                     if pairing and not _paired_elsewhere(record, pairing):
                         return refuse("This computer is already paired.")
-                    if pairing and service and not _pairing_unusable(pairing):
-                        # The shared service's owner changes only with admin rights.
-                        return refuse("This computer is paired with another lab website. To pair it with "
-                                      "this one, in a terminal: sudo aurora-tools pair --reset")
+                    # The shared service's working pairing with another lab website changes
+                    # owner only with admin rights; restoring one this lab already lists for
+                    # the signed-in person is not a change of owner, so that still goes ahead.
+                    restore_only = bool(pairing and service and not _pairing_unusable(pairing))
                     # Desktop Aurora paired with another lab website (e.g. a test site): the old
-                    # pairing stays until the new one is confirmed.
-                    networkMode.pair_start(record.get("lab_origin") or "", data.get("name") or "")
+                    # pairing stays until the new one is confirmed. Either way the pairing is
+                    # restored instead when the lab already lists this computer with the
+                    # signed-in person as its owner (networkMode.pair_start).
+                    networkMode.pair_start(record.get("lab_origin") or "", data.get("name") or "",
+                                           user_id=str(record.get("user_id") or ""),
+                                           restore_only=restore_only)
                 elif action == "pair_confirm":
                     networkMode.pair_confirm(bool(data.get("accept")))
                 elif action == "pair_auto_confirm":

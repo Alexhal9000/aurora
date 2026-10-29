@@ -73,6 +73,7 @@ from .crashSafety import (
     transaction_over,
     tracked_rename,
     tracked_remove,
+    tracked_replace,
     remove_subject_folder,
     atomic_nib_save,
     atomic_write_json,
@@ -192,6 +193,7 @@ from .atlas_paths import (
     reference_atlas_dir,
     is_reference_atlas_promoted,
     finalize_promoted_reference_atlas,
+    read_selected_reference,
 )
 from .elasticHeatmapMetrics import (
     FALLBACK_HEATMAP_METRIC,
@@ -6927,9 +6929,10 @@ def _commit_elastic_staging_dir(scan_dir, json_basename):
                 # output uses this suffix, so it is dropped rather than committed.
                 os.remove(os.path.join(staging_dir, name))
                 continue
-            os.replace(os.path.join(staging_dir, name), os.path.join(scan_dir, name))
+            # tracked_replace: an output being redone replaces the old one undoably.
+            tracked_replace(os.path.join(staging_dir, name), os.path.join(scan_dir, name))
         if json_basename in staged_names:
-            os.replace(os.path.join(staging_dir, json_basename), os.path.join(scan_dir, json_basename))
+            tracked_replace(os.path.join(staging_dir, json_basename), os.path.join(scan_dir, json_basename))
     os.rmdir(staging_dir)
 
 
@@ -7004,7 +7007,7 @@ def scrub_incomplete_voxel_elastic_registration(directory, scan_name):
     )
     for path in artifacts:
         try:
-            os.remove(path)
+            tracked_remove(path)  # CRASH-SAFE PROTOCOL: undoable inside a transaction
             print(f"  removed stale elastic artifact: {os.path.basename(path)}")
         except OSError as exc:
             print(f"  warning: could not remove {path}: {exc}")
@@ -13235,7 +13238,7 @@ class DeleteEditView(APIView):
                             _img    = os.path.join(directory, sub_path, f"{_stem}.nii.gz")
                             if os.path.exists(_backup):
                                 try:
-                                    os.replace(_backup, _img)
+                                    tracked_replace(_backup, _img)  # CRASH-SAFE PROTOCOL: undoable
                                     print(f"Restored elastic backup: {_stem}")
                                 except Exception as _re:
                                     print(f"Warning: could not restore elastic backup {_stem}: {_re}")
@@ -13395,6 +13398,13 @@ def normalize_elastic_custom_options(request_data):
     }
 
 
+# Where each step of one subject's elastic registration starts, as a fraction of that
+# subject's share of the progress bar. The ANTs registration takes most of the time (minutes
+# per subject); composing/saving the warps, the threshold search and the final save follow.
+# Was an even 1/4 per step until 1.9.4, which left the bar crawling through the registration.
+ELASTIC_SCAN_SHARE = {"registration": 0.0, "saving_transforms": 0.8, "threshold": 0.9, "saving_outputs": 0.95}
+
+
 class ElasticRegistrationView(APIView):
 
     registration_tools = RegistrationTools()
@@ -13546,6 +13556,13 @@ class ElasticRegistrationView(APIView):
         flagged_set = load_flagged_subject_names(directory)
         moving_images = apply_flag_filter(moving_images, flagged_set, flag_filter)
         moving_images = filter_out_linked_children(directory, moving_images)
+        # Optional explicit subject list (RedoElasticToReferenceAtlasView re-runs only the
+        # subjects that share one stored settings set). It only narrows the eligible
+        # subjects found above; it never adds a faulty, linked or completed one.
+        only_subjects = request.data.get('subjects') if request.data else None
+        if isinstance(only_subjects, (list, tuple)):
+            wanted = {name for name in only_subjects if isinstance(name, str)}
+            moving_images = [f for f in moving_images if f in wanted]
         # Initialize WebSocket progress tracking
         total_scans = len(moving_images)
         channel_layer = get_channel_layer()
@@ -13822,9 +13839,54 @@ class ElasticRegistrationView(APIView):
             # as soon as the warps are copied into the staging folder (see below).
             ants_temp_outputs = []
 
+            # Live registration progress (Aurora 1.9.4+): the ANTs worker reports the
+            # resolution level, iteration and metric of the running registration (see
+            # "Live progress" in antsWorker). The registration fills this scan's share of the
+            # bar up to ELASTIC_SCAN_SHARE['saving_transforms']. Inside it the affine initialization takes a
+            # fixed tenth (a guess: it samples 20% of the voxels and its levels usually
+            # converge early) and the SyN pass(es) share the rest by their planned cost
+            # (antsWorker.schedule_work). Iteration counts are maxima, so the bar jumps ahead
+            # when ANTs ends a level early.
+            affine_share = 0.1 if affine_initialization else 0.0
+
+            def registration_progress(start, end, step_label=None):
+                """antsWorker progress callback for the part [start, end] of the registration."""
+                def report(state):
+                    if channel_layer is None:
+                        return
+                    within = start + (end - start) * state["fraction"]
+                    # Kept short for the bar (its own label shows the percentage): pass, level and
+                    # iteration as "n/total" (the iteration total is a maximum, ANTs may end a
+                    # level sooner), and the similarity for CC/GC. Scales and timings per level
+                    # go to the engine terminal (antsWorker).
+                    details = []
+                    if step_label:
+                        details.append(step_label)
+                    details.append(f'level {state["level"]}/{state["levels"]}')
+                    details.append(f'iteration {state["iteration"]}/{state["iterations"]}')
+                    metric_text = antsWorker.describe_metric(state.get("metric"), state.get("value"))
+                    if metric_text.startswith('similarity'):
+                        details.append(metric_text)
+                    message = f'Registering {moving_image_name} to {reference}'
+                    async_to_sync(channel_layer.group_send)(
+                        'progress_group',
+                        {
+                            'type': 'send_progress',
+                            'progress': (idx + within * ELASTIC_SCAN_SHARE['saving_transforms']) / total_scans,
+                            'scan_name': moving_image_name,
+                            'custom_message': f'{message} ({", ".join(details)})',
+                            'total': total_scans,
+                            'current': idx + 1,
+                        }
+                    )
+                return report
+
             if affine_initialization:
                 # Calculate the affine transformation matrix using ants, then turn it into a deformation field and use it as the initial_transform for the non-linear elastic registration
-                initial_affine_path, initial_affine_field_path = self.registration_tools.calculate_affine_transform_as_field(fixed_image_data, moving_image_data)
+                initial_affine_path, initial_affine_field_path = self.registration_tools.calculate_affine_transform_as_field(
+                    fixed_image_data, moving_image_data,
+                    progress=registration_progress(0.0, affine_share, 'affine initialization'),
+                )
                 ants_temp_outputs.extend([initial_affine_path, initial_affine_field_path])
                 #initial_affine_field_path = "/tmp/tmpjfrmbow11Warp.nii.gz" # for quick debugging loading a pre-calculated affine field
                 print(f"initial_affine_field_path: {initial_affine_field_path}")
@@ -13925,7 +13987,29 @@ class ElasticRegistrationView(APIView):
                     o["syn_sampling"] = int(np.clip(int(opts["syn_sampling"]) + 1, 2, 64))
                 return o
 
-            def run_preset_registration(initial_transform, preset):
+            # Share of the registration bar for each SyN pass, by planned cost (see above).
+            if quick_registration in guided_presets:
+                pass_iterations = [guided_presets[quick_registration]["reg_iterations"]]
+                if double_pass:
+                    pass_iterations.append(guided_presets_second[quick_registration]["reg_iterations"])
+            else:
+                pass_iterations = [elastic_custom_opts["reg_iterations"]]
+                if double_pass:
+                    pass_iterations.append(refine_elastic_custom_for_second_pass(elastic_custom_opts)["reg_iterations"])
+            pass_work = [antsWorker.schedule_work(iterations) or 1.0 for iterations in pass_iterations]
+            pass_spans = []
+            span_start = affine_share
+            for work in pass_work:
+                span_end = span_start + (1.0 - affine_share) * work / sum(pass_work)
+                pass_spans.append((span_start, span_end))
+                span_start = span_end
+
+            def pass_progress(pass_index):
+                start, end = pass_spans[pass_index]
+                label = f'pass {pass_index + 1}/{len(pass_spans)}' if len(pass_spans) > 1 else None
+                return registration_progress(start, end, label)
+
+            def run_preset_registration(initial_transform, preset, progress=None):
                 reg_kwargs = {
                     "fixed": fixed_image_data,
                     "moving": moving_image_data,
@@ -13943,12 +14027,13 @@ class ElasticRegistrationView(APIView):
                 }
                 if preset["syn_metric"] != "demons":
                     reg_kwargs["syn_sampling"] = preset["syn_sampling"]
-                return antsWorker.registration(**reg_kwargs)
+                return antsWorker.registration(progress=progress, **reg_kwargs)
 
             if quick_registration in guided_presets:
                 elastix_transform = run_preset_registration(
                     [initial_affine_field_path if affine_initialization else "Identity"],
                     guided_presets[quick_registration],
+                    progress=pass_progress(0),
                 )
             elif quick_registration == "custom":
                 _reg_kwargs = {
@@ -13968,7 +14053,7 @@ class ElasticRegistrationView(APIView):
                 }
                 if elastic_custom_opts["syn_metric"] != "demons":
                     _reg_kwargs["syn_sampling"] = elastic_custom_opts["syn_sampling"]
-                elastix_transform = antsWorker.registration(**_reg_kwargs)
+                elastix_transform = antsWorker.registration(progress=pass_progress(0), **_reg_kwargs)
             else:
                 raise ValueError(f"Unknown quick_registration preset: {quick_registration}")
             # Pass-1 outputs must stay on disk until pass 2 and the warp composition have read them.
@@ -13981,6 +14066,7 @@ class ElasticRegistrationView(APIView):
                     elastix_transform = run_preset_registration(
                         fwd_warps,
                         guided_presets_second[quick_registration],
+                        progress=pass_progress(1),
                     )
                 elif quick_registration == "custom":
                     o2 = refine_elastic_custom_for_second_pass(elastic_custom_opts)
@@ -14001,7 +14087,7 @@ class ElasticRegistrationView(APIView):
                     }
                     if o2["syn_metric"] != "demons":
                         _reg_kwargs["syn_sampling"] = o2["syn_sampling"]
-                    elastix_transform = antsWorker.registration(**_reg_kwargs)
+                    elastix_transform = antsWorker.registration(progress=pass_progress(1), **_reg_kwargs)
                 ants_temp_outputs.extend(elastix_transform['fwdtransforms'] + elastix_transform['invtransforms'])
                 elastic_ants_runs.append(antsWorker.run_stats(elastix_transform))
 
@@ -14030,7 +14116,7 @@ class ElasticRegistrationView(APIView):
             # Send progress update after each scan is processed
             channel_layer = get_channel_layer()
             if channel_layer is not None:
-                progress = ((idx+(1/4)) / total_scans)
+                progress = ((idx+ELASTIC_SCAN_SHARE['saving_transforms']) / total_scans)
                 async_to_sync(channel_layer.group_send)(
                     'progress_group',
                     {
@@ -14320,7 +14406,7 @@ class ElasticRegistrationView(APIView):
             # Send progress update after each scan is processed
             channel_layer = get_channel_layer()
             if channel_layer is not None:
-                progress = ((idx+(2/4)) / total_scans)
+                progress = ((idx+ELASTIC_SCAN_SHARE['threshold']) / total_scans)
                 async_to_sync(channel_layer.group_send)(
                     'progress_group',
                     {
@@ -14501,7 +14587,7 @@ class ElasticRegistrationView(APIView):
             # Send progress update after each scan is processed
             channel_layer = get_channel_layer()
             if channel_layer is not None:
-                progress = ((idx+(3/4)) / total_scans)
+                progress = ((idx+ELASTIC_SCAN_SHARE['saving_outputs']) / total_scans)
                 async_to_sync(channel_layer.group_send)(
                     'progress_group',
                     {
@@ -14680,10 +14766,17 @@ class ElasticRegistrationView(APIView):
                 'use_mask': request.data['use_mask'],
                 'reference_mask_only': reference_mask_only,
                 'do_dice_adjustment': request.data['do_dice_adjustment'],
+                # Also stored so a later redo (RedoElasticToReferenceAtlasView) can repeat
+                # the registration with exactly the same parameters.
+                'prefer_mask': bool(prefer_mask),
+                'mask_label': mask_label,
+                'use_distance_map': bool(use_distance_map),
             }
             if quick_registration == 'custom':
                 _elastic_settings['elastic_custom_options'] = elastic_custom_opts
             json_metadata['elastic_settings'] = _elastic_settings
+            # A pending redo to the promoted atlas is done once this elastic is committed.
+            json_metadata.pop(ELASTIC_REDO_PENDING_KEY, None)
             if elastic_compute:
                 json_metadata['elastic_compute'] = elastic_compute
             else:
@@ -22237,6 +22330,334 @@ class MakeAtlasReferenceView(APIView):
             )
 
 
+# ---------------------------------------------------------------------------
+# Redo elastic registrations to the promoted ReferenceAtlas
+# ---------------------------------------------------------------------------
+# After the population atlas is promoted to extracted/ReferenceAtlas and becomes the
+# project reference, the subjects' existing voxel elastic registrations still target
+# the reference that was used before (their `elastic_to`). Their warps, warped volumes,
+# heatmaps and landmarks therefore live in the old reference's frame, not the atlas's.
+# RedoElasticToReferenceAtlasView lists those registrations and, on request, deletes
+# them (and only them, plus any edit stacked on top) and re-runs each one with the
+# elastic settings stored in its own subject JSON (`elastic_settings`), only the
+# target changing to ReferenceAtlas.
+
+# Subject JSON key marking a subject whose stale elastic was deleted by a "redo" and
+# that still waits for its re-registration: {'target': 'ReferenceAtlas',
+# 'elastic_settings': {...the settings the redo uses...}}. It lets a redo that was
+# interrupted after the delete (engine stopped, crash) be resumed from the preview with
+# the same settings. The settings are copied here because any elastic run scrubs
+# `elastic_settings` from subjects without a complete elastic
+# (scrub_incomplete_voxel_elastic_registration). ElasticRegistrationView drops the key
+# when the subject's new elastic is committed.
+ELASTIC_REDO_PENDING_KEY = 'elastic_redo_pending'
+
+# elastic_settings keys every stored registration has (written since elastic_settings
+# exists). Without them the original parameters are unknown and the subject is not
+# re-run automatically.
+_ELASTIC_SETTINGS_REQUIRED_KEYS = (
+    'registration_method',
+    'affine_initialization',
+    'double_pass',
+    'use_mask',
+    'do_dice_adjustment',
+)
+
+# Keys added to elastic_settings later (2026-10-28). Older registrations do not have
+# them; the redo then uses the elastic tool's defaults and reports that it did.
+_ELASTIC_SETTINGS_LATER_DEFAULTS = {
+    'reference_mask_only': True,
+    'prefer_mask': False,
+    'mask_label': 1,
+    'use_distance_map': False,
+}
+
+
+def _elastic_slot_numbers(scan_dir, scan_name):
+    """Edit slot numbers of the subject's primary warped volumes (`*_edit_<n>_elastic.nii.gz`)."""
+    slot_re = re.compile(rf"^{re.escape(scan_name)}_edit_(\d+)_elastic\.nii\.gz$")
+    slots = []
+    for path in _voxel_elastic_primary_volumes(scan_dir, scan_name):
+        match = slot_re.match(os.path.basename(path))
+        if match:
+            slots.append(int(match.group(1)))
+    return sorted(slots)
+
+
+def _elastic_redo_settings(stored):
+    """
+    Complete elastic settings for a redo, from a subject's stored `elastic_settings`.
+
+    Returns (settings, defaulted_keys), or (None, []) when the stored settings lack the
+    original parameters (then the redo cannot claim to use the same parameters).
+    """
+    if not isinstance(stored, dict):
+        return None, []
+    if any(key not in stored for key in _ELASTIC_SETTINGS_REQUIRED_KEYS):
+        return None, []
+    settings = {key: stored[key] for key in _ELASTIC_SETTINGS_REQUIRED_KEYS}
+    defaulted = []
+    for key, default in _ELASTIC_SETTINGS_LATER_DEFAULTS.items():
+        if key in stored:
+            settings[key] = stored[key]
+        else:
+            settings[key] = default
+            defaulted.append(key)
+    if settings['registration_method'] == 'custom':
+        custom = stored.get('elastic_custom_options')
+        if not isinstance(custom, dict):
+            return None, []
+        settings['elastic_custom_options'] = custom
+    return settings, defaulted
+
+
+def elastic_redo_plan(directory):
+    """
+    What a redo to the promoted ReferenceAtlas would do for this project.
+
+    `applicable` is False unless the atlas is promoted (extracted/ReferenceAtlas exists)
+    and is the selected project reference. Subjects:
+      * stale: a complete voxel elastic registration whose `elastic_to` is not the
+        promoted atlas. A legacy `elastic_to == 'atlas'` is the same image under its
+        pre-promotion name, so it is current, not stale.
+      * pending: a redo already deleted the stale elastic but did not re-run it yet
+        (ELASTIC_REDO_PENDING_KEY set, no complete elastic).
+    Faulty subjects, linked children (never elastic-registered themselves) and
+    preserved meshes (mesh elastic, NR-ICP, is a separate tool) are left out.
+    """
+    reference = read_selected_reference(directory)
+    plan = {
+        'applicable': False,
+        'promoted': is_reference_atlas_promoted(directory),
+        'reference': reference,
+        'subjects': [],
+        'groups': [],
+        'skipped_faulty': [],
+        'without_settings': [],
+    }
+    if not plan['promoted'] or reference != REFERENCE_ATLAS_SUBJECT:
+        return plan
+    plan['applicable'] = True
+
+    current_targets = {REFERENCE_ATLAS_SUBJECT, 'atlas'}
+    for scan_name in list_extracted_scan_names(directory):
+        if scan_name == REFERENCE_ATLAS_SUBJECT:
+            continue
+        scan_dir = os.path.join(directory, "extracted", scan_name)
+        json_path = os.path.join(scan_dir, f"{scan_name}.json")
+        try:
+            with open(json_path, 'r') as jf:
+                metadata = json.load(jf)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if is_preserved_mesh_metadata(metadata):
+            continue
+        linked_to = metadata.get('linked_to')
+        if isinstance(linked_to, str) and linked_to and linked_to != scan_name:
+            continue
+
+        complete = _has_complete_voxel_elastic_registration(directory, scan_name)
+        elastic_to = metadata.get('elastic_to') if complete else None
+        pending = metadata.get(ELASTIC_REDO_PENDING_KEY)
+        if complete and elastic_to not in current_targets:
+            state = 'stale'
+            stored_settings = metadata.get('elastic_settings')
+        elif (not complete and isinstance(pending, dict)
+                and pending.get('target') == REFERENCE_ATLAS_SUBJECT):
+            state = 'pending'
+            stored_settings = pending.get('elastic_settings')
+        else:
+            continue
+        if metadata.get('faulty', False):
+            plan['skipped_faulty'].append(scan_name)
+            continue
+
+        settings, defaulted = _elastic_redo_settings(stored_settings)
+        elastic_slots = _elastic_slot_numbers(scan_dir, scan_name) if state == 'stale' else []
+        elastic_slot = elastic_slots[0] if elastic_slots else None
+        top_edit = DeleteEditRangeView._top_edit(scan_dir, scan_name)
+        edits_above = (
+            top_edit - elastic_slot
+            if elastic_slot is not None and top_edit is not None and top_edit > elastic_slot
+            else 0
+        )
+        plan['subjects'].append({
+            'name': scan_name,
+            'state': state,
+            'elastic_to': elastic_to,
+            'elastic_edit': elastic_slot,
+            'edits_above_elastic': edits_above,
+            'settings': settings,
+            'defaulted_settings': defaulted,
+            # A masked edit inserted before the elastic keeps a pre-mask backup of it.
+            # Deleting the elastic leaves that masked edit in place, so the redo
+            # registers the masked edit (the original registered the unmasked one).
+            'inserted_mask_before_elastic': bool(
+                elastic_slot is not None and os.path.isfile(os.path.join(
+                    scan_dir, f"{scan_name}_edit_{elastic_slot}_elastic.nii.backup.gz"))
+            ),
+        })
+
+    # One elastic run per distinct settings set: ElasticRegistrationView applies one set
+    # of parameters to every subject of a run.
+    groups = {}
+    for subject in plan['subjects']:
+        if subject['settings'] is None:
+            continue
+        key = json.dumps(subject['settings'], sort_keys=True)
+        groups.setdefault(key, {'settings': subject['settings'], 'subjects': []})
+        groups[key]['subjects'].append(subject['name'])
+    plan['groups'] = list(groups.values())
+    plan['without_settings'] = [s['name'] for s in plan['subjects'] if s['settings'] is None]
+    return plan
+
+
+class RedoElasticToReferenceAtlasView(APIView):
+    """
+    Redo the voxel elastic registrations that target the pre-promotion reference.
+
+    GET  ?directory=...                  -> elastic_redo_plan (drives the preview button).
+    POST {directory, mode: 'delete'}     -> delete those elastic registrations only.
+    POST {directory, mode: 'run'}        -> delete them, then re-run each subject with
+                                            its own stored elastic settings, the target
+                                            being ReferenceAtlas.
+
+    The delete goes through DeleteEditRangeView from the elastic edit upwards, so it is
+    the same delete the working-directory tool does (an edit stacked on top of the
+    elastic goes too; the stack never keeps a gap). The re-run goes through
+    ElasticRegistrationView, one request per distinct settings set restricted to its
+    subjects, so registration, outputs, metrics and provenance are exactly those of a
+    normal elastic run.
+    """
+
+    def get(self, request):
+        directory = request.query_params.get('directory')
+        if not directory or not os.path.isdir(directory):
+            return Response({'error': 'directory is required'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(elastic_redo_plan(directory))
+
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): each subject's delete and its
+    # pending marker are one subject_transaction (the DeleteEditRangeView call joins it),
+    # so a subject is either untouched or has no elastic and the marker. The re-run is an
+    # ordinary ElasticRegistrationView run (staging folder + SubjectTransaction commit);
+    # an interrupted re-run is resumed from the preview because the marker stays until
+    # the new elastic is committed.
+    def post(self, request):
+        directory = request.data.get('directory')
+        mode = request.data.get('mode')
+        if not directory or not os.path.isdir(directory):
+            return Response({'error': 'directory is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if mode not in ('delete', 'run'):
+            return Response({'error': "mode must be 'delete' or 'run'"}, status=status.HTTP_400_BAD_REQUEST)
+
+        plan = elastic_redo_plan(directory)
+        if not plan['applicable']:
+            return Response(
+                {'error': f'The promoted atlas ({REFERENCE_ATLAS_SUBJECT}) is not the project reference.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not plan['subjects']:
+            return Response({'message': 'Every elastic registration already targets the promoted atlas.',
+                             'deleted': [], 'registered': []})
+
+        print(f"\033[93mredo elastic to {REFERENCE_ATLAS_SUBJECT} ({mode}) in {directory}: "
+              f"{[s['name'] for s in plan['subjects']]}\033[0m")
+
+        # 1. Delete every stale elastic registration (pending subjects have none left).
+        deleted, delete_failed = [], []
+        for subject in plan['subjects']:
+            if subject['state'] != 'stale':
+                continue
+            name = subject['name']
+            try:
+                with subject_transaction(directory, name, 'redo_elastic_delete'):
+                    response = DeleteEditRangeView().post(SimpleNamespace(data={
+                        'directory': directory,
+                        'filename': name,
+                        'from_edit': str(subject['elastic_edit']),
+                    }))
+                    if getattr(response, 'status_code', 200) >= 400:
+                        detail = getattr(response, 'data', {}) or {}
+                        raise RuntimeError(detail.get('error') or 'delete failed')
+                    if mode == 'run' and subject['settings'] is not None:
+                        json_path = os.path.join(directory, "extracted", name, f"{name}.json")
+                        with open(json_path, 'r') as jf:
+                            metadata = json.load(jf)
+                        metadata[ELASTIC_REDO_PENDING_KEY] = {
+                            'target': REFERENCE_ATLAS_SUBJECT,
+                            'elastic_settings': subject['settings'],
+                        }
+                        atomic_write_json(json_path, metadata, indent=4)
+                deleted.append(name)
+            except Exception as exc:  # the subject is already rolled back here
+                print(f"  could not delete the elastic of {name}: {exc}")
+                delete_failed.append({'name': name, 'error': str(exc)})
+
+        if mode == 'delete':
+            message = f"Deleted {len(deleted)} elastic registration(s)."
+            if delete_failed:
+                message += f" {len(delete_failed)} could not be deleted and were left unchanged."
+            return Response({'message': message, 'deleted': deleted, 'delete_failed': delete_failed},
+                            status=status.HTTP_200_OK)
+
+        # 2. Re-run, one ElasticRegistrationView request per settings group.
+        failed_names = {f['name'] for f in delete_failed}
+        registered, run_errors = [], []
+        for group in plan['groups']:
+            names = [n for n in group['subjects'] if n not in failed_names]
+            if not names:
+                continue
+            settings = group['settings']
+            data = {
+                'directory': directory,
+                'reference': REFERENCE_ATLAS_SUBJECT,
+                'quick_registration': settings['registration_method'],
+                'affine_initialization': settings['affine_initialization'],
+                'double_pass': settings['double_pass'],
+                'use_mask': settings['use_mask'],
+                'do_dice_adjustment': settings['do_dice_adjustment'],
+                'reference_mask_only': settings['reference_mask_only'],
+                'prefer_mask': settings['prefer_mask'],
+                'mask_label': settings['mask_label'],
+                'use_distance_map': settings['use_distance_map'],
+                # The subject list below is the whole selection; no flag filtering.
+                'flagFilter': 'off',
+                'subjects': names,
+            }
+            if settings['registration_method'] == 'custom':
+                data['elastic_custom_options'] = settings['elastic_custom_options']
+            print(f"  re-running elastic for {names} with {settings}")
+            response = ElasticRegistrationView().post(SimpleNamespace(data=data))
+            if getattr(response, 'status_code', 200) >= 400:
+                detail = getattr(response, 'data', {}) or {}
+                run_errors.append({'subjects': names, 'error': detail.get('error') or 'elastic registration failed'})
+                # A failed run stops at the failing subject; later groups still run.
+                registered.extend(n for n in names if _has_complete_voxel_elastic_registration(directory, n))
+                continue
+            registered.extend(names)
+
+        without_settings = plan.get('without_settings', [])
+        message = f"Re-registered {len(registered)} scan(s) to {REFERENCE_ATLAS_SUBJECT}."
+        if without_settings:
+            message += (f" {len(without_settings)} had no stored elastic settings: their elastic was deleted; "
+                        f"run the elastic tool for them.")
+        if delete_failed:
+            message += f" {len(delete_failed)} could not be deleted and were left unchanged."
+        if run_errors:
+            message += " Some registrations failed: " + "; ".join(e['error'] for e in run_errors)
+        return Response(
+            {
+                'message': message,
+                'deleted': deleted,
+                'registered': registered,
+                'delete_failed': delete_failed,
+                'run_errors': run_errors,
+                'without_settings': without_settings,
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR if run_errors and not registered else status.HTTP_200_OK,
+        )
+
+
 class GetProjectSettingsView(APIView):
     def post(self, request):
         directory = request.data.get('directory')
@@ -22904,7 +23325,7 @@ class DeleteScientificReportView(APIView):
                 if not real.startswith(extracted_real + os.sep):
                     return Response({'error': 'invalid path'}, status=400)
                 if os.path.isfile(path):
-                    os.remove(path)
+                    tracked_remove(path)  # CRASH-SAFE PROTOCOL: undoable inside a transaction
                     deleted.append(os.path.basename(path))
 
             if not deleted:

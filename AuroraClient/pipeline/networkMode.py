@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 
 LAB_ORIGIN_PRODUCTION = "https://hallgrimssonlab.ca"
 CHECK_IN_SECONDS = 5 * 60
-CHECK_IN_BUSY_SECONDS = 20    # while a job runs, so the website's progress and time left stay fresh
+CHECK_IN_BUSY_SECONDS = 20    # while a job runs and someone has My Aurora servers open (lab says "watched")
+CHECK_IN_BUSY_UNWATCHED_SECONDS = 120  # while a job runs and nobody is looking: spares the lab server
 MIN_EVENT_GAP_SECONDS = 15    # someone arriving/leaving or a job starting/ending checks in at once, at most this often
 POLL_SECONDS = 30  # how often the engine notices a new pairing or retries a failed check-in
 PAIR_POLL_SECONDS = 4
@@ -192,6 +193,15 @@ def run_pairing_cli(lab_origin: str, name: str, reset: bool) -> int:
         print("Check this computer's internet connection (or that the dev site is running) and try again.")
         return 1
     data = response.json() if response.headers.get("Content-Type", "").startswith("application/json") else {}
+    known = _known_pairing(response, data)
+    if known:
+        # Run by an administrator at this computer, with this computer's own key: the lab
+        # already lists it, so only the local record was missing.
+        _restore_pairing(lab_origin, key, known)
+        print(f"\n  This computer was already paired: \"{known['server_name']}\", owned by "
+              f"{known['owner']['name']}. Restored that pairing.")
+        print("  To give it to someone else instead: sudo aurora-tools pair --reset\n")
+        return 0
     if response.status_code != 200:
         print(f"\nCould not start pairing: {data.get('error') or response.status_code}")
         return 1
@@ -264,9 +274,53 @@ def _pair_public(flow: dict) -> dict:
     return {key: flow.get(key) for key in ("code", "pair_url", "expires_at", "state", "claimed_by", "error")}
 
 
-def pair_start(lab_origin: str, name: str) -> dict:
+def _known_pairing(response, data: dict) -> dict:
+    """The lab's record of this computer when pairing start says it is already paired
+    (409 already_paired with its server name and owner; older labs send no record), else {}."""
+    if response.status_code != 409 or data.get("code") != "already_paired":
+        return {}
+    server = data.get("server") if isinstance(data.get("server"), dict) else {}
+    owner = server.get("owner") if isinstance(server.get("owner"), dict) else {}
+    if not owner.get("id"):
+        return {}
+    return {"server_name": str(server.get("name") or "")[:100],
+            "owner": {"id": str(owner["id"]), "name": str(owner.get("name") or "")[:120],
+                      "email": str(owner.get("email") or "")[:200]}}
+
+
+def _restore_pairing(lab_origin: str, key, known: dict) -> dict:
+    """Write the local pairing record from the lab's own record of this key (see
+    _known_pairing). Nothing changes on the lab: the computer just learns again that it
+    is the server the lab already knows, so its group and members stay as they were."""
+    if (pairing_state() or {}).get("lab_origin") not in (None, lab_origin):
+        # Switching lab website: the old group belongs to the old one.
+        try:
+            _group_path().unlink()
+        except OSError:
+            pass
+    _write_private_json(_pairing_path(), {
+        "lab_origin": lab_origin,
+        "server_name": known["server_name"],
+        "owner": {"name": known["owner"]["name"], "email": known["owner"]["email"]},
+        "key_fingerprint": key_fingerprint(key),
+        "paired_at": time.time(),
+        "restored": True,
+    })
+    logger.warning("Pairing with %s restored: this computer is already \"%s\" owned by %s.",
+                   lab_origin, known["server_name"], known["owner"]["name"])
+    threading.Thread(target=check_in_once, name="aurora-pair-check-in", daemon=True).start()
+    return {"state": "paired", "server_name": known["server_name"], "restored": True}
+
+
+def pair_start(lab_origin: str, name: str, user_id: str = "", restore_only: bool = False) -> dict:
     """Ask the lab for a pairing code. The person types it on the website, then confirms
-    here who claimed it (pair_confirm). Raises ValueError with a readable message."""
+    here who claimed it (pair_confirm). Raises ValueError with a readable message.
+
+    If the lab already knows this computer's key and its owner is `user_id` (the person
+    signed in at this computer), the local record is restored instead and no code is
+    needed (returns state "paired"). Someone else still cannot take the computer over.
+    restore_only: refuse to hand out a code (the shared service's working pairing with
+    another lab website changes owner only through sudo aurora-tools pair --reset)."""
     lab_origin = (lab_origin or LAB_ORIGIN_PRODUCTION).rstrip("/")
     if lab_origin not in engineConfig.trusted_lab_origins():
         raise ValueError(f"{lab_origin} is not a lab website Aurora trusts.")
@@ -280,6 +334,19 @@ def pair_start(lab_origin: str, name: str) -> dict:
         data = response.json()
     except Exception as exc:  # noqa: BLE001 - lab unreachable or not JSON
         raise ValueError(f"Could not reach the lab website at {lab_origin}.") from exc
+    known = _known_pairing(response, data)
+    if known and user_id and known["owner"]["id"] == str(user_id):
+        with _pair_lock:
+            _pair_flow.clear()
+        return _restore_pairing(lab_origin, key, known)
+    if known:
+        raise ValueError(
+            f"This computer is already paired with {known['owner']['name']} on this lab website. "
+            f"{known['owner']['name']} can remove it under My Aurora servers so you can pair it, "
+            "or an administrator of this computer can run: sudo aurora-tools pair --reset")
+    if restore_only:
+        raise ValueError("This computer is paired with another lab website. To pair it with "
+                         "this one, in a terminal: sudo aurora-tools pair --reset")
     if response.status_code != 200:
         raise ValueError(f"Could not start pairing: {data.get('error') or response.status_code}")
     with _pair_lock:
@@ -553,6 +620,7 @@ def check_in_once(lease: dict | None = None) -> bool:
 
 
 _lab_unreachable: dict = {}   # lab origin -> True while its check-ins fail to connect
+_lab_watching = {"value": True}   # last check-in answer; a lab without the flag counts as watching
 
 
 def _check_in_post(state: dict, config: dict, lease, activity, reports: list) -> bool:
@@ -593,6 +661,7 @@ def _check_in_post(state: dict, config: dict, lease, activity, reports: list) ->
         logger.info("Aurora check-in refused: %s", response.status_code)
         return False
     data = response.json()
+    _lab_watching["value"] = bool(data.get("watched", True))
     group = {
         "name": data.get("name"),
         "owner": data.get("owner"),
@@ -643,7 +712,10 @@ def start_check_in_thread() -> None:
                 continue
             now = time.time()
             key = engineActivity.state_key()
-            interval = CHECK_IN_BUSY_SECONDS if key[2] else CHECK_IN_SECONDS
+            if key[2]:
+                interval = CHECK_IN_BUSY_SECONDS if _lab_watching["value"] else CHECK_IN_BUSY_UNWATCHED_SECONDS
+            else:
+                interval = CHECK_IN_SECONDS
             due = now - last_ok >= interval
             # After a failed check-in (lab unreachable) wait longer before trying again.
             gap = POLL_SECONDS * 2 if last_failed else MIN_EVENT_GAP_SECONDS

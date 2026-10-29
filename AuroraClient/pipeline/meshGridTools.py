@@ -25,7 +25,7 @@ from .registrationTools import (
     save_projection_png,
 )
 # Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
-from .crashSafety import atomic_mesh_export
+from .crashSafety import atomic_mesh_export, match_new_file_mode
 
 
 QUADRANT_RENDER_SIZE = 512
@@ -94,6 +94,7 @@ def _atomic_write_json(json_path, payload, retries=5, delay=0.05):
             suffix='.tmp',
             dir=directory,
         )
+        match_new_file_mode(tmp_path)  # mkstemp makes 0600: keep shared folders readable
         try:
             with os.fdopen(fd, 'w') as jf:
                 json.dump(payload, jf, indent=4)
@@ -561,7 +562,9 @@ def _render_mesh_screenshot(
     transparent=False,
     image_orientation='rotate180',
 ):
-    _ensure_vtk_headless()
+    if not _ensure_vtk_headless():
+        # Headless and no working off-screen window: VTK would segfault the engine.
+        raise RuntimeError("VTK off-screen rendering is not available here")
     import pyvista as pv
 
     pv.OFF_SCREEN = True

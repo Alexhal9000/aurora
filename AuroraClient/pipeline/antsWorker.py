@@ -17,6 +17,18 @@ under the system temp folder, which callers delete as before. The warped images
 (warpedmovout/warpedfixout) are not sent back; no caller here uses them (pass
 return_images=True if one ever does).
 
+Live progress (verbose=True calls): the worker's output comes back through a pipe, is
+passed on to the console unchanged, and is read on the way to know which resolution level
+and iteration ANTs is at and its latest metric value (see "Live progress" below). Pass
+progress=callable to get that state about once a second:
+
+    antsWorker.registration(..., verbose=True, progress=lambda state: ...)
+    state = {"fraction": 0..1 of this registration, "level", "levels", "iteration",
+             "iterations", "scale", "metric", "value", "text": "level 3 of 4 (1/2 scale), ..."}
+
+One line per finished level (iterations run, converged early or not, time, metric) is also
+printed through the engine, so the terminal viewer shows it.
+
 AURORA_ANTS_IN_PROCESS=1 runs registrations in the engine as before (fallback, debugging).
 Small 2D slice registrations (resampleAnisotropicVoxels) stay in-process: the 1-2 s it
 takes to start a worker would cost more than the call.
@@ -286,17 +298,23 @@ def _describe_exit(returncode: int) -> str:
     return f"it exited with code {returncode}"
 
 
-def _wait_and_measure(proc) -> dict:
+def _wait_and_measure(proc, on_tick=None) -> dict:
     """Wait for the worker (sleeping, so the engine stays free) and note its peak memory
-    and the lowest free memory on the computer, for the terminal log."""
+    and the lowest free memory on the computer, for the terminal log. on_tick() is called
+    about once a second meanwhile (live progress)."""
     try:
         import psutil
         child = psutil.Process(proc.pid)
     except Exception:  # noqa: BLE001 - no psutil or already gone: just wait
-        proc.wait()
+        while proc.poll() is None:
+            if on_tick is not None:
+                on_tick()
+            time.sleep(1.0)
         return {}
     peak = {"worker_gb": 0.0, "min_available_gb": None}
     while proc.poll() is None:
+        if on_tick is not None:
+            on_tick()
         try:
             rss = child.memory_info().rss / 1024 ** 3
             available = psutil.virtual_memory().available / 1024 ** 3
@@ -400,8 +418,199 @@ def worker_memory_bytes() -> int:
         return 0
 
 
-def registration(return_images: bool = False, **kwargs) -> dict:
-    """ants.registration(**kwargs), run in a worker process. See the module docstring."""
+# ---------------------------------------------------------------------------
+# Live progress from ANTs' verbose output (registrations run with verbose=True)
+# ---------------------------------------------------------------------------
+#
+# With -v, antsRegistration prints a header at the start of every resolution level and
+# one line per iteration (XX/1 = SyN, no prefix/2 = affine):
+#
+#   XXDIAGNOSTIC,Iteration,metricValue,convergenceValue,ITERATION_TIME_INDEX,SINCE_LAST
+#    1DIAGNOSTIC,     9, -9.754020571709e-01, -4.707619664259e-04, 4.3768e-02, 4.2770e-03,
+#
+# The schedule (iterations and shrink factor of every level) is read from the
+# "antsRegistration ..." command line that ANTsPy prints first. Levels with 0 iterations
+# print no header, so the n-th header is the n-th level that has iterations.
+#
+# Fraction done: a level's iteration count is a MAXIMUM. ANTs ends a level as soon as the
+# metric stops improving (e.g. --convergence [200x70x50x0,1e-7,8]: slope of the last 8
+# values below 1e-7), often well before it, and the estimate then jumps to the next level.
+# Levels are weighted by cost, iterations / shrink^dimension (a 3D level at half scale has
+# 1/8 of the voxels), so the full-scale levels, where nearly all the time goes, count most.
+#
+# Metric values (ANTs minimises; computed inside the mask on the smoothed, downsampled
+# images of the current level, so values of different levels are not comparable):
+#   CC      minus the mean squared local (neighbourhood) correlation r^2 -> "similarity 97.4%"
+#   GC      minus the squared global correlation r^2                    -> "similarity 99.1%"
+#   Mattes  minus the mutual information (nats)                         -> "mutual information 0.55"
+#   MeanSquares, Demons  mean squared intensity difference              -> "RMS difference 0.012"
+# (r^2 checked with ants.image_similarity: an image against its negative gives -1.)
+
+_DIAGNOSTIC_HEADER = "DIAGNOSTIC,Iteration"
+_DIAGNOSTIC_LINE_RE = re.compile(r"DIAGNOSTIC,\s*(\d+),\s*([^,\s]+)\s*,")
+
+
+def schedule_work(iterations, shrink_factors=None, dimension: int = 3) -> float:
+    """Relative cost of a registration level schedule: sum of iterations / shrink^dimension.
+    Without shrink factors, ANTsPy's SyN default for len(iterations) levels is used
+    (..., 8, 4, 2, 1). Used to weight levels, and passes against each other."""
+    iterations = [max(0, int(n)) for n in (iterations or [])]
+    if shrink_factors is None:
+        shrink_factors = [2 ** (len(iterations) - 1 - level) for level in range(len(iterations))]
+    return float(sum(n / float(max(1, s)) ** dimension for n, s in zip(iterations, shrink_factors)))
+
+
+def describe_metric(metric: str, value) -> str:
+    """Readable text for an ANTs metric value (see the table above); '' when unknown."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if value != value or value in (float("inf"), float("-inf")):
+        return ""
+    name = (metric or "").lower()
+    if name in ("cc", "gc"):
+        return f"similarity {max(0.0, -value) * 100:.1f}%"
+    if name in ("mattes", "mi"):
+        return f"mutual information {-value:.3f}"
+    if name in ("meansquares", "demons"):
+        return f"RMS difference {max(0.0, value) ** 0.5:.3g}"
+    return f"metric {value:.4g}"
+
+
+def _scale_text(shrink: int) -> str:
+    return "full scale" if shrink <= 1 else f"1/{shrink} scale"
+
+
+class _VerboseProgress:
+    """Follows one worker's verbose output (line by line, from the output thread) and
+    keeps where the registration is. snapshot() is read from the waiting thread."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.levels = []          # [{transform, metric, iterations, shrink, weight}]
+        self.dimension = 3
+        self.level = -1           # index into self.levels of the running level
+        self.iteration = 0
+        self.value = None
+        self.level_started = None
+
+    def feed(self, line: str) -> None:
+        if line.startswith("antsRegistration "):
+            self._read_schedule(line.split())
+            return
+        if "DIAGNOSTIC" not in line:
+            return
+        if _DIAGNOSTIC_HEADER in line:
+            with self._lock:
+                self._end_level()
+                self.level += 1
+                self.iteration, self.value = 0, None
+                self.level_started = time.time()
+            return
+        match = _DIAGNOSTIC_LINE_RE.search(line)
+        if match:
+            with self._lock:
+                self.iteration = int(match.group(1))
+                try:
+                    self.value = float(match.group(2))
+                except ValueError:
+                    pass
+
+    def _read_schedule(self, tokens) -> None:
+        stages, metric = [], None
+        for position, token in enumerate(tokens[:-1]):
+            value = tokens[position + 1]
+            if token == "--dimensionality" and value.isdigit():
+                self.dimension = int(value)
+            elif token == "--metric":
+                metric = value.split("[", 1)[0]
+            elif token == "--transform":
+                stages.append({"transform": value.split("[", 1)[0], "metric": metric,
+                               "iterations": [], "shrink": []})
+            elif token == "--convergence" and stages:
+                stages[-1]["iterations"] = [int(n) for n in re.findall(r"\d+", value.strip("[").split(",")[0])]
+            elif token == "--shrink-factors" and stages:
+                stages[-1]["shrink"] = [int(n) for n in re.findall(r"\d+", value)]
+        levels = []
+        for stage in stages:
+            for position, count in enumerate(stage["iterations"]):
+                shrink = stage["shrink"][position] if position < len(stage["shrink"]) else 1
+                if count > 0:
+                    levels.append({"transform": stage["transform"], "metric": stage["metric"],
+                                   "iterations": count, "shrink": shrink,
+                                   "weight": schedule_work([count], [shrink], self.dimension)})
+        with self._lock:
+            self.levels, self.level = levels, -1
+
+    def _end_level(self) -> None:
+        """Terminal line for the level that just ended (lock held). Only these summaries
+        reach the engine terminal viewer; the full ANTs output goes to the console."""
+        if not (0 <= self.level < len(self.levels)) or not self.iteration:
+            return
+        level = self.levels[self.level]
+        stopped = ("converged early" if self.iteration < level["iterations"]
+                   else "all iterations")
+        seconds = time.time() - self.level_started if self.level_started else 0.0
+        metric = describe_metric(level["metric"], self.value)
+        print(f"[ANTs worker] {level['transform']} level {self.level + 1}/{len(self.levels)} "
+              f"({_scale_text(level['shrink'])}): {self.iteration} of {level['iterations']} "
+              f"iterations ({stopped}) in {seconds:.0f}s"
+              f"{', ' + level['metric'] + ' ' + metric if metric else ''}", flush=True)
+
+    def finish(self) -> None:
+        with self._lock:
+            self._end_level()
+            self.level = len(self.levels)
+
+    def snapshot(self):
+        """{"fraction", "level", "levels", "iteration", "iterations", "scale", "metric",
+        "value", "text"} of the running level, or None before the first level starts."""
+        with self._lock:
+            if not self.levels or not (0 <= self.level < len(self.levels)):
+                return None
+            level = self.levels[self.level]
+            total = sum(item["weight"] for item in self.levels) or 1.0
+            done = sum(item["weight"] for item in self.levels[:self.level])
+            done += level["weight"] * min(1.0, self.iteration / level["iterations"])
+            metric = describe_metric(level["metric"], self.value)
+            text = (f"level {self.level + 1} of {len(self.levels)} ({_scale_text(level['shrink'])}), "
+                    f"iteration {self.iteration} of at most {level['iterations']}")
+            return {
+                "fraction": max(0.0, min(1.0, done / total)),
+                "level": self.level + 1, "levels": len(self.levels),
+                "iteration": self.iteration, "iterations": level["iterations"],
+                "scale": level["shrink"], "metric": level["metric"], "value": self.value,
+                "text": text + (f", {metric}" if metric else ""),
+            }
+
+
+def _pump_output(stream, follower: _VerboseProgress) -> None:
+    """Output thread: pass every worker line on to the console unchanged (as when the worker
+    wrote there itself) and let `follower` read it. Must never stop early: a pipe nobody
+    reads fills up and blocks the worker."""
+    console = getattr(sys.__stdout__, "buffer", None)
+    for raw in iter(stream.readline, b""):
+        try:
+            if console is not None:
+                console.write(raw)
+                console.flush()
+        except Exception:  # noqa: BLE001 - no console (Windows service): keep reading
+            console = None
+        try:
+            follower.feed(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
+        except Exception:  # noqa: BLE001 - progress is cosmetic
+            pass
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def registration(return_images: bool = False, progress=None, **kwargs) -> dict:
+    """ants.registration(**kwargs), run in a worker process. See the module docstring.
+    progress: optional callable(state), called about once a second with the live state of
+    a verbose=True registration (not called in-process)."""
     if os.environ.get("AURORA_ANTS_IN_PROCESS") == "1":
         import ants
         result = ants.registration(**kwargs)
@@ -414,6 +623,12 @@ def registration(return_images: bool = False, **kwargs) -> dict:
     track_temp_output(os.path.join(work_dir, "result.pickle"))  # removes the run folder at scope end
     result_path = os.path.join(work_dir, "result.pickle")
     env = dict(os.environ, TMPDIR=work_dir, TEMP=work_dir, TMP=work_dir)
+    # Verbose runs: read the worker's output on its way to the console (live progress).
+    # Unbuffered, so ANTsPy's command line (the level schedule) arrives before ANTs' lines.
+    follow = bool(kwargs.get("verbose"))
+    if follow:
+        env["PYTHONUNBUFFERED"] = "1"
+    follower = _VerboseProgress()
     started = time.time()
     try:
         proc = subprocess.Popen(
@@ -421,15 +636,40 @@ def registration(return_images: bool = False, **kwargs) -> dict:
             cwd=str(_AURORA_CLIENT_DIR),
             env=env,
             stdin=subprocess.PIPE,
-            # ANTs' verbose output goes to the engine's terminal/log, as before.
+            # Not verbose: ANTs' output goes straight to the engine's console, as before.
+            stdout=subprocess.PIPE if follow else None,
         )
+        reader = None
+        if follow:
+            # Started before the images are sent: the worker may print while it receives them.
+            reader = threading.Thread(target=_pump_output, args=(proc.stdout, follower),
+                                      name="ants-worker-output", daemon=True)
+            reader.start()
+        last_state = None
+
+        def report_progress():
+            nonlocal last_state
+            if progress is None:
+                return
+            state = follower.snapshot()
+            if state is None or state == last_state:
+                return
+            last_state = state
+            try:
+                progress(state)
+            except Exception as exc:  # noqa: BLE001 - progress is cosmetic
+                print(f"[ANTs worker] progress callback failed: {exc}", flush=True)
+
         try:
             pickle.dump({"kwargs": _pack(kwargs), "return_images": return_images},
                         proc.stdin, protocol=pickle.HIGHEST_PROTOCOL)
             proc.stdin.close()
         except BrokenPipeError:
             pass  # the worker died at start; its exit code says why
-        peak = _wait_and_measure(proc)
+        peak = _wait_and_measure(proc, report_progress if follow else None)
+        if reader is not None:
+            reader.join(timeout=10)  # the last lines (end of the final level)
+            follower.finish()
         returncode = proc.returncode
         outcome = None
         try:

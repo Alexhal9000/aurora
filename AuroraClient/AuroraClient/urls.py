@@ -191,6 +191,7 @@ urlpatterns = [
     path('get-report-environment/', GetReportEnvironmentView.as_view(), name='get_report_environment'),
     path('display-environment/', DisplayEnvironmentView.as_view(), name='display_environment'),
     path('make-atlas-reference/', MakeAtlasReferenceView.as_view(), name='make_atlas_reference'),
+    path('redo-elastic-to-reference-atlas/', RedoElasticToReferenceAtlasView.as_view(), name='redo_elastic_to_reference_atlas'),
     path('get-all-subjects-mesh/', GetAllSubjectsMeshView.as_view(), name='get_all_subjects_mesh'),
     path('get-version/', GetVersionView.as_view(), name='get_version'),
     path('preview-denoise/', PreviewDenoiseView.as_view(), name='preview_denoise'),
