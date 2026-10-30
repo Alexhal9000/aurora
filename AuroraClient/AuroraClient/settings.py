@@ -114,6 +114,9 @@ MIDDLEWARE = [
     # Every engine route except the SPA shell, media, docs and /get-version/ needs an
     # engine session created from a lab-signed handoff pass (pipeline/engineAuth.py).
     'pipeline.engineAuth.EngineSessionMiddleware',
+    # A failed request (status >= 400) prints its message, parameters, who asked and the
+    # traceback behind it, and keeps it for problem reports (pipeline/engineTerminal.py).
+    'pipeline.engineTerminal.ErrorDetailMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',

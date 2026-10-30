@@ -53,9 +53,8 @@ class BackgroundOffsetEstimationTests(unittest.TestCase):
         zz, yy, xx = np.indices(shape, dtype=np.float32)
         r = np.sqrt((zz - 48) ** 2 + (yy - 48) ** 2 + (xx - 48) ** 2)
         volume = np.full(shape, 1000.0, dtype=np.float32)
-        # Body fills most of the field of view, as in whole-animal CT. The near
-        # band peaks on tissue only when tissue dominates it; with a thin
-        # tissue layer (radius <= 36 here) the near band still peaks on air.
+        # Body fills most of the field of view, as in whole-animal CT. (A thin
+        # tissue layer is covered by the air-exclusion test below.)
         volume[r <= 40] = 8000.0
         volume[r <= 12] = 20000.0
         volume += rng.normal(0.0, 300.0, size=shape).astype(np.float32)
@@ -66,6 +65,30 @@ class BackgroundOffsetEstimationTests(unittest.TestCase):
         tissue, info = estimate_background_peak(volume, 15000, region=REGION_SURROUNDING_TISSUE)
         self.assertLess(abs(tissue - 8000), 80)
         self.assertEqual(info['region'], REGION_SURROUNDING_TISSUE)
+
+    def test_tissue_found_when_thin_layer_shares_near_band_with_air(self):
+        # Thin soft tissue around bone (skulls, limbs): the near band holds
+        # more tissue than air, but air is a much narrower peak, so without
+        # air exclusion its fullest histogram bin wins (seen on Scanco skull
+        # CT, where tissue ~35,000 lost to air ~32,790).
+        rng = np.random.default_rng(2)
+        shape = (96, 96, 96)
+        zz, yy, xx = np.indices(shape, dtype=np.float32)
+        r = np.sqrt((zz - 48) ** 2 + (yy - 48) ** 2 + (xx - 48) ** 2)
+        volume = np.full(shape, 1000.0, dtype=np.float32)
+        noise = np.full(shape, 60.0, dtype=np.float32)
+        volume[r <= 30] = 8000.0
+        noise[r <= 30] = 900.0
+        volume[r <= 10] = 20000.0
+        volume += rng.normal(0.0, 1.0, size=shape).astype(np.float32) * noise
+        volume = np.clip(volume, 0, 65535).astype(np.uint16)
+        tissue, info = estimate_background_peak(volume, 15000, region=REGION_SURROUNDING_TISSUE)
+        self.assertLess(abs(tissue - 8000), 250, info)
+        self.assertEqual(info['air_exclusion'], 'applied')
+        self.assertLess(abs(info['air_peak'] - 1000), 40)
+        # Surrounding air is unaffected by the exclusion step.
+        air, _ = estimate_background_peak(volume, 15000, region=REGION_OUTSIDE)
+        self.assertLess(abs(air - 1000), 40)
 
     def test_constant_padding_is_ignored(self):
         volume = _phantom(pad=True)

@@ -31,5 +31,4 @@ export-landmarks-json=Export landmarks (JSON)
 export-landmark-distances=Export landmark distances
 batch-apply-mask-to-scans=Apply masks
 apply-mask-to-image=Apply masks (single)
-# Transfer masks → PropagateMaskView (add entry when documented):
-# propagate-mask=Transfer masks
+propagate-mask=Transfer masks

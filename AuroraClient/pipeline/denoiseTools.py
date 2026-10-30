@@ -1027,22 +1027,25 @@ class DenoiseAllScansView(APIView):
                         denoised_data = self.denoise_median(scan_data)
 
                     elif algorithm == 'NonLocalMeans':
+                        # Same names and defaults as Denoise preview and the UI (patch_size /
+                        # patch_distance, DENOISE_PARAMETER_DEFAULTS); template_size / search_size
+                        # are still accepted from older API callers.
                         denoised_data = self.denoise_nl_means_module(scan_data,
-                                                             parameters.get('h', 0.1),
-                                                             parameters.get('template_size', 7),
-                                                             parameters.get('search_size', 21),
+                                                             parameters.get('h', 0.01),
+                                                             parameters.get('patch_size', parameters.get('template_size', 7)),
+                                                             parameters.get('patch_distance', parameters.get('search_size', 11)),
                                                              split=True,
                                                              mode=parameters.get('mode', "2.5D"))
                     elif algorithm == 'TotalVariationChambolle':
                         denoised_data = self.denoise_tv_chambolle(scan_data,
                                                                  parameters.get('weight', 0.1),
-                                                                 parameters.get('eps', 0.002),
+                                                                 parameters.get('eps', 0.0002),
                                                                  parameters.get('max_num_iter', 200))
                     elif algorithm == 'TotalVariationBregman':
                         denoised_data = self.denoise_tv_bregman(scan_data,
-                                                               parameters.get('weight', 0.1),
-                                                               parameters.get('eps', 0.002),
-                                                               parameters.get('max_num_iter', 200))
+                                                               parameters.get('weight', 5.0),
+                                                               parameters.get('eps', 0.001),
+                                                               parameters.get('max_num_iter', 100))
                     elif algorithm == 'Wavelet':
                         denoised_data = self.denoise_wavelet(scan_data,
                                                             parameters.get('wavelet', 'db1'),
@@ -1050,10 +1053,12 @@ class DenoiseAllScansView(APIView):
                                                             parameters.get('sigma', 0.1))
                     elif algorithm == 'Butterworth':
                         denoised_data = self.denoise_butterworth(scan_data,
-                                                                parameters.get('cutoff', 0.05),
+                                                                parameters.get('cutoff', 0.005),
                                                                 parameters.get('order', 2),
-                                                                parameters.get('high_pass', True),
-                                                                parameters.get('squared_butterworth', False))
+                                                                # Low-pass by default: high-pass keeps noise and removes the
+                                                                # smooth signal (was True here, unlike preview/UI defaults).
+                                                                parameters.get('high_pass', False),
+                                                                parameters.get('squared_butterworth', True))
                     else:
                         raise ValueError(f"Unknown algorithm: {algorithm}")
                 

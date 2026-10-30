@@ -446,6 +446,9 @@ def status_payload(record: dict) -> dict:
         # Header servers icon: yellow while someone else is using this shared computer.
         "in_use_by_other": shared and _in_use_by_other(record),
         "request_ttl_hours": REQUEST_TTL_SECONDS // 3600,
+        # The person at this computer: their home folder, so Settings can turn the open
+        # project's "~/..." path into the full path it suggests sharing.
+        "home": str(Path.home()) if not record.get("remote") else "",
     }
     if record.get("remote") and not payload["can_manage"]:
         # A member sees only the folders given to them, not the names of everyone else's.
@@ -604,6 +607,9 @@ class EngineSharingView(APIView):
         shared = service or engineConfig.is_network_mode()
 
         def refuse(message, code=status.HTTP_400_BAD_REQUEST):
+            # Said in the log too: the access log alone only shows "Bad Request", which
+            # tells nothing when a report or the terminal is all there is to go on.
+            logger.warning("Sharing action %r by %s refused: %s", action, record.get("name") or "someone", message)
             return Response({"error": message}, status=code)
 
         def done(**extra):
@@ -697,6 +703,18 @@ class EngineSharingView(APIView):
                 _request_path().unlink()
             except OSError:
                 pass
+            return done()
+
+        if action == "remember_folders":
+            # Sharing off: the folders chosen in Settings are kept for when it is turned on
+            # (nothing is shared or granted yet; only "Turn on" asks for admin rights).
+            if shared or record.get("remote"):
+                return refuse("Change the shared folders with a request while sharing is on.")
+            try:
+                folders = _clean_folders(data.get("folders"))
+            except ValueError as exc:
+                return refuse(str(exc))
+            engineConfig.write_config(shared_folders=folders)
             return done()
 
         try:

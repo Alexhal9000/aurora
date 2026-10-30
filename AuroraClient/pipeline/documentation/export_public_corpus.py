@@ -255,6 +255,90 @@ def _transcript_txt(segments: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+# Same headings, order and effect labels as DocsConsiderations in DocumentationPanel.js.
+_CONSIDERATION_TEXT_FIELDS = (("why", "Why use it"), ("howItWorks", "Why it works"))
+_CONSIDERATION_SECTIONS = (
+    ("why", "Why use it"),
+    ("useWhen", "Use it when"),
+    ("skipWhen", "Skip it when"),
+    ("downstream", "Effect on later steps"),
+    ("howItWorks", "Why it works"),
+    ("badParameters", "Signs of poor parameters"),
+    ("goodParameters", "Good parameters"),
+    ("tuning", "Finding the best values"),
+    ("testing", "How to check the result"),
+)
+_CONSIDERATION_EFFECTS = {"helps": "Helps", "neutral": "No difference", "caution": "Caution"}
+
+
+def _consideration_items(key: str, value: Any) -> List[str]:
+    """Flatten one considerations field into plain-text list items."""
+    if not isinstance(value, list):
+        return []
+    items: List[str] = []
+    for row in value:
+        if key == "downstream" and isinstance(row, dict):
+            step = _plain(row.get("step") or row.get("entryId") or "").strip()
+            effect = _CONSIDERATION_EFFECTS.get(row.get("effect"), "")
+            note = _plain(row.get("note", "")).strip()
+            head = f"{step} ({effect})" if effect else step
+            items.append(f"{head}: {note}" if note else head)
+        else:
+            text = _plain(row).strip()
+            if text:
+                items.append(text)
+    return items
+
+
+def _considerations_sections(method: Dict[str, Any]) -> List[tuple]:
+    """[(heading, text_or_None, items, ordered)] for the non-empty considerations fields."""
+    considerations = method.get("considerations")
+    if not isinstance(considerations, dict):
+        return []
+    out = []
+    for key, heading in _CONSIDERATION_SECTIONS:
+        value = considerations.get(key)
+        if key in dict(_CONSIDERATION_TEXT_FIELDS):
+            text = _plain(value or "").strip()
+            if text:
+                out.append((heading, text, [], False))
+        else:
+            items = _consideration_items(key, value)
+            if items:
+                out.append((heading, None, items, key == "tuning"))
+    return out
+
+
+def _considerations_html(method: Dict[str, Any]) -> str:
+    sections = _considerations_sections(method)
+    if not sections:
+        return ""
+    parts = ["<h4>Considerations</h4>"]
+    for heading, text, items, ordered in sections:
+        parts.append(f"<h5>{_esc(heading)}</h5>")
+        if text:
+            parts.append(_paragraphs_html(text))
+        else:
+            tag = "ol" if ordered else "ul"
+            parts.append(f"<{tag}>" + "".join(f"<li>{_esc(i)}</li>" for i in items) + f"</{tag}>")
+    return "\n".join(parts)
+
+
+def _considerations_txt(method: Dict[str, Any]) -> str:
+    sections = _considerations_sections(method)
+    if not sections:
+        return ""
+    lines = ["Considerations"]
+    for heading, text, items, ordered in sections:
+        lines.append(f"{heading}:")
+        if text:
+            lines.append(text)
+        else:
+            for idx, item in enumerate(items, 1):
+                lines.append(f"{idx}. {item}" if ordered else f"- {item}")
+    return "\n".join(lines)
+
+
 def _structured_data(corpus: Dict[str, Any]) -> Dict[str, Any]:
     title = corpus.get("title") or "Aurora Documentation"
     generated = corpus.get("generatedAt") or None
@@ -387,6 +471,7 @@ def corpus_to_html(corpus: Dict[str, Any]) -> str:
                 if method.get("summary"):
                     parts.append("<h4>Summary</h4>")
                     parts.append(_paragraphs_html(method.get("summary", "")))
+                parts.append(_considerations_html(method))
                 parts.append(_render_options_html(method.get("options") or []))
                 parts.append(_render_outputs_html(method.get("outputs") or []))
                 if method.get("algorithm"):
@@ -442,6 +527,9 @@ def corpus_to_txt(corpus: Dict[str, Any]) -> str:
                 summary = _paragraphs_txt(method.get("summary", ""))
                 if summary:
                     lines.extend(["Summary", summary, ""])
+                considerations = _considerations_txt(method)
+                if considerations:
+                    lines.extend([considerations, ""])
                 opts = _options_txt(method.get("options") or [])
                 if opts:
                     lines.extend([opts, ""])

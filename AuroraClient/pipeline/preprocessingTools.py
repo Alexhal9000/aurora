@@ -2696,7 +2696,7 @@ class MatchHistogramView(APIView):
             except Exception as e:
                 print(f"Error processing {scan_name}: {str(e)}")
     
-    def match_histogram_percentile_normalize(self, directory, reference, scan_names, reference_data, reference_threshold, reference_metadata, total_scans, channel_layer, percentile_low=2, percentile_high=98):
+    def match_histogram_percentile_normalize(self, directory, reference, scan_names, reference_data, reference_threshold, reference_metadata, total_scans, channel_layer, percentile_low=2, percentile_high=99.5):
         """Clip to [percentile_low, percentile_high] (foreground) and linearly map to the full data type range."""
         for idx, scan_name in enumerate(scan_names):
             try:
@@ -2930,7 +2930,7 @@ class MatchHistogramView(APIView):
             print(f"  Error handling paired landmark files (histmatched): {le}")
 
 
-    def match_histogram(self, directory, reference, method="histogram_match", percentile_low=2, percentile_high=98, onlyCurrentScan=False, selectedScan=None, flag_filter='off'):
+    def match_histogram(self, directory, reference, method="histogram_match", percentile_low=2, percentile_high=99.5, onlyCurrentScan=False, selectedScan=None, flag_filter='off'):
         print(f"Starting histogram matching with reference: {reference}, method: {method}")
         
         # Load the reference and find scan names (existing logic)
@@ -3116,7 +3116,9 @@ class MatchHistogramView(APIView):
         reference = request.data.get('reference')
         method = request.data.get('method', 'histogram_match')
         percentile_low = request.data.get('percentile_low', 2)
-        percentile_high = request.data.get('percentile_high', 98)
+        # 99.5 rather than 98: percentiles count every voxel (air included), so on small
+        # specimens the 98th percentile can land inside the brightest anatomy.
+        percentile_high = request.data.get('percentile_high', 99.5)
         onlyCurrentScan = request.data.get('onlyCurrentScan', False)
         selectedScan = request.data.get('selectedScan', None)
         flag_filter = normalize_flag_filter_value(

@@ -157,6 +157,28 @@ Use this when a new method/class should appear in the docs panel.
    - **Scientific wording:** Prefer clear math/prose from
      `Hallgrimsson_Image_Processing_Paper/Final_Paper/draft.md` when it matches live code
      (see `UPDATE_PROMPT.txt` → “Preferred scientific wording source”). Code wins on conflict.
+   - **Considerations (user-facing tools):** optional `considerations` object, placed after
+     `summary`, rendered as the "Considerations" block under Overview and published in the
+     corpus. Plain language for users, grounded in the live code; math stays in `algorithm`.
+     ```json
+     "considerations": {
+       "why": "What the tool is for, in one or two sentences.",
+       "useWhen": ["Cases where it helps"],
+       "skipWhen": ["Cases where it makes no difference or hurts"],
+       "downstream": [
+         { "step": "Elastic registration", "entryId": "elastic-registration",
+           "effect": "helps | neutral | caution", "note": "Why." }
+       ],
+       "howItWorks": "Why it works, without equations.",
+       "badParameters": ["What incorrect settings look like"],
+       "goodParameters": ["What good settings look like"],
+       "tuning": ["Ordered steps to arrive at good values"],
+       "testing": ["How to check the result"]
+     }
+     ```
+     Every field is optional. Tool menus link to the entry through
+     `AURORA_TOOL_DOCS_ENTRIES` in `ui_src/components/aurora/toolMenuDocs.js` (keep it in sync
+     with `UI_TITLE_MAP.txt`); the menu shows the entry's first `.gif` image automatically.
    - **Library wrappers:** For tools that dispatch to SciPy/skimage/etc. (e.g. Denoise), put
      official docs links in `algorithm.references` and place `[[references]]` in `algorithm.text`
      on the “apply selected method” step. Do not re-derive library equations. See

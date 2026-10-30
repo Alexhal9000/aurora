@@ -44,6 +44,19 @@ Method, for one scan with a confirmed segmentation threshold ``T``:
    often undefined (a bone threshold leaves the body open), so it is not
    used. On real adult mouse CT the near band peaked on soft tissue and the
    far half on air.
+   Air exclusion (``surrounding_tissue`` only). When the soft tissue around
+   the specimen is thinner than ``D*`` (mouse skulls, limbs, heads scanned in
+   a wide tube) the near band also holds a lot of air. Air is a narrow peak
+   and soft tissue a wide one, so with a fine histogram the air bin can be
+   the fullest even when tissue holds more voxels (Scanco skulls K0167 to
+   K0176: tissue ~35,000 lost to air ~32,790). The air peak ``A`` of the far
+   band is therefore estimated first (exactly as for ``outside``) together
+   with its spread ``s_A``, taken as the RMS deviation on the narrower side of
+   the peak (the side not contaminated by tissue or holder). Near-band voxels
+   with ``|v - A| <= k * s_A`` (``k = 3``, the same three-sigma rule as the
+   edge guard) are dropped before the peak is taken. If too few voxels remain
+   the near band holds no measurable tissue and its unfiltered peak is used;
+   both cases are recorded in the provenance.
 8. Peak. A histogram of the blurred values is built with the
    Freedman-Diaconis bin width; the fullest bin is refined to sub-bin
    precision with a three-point parabolic fit and rounded to the nearest
@@ -77,6 +90,9 @@ BLUR_SIGMA = 1.0
 GUARD_SIGMAS = 3.0
 # Percentile of exterior distances splitting near (tissue) from far (air).
 SPLIT_DISTANCE_PERCENTILE = 50.0
+# Half-width of the air peak, in air standard deviations, removed from the
+# near band before the Surrounding tissue peak is taken.
+AIR_EXCLUSION_SIGMAS = 3.0
 # Minimum number of selected voxels needed for a trustworthy histogram peak.
 MIN_SAMPLES = 2000
 # Bin-count safety limits for the Freedman-Diaconis histogram.
@@ -138,6 +154,22 @@ def histogram_peak(values):
             offset = 0.5 * (c_minus - c_plus) / denom
             centre += float(np.clip(offset, -0.5, 0.5)) * width
     return centre, width, int(hist.size)
+
+
+def peak_spread(values, peak):
+    """Spread of the mode at ``peak`` from its narrower (cleaner) side.
+
+    The RMS deviation from ``peak`` is computed separately for the values
+    below and above it; the smaller of the two is returned. Material that
+    sits next to the mode (tissue above air in CT, the sample holder)
+    widens only one side, so the narrower side is the better estimate of
+    the mode's own noise. Returns 0.0 when neither side has values.
+    """
+    spreads = []
+    for side in (values[values < peak], values[values > peak]):
+        if side.size:
+            spreads.append(float(np.sqrt(np.mean((side - peak) ** 2))))
+    return min(spreads) if spreads else 0.0
 
 
 def estimate_background_peak(data, threshold, region=DEFAULT_REGION):
@@ -216,18 +248,50 @@ def estimate_background_peak(data, threshold, region=DEFAULT_REGION):
     reference = distances[on_exterior] if np.any(on_exterior) else distances
     cutoff = float(np.percentile(reference, SPLIT_DISTANCE_PERCENTILE))
     info['split_distance_sampled_voxels'] = cutoff
+    air_selected = on_exterior & (distances >= cutoff)
     if region == REGION_OUTSIDE:
-        selected = on_exterior & (distances >= cutoff)
+        selected = air_selected
     else:
         selected = distances < cutoff
 
     # 5. Blur after the masking decisions; only selected voxels are read out.
     blurred = ndimage.gaussian_filter(sampled.astype(np.float32), sigma=sigma, mode='nearest')
-    values = blurred[eligible][selected].astype(np.float64)
+    eligible_values = blurred[eligible]
     del blurred, eligible
+    values = eligible_values[selected].astype(np.float64)
     if values.size < MIN_SAMPLES:
         info['fallback_reason'] = f'only {values.size} voxels in the {region} region (need {MIN_SAMPLES})'
         return None, info
+
+    # 7b. Surrounding tissue: remove the air peak (measured on the far band)
+    # from the near band, so a thin tissue layer is not outvoted by the
+    # narrower air peak next to it (see module docstring).
+    if region == REGION_SURROUNDING_TISSUE:
+        air_values = eligible_values[air_selected].astype(np.float64)
+        if air_values.size >= MIN_SAMPLES:
+            air_peak, _, _ = histogram_peak(air_values)
+            air_spread = peak_spread(air_values, air_peak)
+            half_width = float(AIR_EXCLUSION_SIGMAS * air_spread)
+            tissue_values = values[np.abs(values - air_peak) > half_width]
+            info.update({
+                'air_peak': float(air_peak),
+                'air_spread': float(air_spread),
+                'air_exclusion_half_width': half_width,
+                'air_excluded_voxels': int(values.size - tissue_values.size),
+            })
+            if tissue_values.size >= MIN_SAMPLES:
+                values = tissue_values
+                info['air_exclusion'] = 'applied'
+            else:
+                info['air_exclusion'] = (
+                    f'skipped: only {tissue_values.size} near-band voxels outside the air peak '
+                    f'(need {MIN_SAMPLES})'
+                )
+            del tissue_values
+        else:
+            info['air_exclusion'] = f'skipped: only {air_values.size} far-band voxels to measure air'
+        del air_values
+    del eligible_values
 
     # 8. Histogram peak with parabolic refinement.
     peak, bin_width, n_bins = histogram_peak(values)
