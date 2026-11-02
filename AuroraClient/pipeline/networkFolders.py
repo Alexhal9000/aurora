@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
+import time
 from pathlib import Path
 from typing import Iterable, List
 
@@ -178,6 +180,37 @@ def folders_for(request) -> List[Path]:
     return member_folders(record.get("user_id"), roots)
 
 
+_mounts_cache = {"at": 0.0, "points": []}
+
+
+def mount_points() -> List[Path]:
+    """Every mount point of this computer (Linux; read again at most every 5 seconds)."""
+    now = time.monotonic()
+    if now - _mounts_cache["at"] < 5.0:
+        return _mounts_cache["points"]
+    points = []
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 2:
+                    # /proc/mounts writes a space in a path as \040
+                    points.append(Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), parts[1])))
+    except OSError:
+        pass
+    _mounts_cache.update(at=now, points=points)
+    return points
+
+
+def crosses_mount(root: Path, real: Path) -> bool:
+    """Is there a mount strictly inside `root` on the way to `real` (a network drive or
+    USB disk mounted under a shared folder)? The mount belongs to whoever mounted it and
+    carries that person's access to the file server, so a shared parent folder does not
+    pass it on: the owner shares the mount, or a folder in it, on its own."""
+    return any(root in point.parents and (point == real or point in real.parents)
+               for point in mount_points())
+
+
 def is_inside_shared(path: str, roots: Iterable[Path] = None) -> bool:
     if not isinstance(path, str) or not path.strip() or "\x00" in path:
         return False
@@ -186,7 +219,7 @@ def is_inside_shared(path: str, roots: Iterable[Path] = None) -> bool:
     except (OSError, ValueError):
         return False
     for root in roots if roots is not None else shared_folders():
-        if real == root or root in real.parents:
+        if (real == root or root in real.parents) and not crosses_mount(root, real):
             return True
     return False
 

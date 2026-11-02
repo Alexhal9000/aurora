@@ -124,13 +124,14 @@ def _progress_snapshot() -> Dict[str, Any]:
     }
 
 
-def status_payload() -> Dict[str, Any]:
+def status_payload(include_beta: bool = False) -> Dict[str, Any]:
+    """include_beta: list beta-tester-only models too (engineAuth.is_beta_session)."""
     from .foundation_models import enabled_models
 
     with _LOCK:
         progress = _progress_snapshot()
     models = []
-    for spec in enabled_models():
+    for spec in enabled_models(include_beta=include_beta):
         item = public_spec(spec["id"])
         if progress and progress.get("model_id") == spec["id"]:
             item["download"] = progress
@@ -162,7 +163,8 @@ def record_accepted_terms(model_ids: List[str], user_name: str = "") -> None:
     path.write_text(json.dumps({"entries": existing}, indent=2) + "\n", encoding="utf-8")
 
 
-def start_download(model_ids: List[str], token: str, lab_origin: str, user_name: str = "") -> None:
+def start_download(model_ids: List[str], token: str, lab_origin: str, user_name: str = "",
+                   include_beta: bool = False) -> None:
     if not token:
         raise DownloadError("Login token is required.")
     origin = normalize_lab_origin(lab_origin)
@@ -172,7 +174,7 @@ def start_download(model_ids: List[str], token: str, lab_origin: str, user_name:
         if spec is None:
             raise DownloadError(f"Unknown model {model_id!r}.")
         from .foundation_models import enabled_models
-        if spec["id"] not in {item["id"] for item in enabled_models()}:
+        if spec["id"] not in {item["id"] for item in enabled_models(include_beta=include_beta)}:
             raise DownloadError(f"Model {model_id!r} is not offered in this release.")
         if not is_installed(model_id):
             wanted.append(model_id)

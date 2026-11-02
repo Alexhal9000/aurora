@@ -771,14 +771,27 @@ class ListDirectoriesView(APIView):
     def get(self, request, *args, **kwargs):
         path = unquote(request.query_params.get('path', '~'))
         clamped = False
-        if networkFolders.is_remote_request(request) or networkFolders.running_as_service():
-            # Network session, or the background service (which can only reach the shared
-            # folders anyway): start in and stay within the shared folders. "clamped" tells
-            # the browser to take the folder shown as its working folder ("~" there means
-            # this computer's home, which is not shared).
+        # The Settings folder picker (picker=1) asks as the person choosing what to share.
+        picker = request.query_params.get('picker') == '1'
+        service_here = networkFolders.running_as_service() and not networkFolders.is_remote_request(request)
+        restricted = networkFolders.is_remote_request(request) or (service_here and not picker)
+        if restricted:
+            # Network session, or the file browser at the computer of a shared service: start
+            # in and stay within the shared folders, mounted drives left out, exactly as every
+            # member sees it. "clamped" tells the browser to take the folder shown as its
+            # working folder ("~" there means this computer's home, which is not shared).
             requested = path
             path = networkFolders.listing_start(path, networkFolders.folders_for(request))
             clamped = path != requested
+        elif service_here and path in ("~", "root"):
+            # The folder picker in Settings, at the computer of the shared service: starts
+            # in the first shared folder (the service's own home holds nothing) but may look
+            # anywhere the service account can read, mounted drives included, so any
+            # folder can be chosen for sharing.
+            roots = networkFolders.folders_for(request)
+            if roots:
+                requested, path = path, str(roots[0])
+                clamped = path != requested
         try:
             if path == "root":
                 path = "/"
@@ -837,13 +850,33 @@ class ListDirectoriesView(APIView):
                     'files': ['-- RESTRICTED PATH --'],
                     'sizes': ['-- RESTRICTED PATH --'],
                     'path': os.path.abspath(path),
-                    'clamped': clamped
+                    'clamped': clamped,
+                    'restricted': True,
                 }
+                try:
+                    # Why, and the steps if it is a mounted drive (shown beside the path).
+                    from . import engineSharing
+                    response_data['write_note'] = engineSharing.RESTRICTED_NOTE
+                    fix = engineSharing.mount_fix(path)
+                    if fix:
+                        fix['can_run'] = not networkFolders.running_as_service() and not networkFolders.is_remote_request(request)
+                        response_data['write_fix'] = fix
+                except Exception:
+                    pass
 
                 response_json = json.dumps(response_data, ensure_ascii=False).encode('utf-8', 'replace').decode('utf-8')
                 return Response(json.loads(response_json))
             
 
+            blocked_directories = []
+            if restricted:
+                # A drive mounted inside a shared folder is not shared with it (the mount
+                # carries its mounter's access to the file server): leave it out of the
+                # listing until the owner shares it, or a folder in it, on its own.
+                roots = networkFolders.folders_for(request)
+                allowed = [d for d in directories if networkFolders.is_inside_shared(os.path.join(path, d), roots)]
+                blocked_directories = [d for d in directories if d not in allowed]
+                directories = allowed
             response_data = {
                 'directories': directories,
                 'files': files,
@@ -851,6 +884,29 @@ class ListDirectoriesView(APIView):
                 'path': os.path.abspath(path),
                     'clamped': clamped
             }
+            if blocked_directories:
+                # Shown greyed out and not clickable (mounted drives not shared on their own).
+                response_data['blocked_directories'] = blocked_directories
+                response_data['blocked_can_share'] = not networkFolders.is_remote_request(request)
+            # Folders with data (files or an extracted/ project) that this engine cannot
+            # save in: the reason, for a warning icon beside the path (engineSharing.write_note).
+            if os.path.basename(path) != "extracted":
+                try:
+                    from . import engineSharing
+                    note = engineSharing.write_note(path)
+                except Exception:   # never break the listing over the note
+                    note = None
+                if note:
+                    response_data['write_note'] = note
+                    try:
+                        fix = engineSharing.mount_fix(path)
+                    except Exception:
+                        fix = None
+                    if fix:
+                        # can_run: the desktop Aurora can open the system password window;
+                        # the shared service has no screen, so the dialog shows the command.
+                        fix['can_run'] = not networkFolders.running_as_service() and not networkFolders.is_remote_request(request)
+                        response_data['write_fix'] = fix
             
             response_json = json.dumps(response_data, ensure_ascii=False).encode('utf-8', 'replace').decode('utf-8')
             return Response(json.loads(response_json))

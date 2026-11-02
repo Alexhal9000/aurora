@@ -41,12 +41,16 @@ MEDSAM2_SPEC: Dict[str, Any] = {
     "license_file": "medsam2.txt",
 }
 
-# TEMP: hidden for release — reinstate when DINO-Reg ships
+# Beta-tester only: DINO-Reg is held back from the article release. "beta": True keeps
+# it out of enabled_models() unless the engine session is a beta tester's
+# (engineAuth.is_beta_session); the lab also serves its files only to beta testers
+# (frontend/views.py _AURORA_BETA_MODELS).
 DINOV3_SPEC: Dict[str, Any] = {
     "id": DINOV3_ID,
     "display_name": "DINOv3 ViT-L/16",
     "subdir": "dinov3_vitl16",
     "is_dir": True,
+    "beta": True,
     "files": [
         {
             "name": "model.safetensors",
@@ -78,8 +82,7 @@ DINOV3_SPEC: Dict[str, Any] = {
 
 FOUNDATION_MODELS: List[Dict[str, Any]] = [
     MEDSAM2_SPEC,
-    # TEMP: hidden for release — comment back in when DINO-Reg is restored
-    # DINOV3_SPEC,
+    DINOV3_SPEC,  # beta testers only (see "beta" above)
 ]
 
 
@@ -93,12 +96,14 @@ def foundation_dir() -> Path:
     return models_root() / "foundation"
 
 
-def enabled_models() -> List[Dict[str, Any]]:
-    return list(FOUNDATION_MODELS)
+def enabled_models(include_beta: bool = False) -> List[Dict[str, Any]]:
+    """Models offered for download. Beta-only specs are left out unless include_beta
+    (the caller's engine session is a beta tester's)."""
+    return [spec for spec in FOUNDATION_MODELS if include_beta or not spec.get("beta")]
 
 
 def all_known_models() -> List[Dict[str, Any]]:
-    """Enabled models plus commented-out specs, so loaders can still resolve them."""
+    """Every spec, offered or not, so loaders can still resolve installed models."""
     by_id = {item["id"]: item for item in FOUNDATION_MODELS}
     by_id.setdefault(MEDSAM2_ID, MEDSAM2_SPEC)
     by_id.setdefault(DINOV3_ID, DINOV3_SPEC)

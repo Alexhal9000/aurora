@@ -17,12 +17,23 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+def _aurora_config_dir() -> Path:
+    """Where the secret key (and, when the code folder is read-only, the data) live:
+    ~/.aurora, as always for installed Aurora. Developer runs keep their own settings
+    apart from the installed app's (run_aurora.sh: AURORA_CONFIG_DIR=~/.aurora-dev; its
+    service: /var/lib/aurora-tools/.aurora-dev), so there AURORA_CONFIG_DIR is used.
+    Installed services keep using HOME as before (moving their key or data is not wanted)."""
+    env_dir = os.environ.get("AURORA_CONFIG_DIR", "").strip()
+    developer = os.environ.get("AURORA_DEV") == "1" or os.environ.get("AURORA_DEV_SERVICE") == "1"
+    return Path(env_dir) if env_dir and developer else Path.home() / ".aurora"
+
+
 def _aurora_secret_key() -> str:
     """Per-install key. A key baked into the installer would be extractable."""
     env_key = os.environ.get("AURORA_SECRET_KEY", "").strip()
     if env_key:
         return env_key
-    key_path = Path.home() / ".aurora" / "secret_key"
+    key_path = _aurora_config_dir() / "secret_key"
     if key_path.is_file():
         stored = key_path.read_text(encoding="utf-8").strip()
         if stored:
@@ -190,10 +201,10 @@ def _aurora_data_dir() -> Path:
     if env_dir:
         return _ensure_dir(Path(env_dir))
     if _PACKAGED_LINUX_ROOT in BASE_DIR.parents or BASE_DIR.parent == _PACKAGED_LINUX_ROOT:
-        return _ensure_dir(Path.home() / ".aurora")
+        return _ensure_dir(_aurora_config_dir())
     if os.access(BASE_DIR, os.W_OK):
         return BASE_DIR
-    return _ensure_dir(Path.home() / ".aurora")
+    return _ensure_dir(_aurora_config_dir())
 
 
 def _aurora_sqlite_path() -> Path:

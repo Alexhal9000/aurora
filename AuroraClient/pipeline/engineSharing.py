@@ -30,6 +30,11 @@ on Windows and macOS (beta). A change asked for in the panel goes through one of
 * Direct sharing (no service, no admin side): developer runs only (run_aurora.sh sets
   AURORA_DEV=1). turn_on, apply and turn_off edit this engine's own engine.json and
   restart it (run_aurora.sh starts it again on RESTART_EXIT_CODE).
+* Stray share: a desktop Aurora (not the service, not a developer run) that finds
+  "mode": "network" in engine.json, left there by a developer run (both read the same
+  ~/.aurora). It has no admin side to ask, so turn_off writes local mode itself (it only
+  narrows access), ends the network sessions, and the network port closes when Aurora
+  is opened again (no launcher here restarts it on RESTART_EXIT_CODE).
 * pair_start / pair_confirm / pair_cancel: pairing with the lab from Settings, for the
   person at this computer (same steps and owner confirmation as `aurora-tools pair`).
 * pause / resume: members (not the owner or managers) cannot open the server from other
@@ -42,6 +47,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import secrets
 import shlex
 import signal
@@ -191,9 +197,45 @@ def dev_mode() -> bool:
     return os.environ.get("AURORA_DEV") == "1" and not networkFolders.running_as_service()
 
 
+def stray_share(service: bool, shared: bool) -> bool:
+    """Shared through engine.json by a developer run, but this is neither the service nor
+    a developer run (see "Stray share" in the module docstring)."""
+    return shared and not service and not dev_mode()
+
+
 def direct_mode() -> bool:
-    """Sharing changed by this engine itself (developer runs, see module docstring)."""
-    return dev_mode()
+    """Sharing changed by this engine itself (developer runs, see module docstring).
+    On Linux with the installed helper a developer run is shared like an install instead:
+    the real password prompt, folder grants and systemd service, which then runs this
+    source folder as the aurora-tools account (dev_source_args). AURORA_DEV_DIRECT=1 keeps
+    the old direct way (no service, no root)."""
+    if not dev_mode():
+        return False
+    if os.environ.get("AURORA_DEV_DIRECT") == "1":
+        return True
+    if engineConfig.is_network_mode():
+        # Already shared the direct way (engine.json "mode": "network", from before the
+        # service path or with AURORA_DEV_DIRECT): changes and Turn off stay direct too.
+        return True
+    return not (sys.platform.startswith("linux") and _helper_runs_dev_source())
+
+
+def _helper_runs_dev_source() -> bool:
+    """The installed helper knows --source (an older one refuses it: share directly then)."""
+    try:
+        with open(HELPER, encoding="utf-8", errors="replace") as handle:
+            return os.access(HELPER, os.X_OK) and "--source)" in handle.read()
+    except OSError:
+        return False
+
+
+def dev_source_args() -> list:
+    """Developer run shared as the service: the checkout and virtualenv the service runs
+    (aurora-tools-network enable --source/--venv); [] for installed Aurora."""
+    if not dev_mode() or direct_mode():
+        return []
+    source = Path(__file__).resolve().parents[2]      # <checkout>/AuroraClient/pipeline
+    return ["--source", str(source), "--venv", sys.prefix]
 
 
 # ---------------------------------------------------------------------------
@@ -255,14 +297,31 @@ def confirm_how() -> dict:
             "shell": "a terminal (or SSH)"}
 
 
+# ---------------------------------------------------------------------------
+# Which folders may be shared (the same rules as the admin side: aurora-tools-network
+# check_folders on Linux, aurora_sharing_admin.check_folders on Windows and macOS).
+#
+# Refused, because sharing them would hand out the computer itself: the system disk as a
+# whole, system folders, a whole home folder (ssh keys, logins), private settings folders,
+# and the folders that only hold other drives (/media, /run/media/<you>, /mnt, /Volumes).
+# Everything else may be shared. Folders on another drive (USB, external, network) are
+# allowed with warnings that say what can go wrong there, shown in Settings before turning
+# sharing on and printed again when the change is confirmed.
+# ---------------------------------------------------------------------------
+
 _SYSTEM_FOLDERS = ("/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/proc",
-                   "/root", "/run", "/sbin", "/snap", "/sys", "/usr", "/opt", "/tmp", "/var/tmp",
+                   "/root", "/sbin", "/snap", "/sys", "/usr", "/opt", "/tmp", "/var/tmp",
                    "/var/lib", "/var/log", "/var/cache", "/var/spool", "/var/mail", "/var/backups",
                    "/var/run", "/lost+found",
                    # macOS
                    "/System", "/Library", "/Applications", "/private", "/cores")
-_PRIVATE_NAMES = {".ssh", ".gnupg", ".aurora", ".config", ".local", ".mozilla", ".pki", ".cache",
+_PRIVATE_NAMES = {".ssh", ".gnupg", ".aurora", ".aurora-dev", ".config", ".local", ".mozilla", ".pki", ".cache",
                   "Library", "AppData"}
+# Where Linux and macOS mount drives. /run is a system folder except /run/media/<you>/<drive>.
+_DRIVE_ROOTS = ("/run/media", "/media", "/mnt", "/Volumes")
+# Filesystems without per-account permissions (USB sticks, Windows disks on Linux).
+_NO_PERMISSION_FS = {"vfat", "msdos", "fat", "fat32", "exfat", "ntfs", "ntfs3", "fuseblk"}
+_NETWORK_FS = {"nfs", "nfs4", "cifs", "smb3", "smbfs", "fuse.sshfs", "sshfs", "afpfs", "davfs", "fuse.rclone"}
 
 
 def _system_folders() -> list:
@@ -289,33 +348,159 @@ def _home_folders() -> set:
     return {os.path.normcase(home) for home in homes}
 
 
+def _drive_of(path: str) -> tuple:
+    """(where the drive holding path is mounted, its filesystem type, kind) with kind
+    'removable', 'network', 'fixed' or ''. Empty strings when this cannot be told."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel = ctypes.windll.kernel32
+            root = ctypes.create_unicode_buffer(300)
+            if not kernel.GetVolumePathNameW(str(path), root, 300):
+                return "", "", ""
+            fs_name = ctypes.create_unicode_buffer(64)
+            kernel.GetVolumeInformationW(root.value, None, 0, None, None, None, fs_name, 64)
+            kind = {2: "removable", 3: "fixed", 4: "network"}.get(kernel.GetDriveTypeW(root.value), "")
+            return root.value, fs_name.value.lower(), kind
+        except (AttributeError, OSError, ValueError):
+            return "", "", ""
+    best, fstype = "", ""
+    try:
+        with open("/proc/self/mounts", encoding="utf-8", errors="replace") as mounts:
+            for line in mounts:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                # Spaces and tabs in mount points are written as octal escapes (\040).
+                where = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[1])
+                inside = path == where or path.startswith(where.rstrip("/") + "/")
+                if inside and len(where) >= len(best):
+                    best, fstype = where, fields[2]
+    except OSError:
+        pass   # macOS has no /proc: the drive is told from where it is mounted
+    kind = "network" if fstype in _NETWORK_FS else ""
+    if not kind and any(path == r or path.startswith(r + "/") for r in _DRIVE_ROOTS):
+        kind = "removable"
+    return best, fstype, kind
+
+
+def _mounts_inside(real: str) -> list:
+    """Mount points (network drives, USB disks) strictly inside a folder. Network sessions
+    never see them through the folder: networkFolders.crosses_mount."""
+    if not sys.platform.startswith("linux"):
+        return []
+    root = Path(real)
+    return sorted(str(point) for point in networkFolders.mount_points() if root in point.parents)
+
+
+def review_folder(folder: str, must_exist: bool = True) -> dict:
+    """{"folder", "real", "error", "warnings"} for one folder under the rules above.
+    must_exist=False: the shared service cannot see folders it was not given yet, so a
+    folder it cannot see is not an error there (the admin side checks it)."""
+    result = {"folder": folder, "real": folder, "error": "", "warnings": []}
+    try:
+        real = os.path.realpath(os.path.expanduser(folder))
+    except (OSError, ValueError):
+        result["error"] = f"Not a valid folder name: {folder}"
+        return result
+    result["real"] = real
+    visible = os.path.isdir(real)
+    if not visible and must_exist:
+        result["error"] = f"Not a folder on this computer: {folder}"
+        return result
+    windows = sys.platform == "win32"
+    key = os.path.normcase(real)
+    sep = os.sep
+
+    def inside(base: str) -> bool:
+        base = os.path.normcase(base)
+        return key == base or key.startswith(base.rstrip(sep) + sep)
+
+    def refuse(message: str) -> dict:
+        result["error"] = message
+        return result
+
+    system_drive = os.path.normcase((os.environ.get("SystemDrive") or "C:") + "\\") if windows else "/"
+    whole_disk = os.path.dirname(real) == real
+    if whole_disk and (not windows or key == system_drive):
+        return refuse(f"{real} is the whole system disk and cannot be shared; choose a folder on it.")
+    if any(inside(d) for d in _system_folders()) or key in ("/var", "/users", "/home") \
+            or (inside("/run") and not inside("/run/media")):
+        return refuse(f"{real} is a system folder and cannot be shared.")
+    parent = os.path.dirname(key)
+    holds_drives = key in ("/run/media", "/media", "/mnt", "/volumes") or parent == "/run/media" \
+        or (parent == "/media" and visible and not os.path.ismount(real))
+    if holds_drives:
+        return refuse(f"{real} holds the drives plugged into this computer, not files; share a folder on "
+                      "one of the drives instead (or the drive itself).")
+    if any(home == key or home.startswith(key.rstrip(sep) + sep) for home in _home_folders()):
+        return refuse(f"{real} holds a whole home folder; share a folder inside it, such as Documents.")
+    if _PRIVATE_NAMES & set(real.replace("\\", "/").split("/")):
+        return refuse(f"{real} is a private settings folder and cannot be shared.")
+    if not visible:
+        # The shared account cannot see this folder. Usually it has not been given access
+        # yet (the admin side does that), but a network or FUSE mount (sshfs, CIFS, NFS) can
+        # never be given any: only the mounter's own account may open it. Say so now,
+        # instead of at the confirmation in a terminal.
+        mount, fstype, kind = _drive_of(real)
+        if not direct_mode() and mount and mount != "/" and (kind == "network" or fstype.startswith("fuse.")):
+            # One short line; the steps (mount_fix) sit behind a "How to fix" button in Settings.
+            result["fix"] = mount_fix(real)
+            return refuse("Only your own account can open this drive, so it cannot be shared yet.")
+        return result
+
+    # Short notes, one line each. The account caveats are about the background service,
+    # which runs as its own account: a developer run shares as you, so they do not apply.
+    warnings = result["warnings"]
+    own_account = direct_mode()
+    mount, fstype, kind = _drive_of(real)
+    if whole_disk or (mount and os.path.normcase(mount.rstrip("\\/") or mount) == key and key not in ("/", "/home")):
+        warnings.append("Whole drive: everything on it is shared.")
+    inner = _mounts_inside(real)
+    if inner:
+        shown = ", ".join(os.path.basename(m) or m for m in inner[:3]) + (" and more" if len(inner) > 3 else "")
+        warnings.append(f"Mounted drives inside ({shown}) are not shared with it.")
+    if own_account:
+        return result
+    if kind == "network":
+        warnings.append("Network drive: its server decides whether the shared Aurora may open it.")
+    elif kind == "removable":
+        warnings.append("Separate drive: shared only while it is plugged in.")
+    if fstype in _NO_PERMISSION_FS and not windows:
+        # No Linux permissions (exFAT, FAT, NTFS): the mount options decide for every
+        # account at once. Turning sharing on makes the desktop mount such drives with the
+        # aurora-drives group allowed to write (aurora-tools-network setup_drive_access);
+        # a drive mounted before that needs to be plugged in again once.
+        try:
+            info = os.stat(real)
+            import grp
+            drives_gid = grp.getgrnam("aurora-drives").gr_gid
+        except (OSError, KeyError, ImportError):
+            info, drives_gid = None, None
+        bits = 0
+        if info is not None:
+            bits = info.st_mode & 0o007
+            if info.st_gid == drives_gid:
+                bits |= (info.st_mode >> 3) & 0o007
+        if bits & 0o007 != 0o007:
+            warnings.append(f"{fstype} drive: remounted when sharing turns on.")
+    if sys.platform == "darwin" and inside("/Volumes"):
+        warnings.append("macOS may keep background apps off drives; if so, give Aurora's Python Full Disk Access.")
+    return result
+
+
 def check_folders_here(folders: list) -> list:
-    """The root helper's folder rules (aurora-tools-network check_folders), for direct
-    sharing that changes folders without it. Returns resolved folders or raises ValueError."""
-    system = _system_folders()
-    homes = _home_folders()
+    """The admin side's folder rules, for direct sharing that changes folders without it.
+    Returns resolved folders or raises ValueError (warnings are only logged here)."""
     resolved = []
     for folder in folders:
-        real = os.path.realpath(os.path.expanduser(folder))
-        if not os.path.isdir(real):
-            raise ValueError(f"Not a folder on this computer: {folder}")
-        key = os.path.normcase(real)
-        sep = os.sep
-
-        def inside(base: str) -> bool:
-            base = os.path.normcase(base)
-            return key == base or key.startswith(base.rstrip(sep) + sep)
-
-        if os.path.dirname(real) == real or key in ("/var", "/volumes", "/users", "/home") \
-                or any(inside(d) for d in system):
-            raise ValueError(f"{real} is a system folder and cannot be shared.")
-        if any(home == key or home.startswith(key.rstrip(sep) + sep) for home in homes):
-            raise ValueError(f"{real} holds a whole home folder; share a folder inside it, such as Documents.")
-        parts = set(real.replace("\\", "/").split("/"))
-        if _PRIVATE_NAMES & parts:
-            raise ValueError(f"{real} is a private settings folder and cannot be shared.")
-        if real not in resolved:
-            resolved.append(real)
+        review = review_folder(folder)
+        if review["error"]:
+            raise ValueError(review["error"])
+        for warning in review["warnings"]:
+            logger.warning("Shared folder %s: %s", review["real"], warning)
+        if review["real"] not in resolved:
+            resolved.append(review["real"])
     return resolved
 
 
@@ -439,6 +624,7 @@ def status_payload(record: dict) -> dict:
                    {k: v for k, v in confirm_how().items() if k != "link"},
         "dev_mode": dev_mode(),
         "direct_mode": direct_mode(),
+        "stray_share": stray_share(service, shared),
         # Pairing from Settings: only the person at this computer may make an account its owner.
         "pairing_flow": networkMode.pair_poll() if not record.get("remote") else {},
         "helper_installed": linux_helper,
@@ -497,7 +683,7 @@ def turn_on(folders: list, port: int, pair_owner: str = "") -> tuple:
     command = ["pkexec", HELPER, "enable"]
     for folder in folders:
         command += ["--folder", folder]
-    command += ["--port", str(port), *_owner_args(pair_owner)]
+    command += ["--port", str(port), *_owner_args(pair_owner), *dev_source_args()]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=600)
     except FileNotFoundError:
@@ -510,7 +696,233 @@ def turn_on(folders: list, port: int, pair_owner: str = "") -> tuple:
         detail = (result.stderr or result.stdout or "").strip().splitlines()
         return False, (detail[-1] if detail else "The helper failed.").replace("Error: ", "")
     logger.info("Network sharing turned on:\n%s", result.stdout)
-    return True, result.stdout
+    notes = remount_shared_drives(folders)
+    return True, "\n".join([result.stdout.rstrip(), *notes]).strip() + "\n"
+
+
+def _mount_table() -> list:
+    """(device, mount point, filesystem, options) of every mount; /proc/mounts writes a
+    space in a path as \\040 (drive labels such as "STORE N GO")."""
+    unescape = lambda text: re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)  # noqa: E731
+    table = []
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 4:
+                    table.append((unescape(parts[0]), unescape(parts[1]), parts[2], parts[3].split(",")))
+    except OSError:
+        pass
+    return table
+
+
+def _programs_using(mount_point: str) -> list:
+    """Names of this person's programs holding files on a drive (fuser -vm), such as a Files
+    window (nautilus) left open on it, so the note can say what to close."""
+    try:
+        result = subprocess.run(["fuser", "-vm", mount_point], capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    names = []
+    for line in (result.stderr or "").splitlines():   # fuser -v prints its table on stderr
+        parts = line.split()
+        if len(parts) >= 4 and parts[-3].isdigit() and parts[-1] not in names:
+            names.append(parts[-1])
+    return names
+
+
+RESTRICTED_NOTE = "Aurora cannot open this folder."
+
+
+def write_note(path: str):
+    """Why Aurora (this engine's account) cannot save in a folder it lists, or None when it
+    can. Shown as a warning icon beside the Working Directory path (ListDirectoriesView),
+    so it appears only where saving would really fail: access(2) answers for this very
+    process, ACLs, read-only mounts and drive mount options included. Checks the folder
+    and its extracted/ folder, where Aurora writes everything it makes."""
+    if not (networkFolders.running_as_service() or engineConfig.is_network_mode()):
+        return None   # sharing is off: Aurora runs as the person themselves, nothing to warn about
+    if not networkFolders.is_inside_shared(path):
+        return None   # only inside the shared folders; elsewhere nobody works through this Aurora
+    real = os.path.realpath(path)
+    targets = [real] + [t for t in (os.path.join(real, "extracted"),) if os.path.isdir(t)]
+    if all(os.access(target, os.W_OK | os.X_OK) for target in targets):
+        return None
+    mount = None
+    for device, mount_point, fstype, options in _mount_table():
+        if real == mount_point or real.startswith(mount_point.rstrip("/") + "/"):
+            if mount is None or len(mount_point) > len(mount[1]):
+                mount = (device, mount_point, fstype, options)
+    if mount and "ro" in mount[3]:
+        return "Read-only: Aurora cannot save here."
+    if (mount and mount[2] in _NO_PERMISSION_FS and mount[1].startswith(("/run/media/", "/media/"))
+            and networkFolders.running_as_service()):
+        # exFAT/FAT/NTFS: the mount options decide for every account at once; a drive
+        # mounted before sharing was turned on lacks the aurora-drives group (see
+        # remount_shared_drives), the one case a replug fixes.
+        try:
+            import grp
+            drives_gid = grp.getgrnam("aurora-drives").gr_gid
+        except (ImportError, KeyError):
+            drives_gid = None
+        if drives_gid is None or f"gid={drives_gid}" not in mount[3]:
+            return "Aurora cannot save on this drive yet. Turn sharing off and on again to remount it."
+    return "Aurora cannot save in this folder."
+
+
+def mount_fix(path: str):
+    """What can be done when Aurora cannot save in a folder that sits on a mount of its own
+    (a network drive mounted by hand, a read-only mount): the mount's details and the
+    commands that fix it, for the dialog behind the warning icon beside the Working
+    Directory path. None when the folder is not on a separate Linux mount.
+      command  sudo aurora-tools network fix-mount ...: changes the mount in place
+               (mount -o remount), which keeps its login, so no password for the file
+               server is asked here or sent through Aurora.
+      manual   unmount + mount again with the same source and user, for kernels that
+               refuse the in-place change; the person types the password themselves."""
+    if not sys.platform.startswith("linux"):
+        return None
+    real = os.path.realpath(path)
+    best = None
+    for device, mount_point, fstype, options in _mount_table():
+        if real == mount_point or real.startswith(mount_point.rstrip("/") + "/"):
+            if best is None or len(mount_point) > len(best[1]):
+                best = (device, mount_point, fstype, options)
+    if best is None or best[1] == "/" or (best[2] not in ("cifs", "smb3", "nfs", "nfs4", "fuseblk")
+                                          and not best[2].startswith("fuse.") and "ro" not in best[3]):
+        return None
+    device, mount_point, fstype, options = best
+    quote = shlex.quote
+    fix = {"mount_point": mount_point, "type": fstype, "source": device, "read_only": "ro" in options,
+           "can_fix": fstype in ("cifs", "smb3") or fstype.startswith("fuse.") or "ro" in options,
+           # "Fix it" in the dialog: only what root alone can change; a FUSE mount needs its owner
+           "run_here": fstype in ("cifs", "smb3") or "ro" in options,
+           "command": f"sudo aurora-tools network fix-mount {quote(mount_point)}", "manual": ""}
+    if fstype in ("cifs", "smb3"):
+        user = next((o.split("=", 1)[1] for o in options if o.startswith("username=")), "")
+        extra = f"uid={os.getuid()},gid=aurora-drives,file_mode=0664,dir_mode=0775"
+        fix["manual"] = (f"sudo umount {quote(mount_point)} && sudo mount -t cifs {quote(device)} {quote(mount_point)} "
+                         f"-o {('user=' + user + ',') if user else ''}{extra}")
+        fix["manual_note"] = "Put the same options in /etc/fstab to keep them after a reboot."
+    elif fstype.startswith("fuse."):
+        tool = "sshfs" if fstype == "fuse.sshfs" else "<the program that mounted it>"
+        # gid/umask make the files look like they belong to group aurora-drives, which the shared
+        # service is in; the server still decides what this login may change. -uz detaches a
+        # mount something still has open (the new mount takes its place).
+        fix["manual"] = (f"fusermount3 -uz {quote(mount_point)} && {tool} {quote(device)} {quote(mount_point)} "
+                         "-o allow_other,default_permissions,uid=$(id -u),gid=$(getent group aurora-drives | cut -d: -f3),umask=0002")
+        fix["manual_note"] = "Run step 2 as yourself, without sudo, so the mount keeps your login."
+    elif fstype in ("nfs", "nfs4"):
+        fix["manual_note"] = "The file server decides: give the aurora-tools user access on it."
+    return fix
+
+
+def run_fix_mount(path: str) -> tuple:
+    """Run the helper's fix-mount with the system's password window (desktop Aurora only;
+    the shared service has no screen, so there the dialog shows the command to type)."""
+    fix = mount_fix(path)
+    if not fix or not fix["run_here"]:
+        return False, "This folder is not on a mount Aurora can change from here."
+    try:
+        result = subprocess.run(["pkexec", HELPER, "fix-mount", fix["mount_point"]],
+                                capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        return False, "pkexec is missing. In a terminal: " + fix["command"]
+    except subprocess.TimeoutExpired:
+        return False, "The password window was not answered in time."
+    if result.returncode in (126, 127) and "Error:" not in (result.stderr or ""):
+        return False, "Nothing was changed: the password was not entered."
+    text = (result.stdout or "").strip().splitlines()
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        return False, (detail[-1] if detail else "The change failed.").replace("Error: ", "")
+    logger.info("Mount %s changed for the shared Aurora: %s", fix["mount_point"], text[-1] if text else "")
+    return True, text[-1] if text else "Done."
+
+
+def remount_shared_drives(folders: list) -> list:
+    """Linux: unmount and mount again the USB / Windows-format drives (exFAT, FAT, NTFS)
+    holding shared folders, so they pick up the mount options aurora-tools-network enable
+    just wrote (group aurora-drives may write; setup_drive_access). Those drives have no
+    file permissions of their own: the options are fixed when a drive is mounted, so one
+    that was already plugged in would stay read-only for the shared Aurora.
+
+    Runs here, as the person at the computer in their own desktop session, through udisks
+    (udisksctl), exactly like ejecting and plugging the drive in again: same device, same
+    /run/media/<user>/<label> path, and udisks refuses to unmount while any file on the
+    drive is open, so nothing is cut off mid-write. Returns one note per drive for the
+    Turn on result; a drive that could not be remounted keeps the eject-and-replug advice."""
+    if not sys.platform.startswith("linux"):
+        return []
+    try:
+        import grp
+        drives_gid = grp.getgrnam("aurora-drives").gr_gid
+    except (ImportError, KeyError):
+        return []   # helper wrote no drive settings (no folder on /run/media or /media)
+    table = _mount_table()
+    todo = {}
+    for folder in folders:
+        real = os.path.realpath(os.path.expanduser(str(folder)))
+        best = None
+        for device, mount_point, fstype, options in table:
+            if real == mount_point or real.startswith(mount_point.rstrip("/") + "/"):
+                if best is None or len(mount_point) > len(best[1]):
+                    best = (device, mount_point, fstype, options)
+        if best is None:
+            continue
+        device, mount_point, fstype, options = best
+        if fstype not in _NO_PERMISSION_FS:
+            continue
+        if not mount_point.startswith(("/run/media/", "/media/")) or not device.startswith("/dev/"):
+            continue
+        if f"gid={drives_gid}" in options:
+            continue   # already mounted with the shared Aurora's group
+        todo[device] = mount_point
+    notes = []
+    for device, mount_point in todo.items():
+        name = os.path.basename(mount_point)
+        replug = f"  {name}: the shared Aurora can only open files there; turn sharing off and on again to retry"
+        try:
+            off = subprocess.run(["udisksctl", "unmount", "-b", device, "--no-user-interaction"],
+                                 capture_output=True, text=True, timeout=60)
+            if off.returncode != 0:
+                reason = (off.stderr or off.stdout or "").strip().splitlines()
+                logger.warning("Could not unmount %s (%s): %s", mount_point, device, reason[-1] if reason else "")
+                users = _programs_using(mount_point)
+                notes.append(replug + (f" (in use now by {', '.join(users)}; close them first)." if users
+                                       else " (it is in use now; close files open on it first)."))
+                continue
+            # The options are passed explicitly: desktop automounters (KDE, GNOME) send
+            # their own gid= with every mount, which wins over udisks' mount_options.conf
+            # (seen on Alejandro's computer). udisks allows gid= of a group the caller is in,
+            # which is why the helper adds the owner to aurora-drives.
+            on = subprocess.run(["udisksctl", "mount", "-b", device, "--no-user-interaction",
+                                 "-o", f"gid={drives_gid},umask=0002"],
+                                capture_output=True, text=True, timeout=60)
+            if on.returncode != 0:
+                logger.warning("Mounting %s with the shared Aurora's group failed (%s); mounting it as before.",
+                               device, (on.stderr or on.stdout or "").strip())
+                on = subprocess.run(["udisksctl", "mount", "-b", device, "--no-user-interaction"],
+                                    capture_output=True, text=True, timeout=60)
+                if on.returncode == 0:
+                    notes.append(f"  {name}: could not be mounted for the shared Aurora to save there.")
+                    continue
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.warning("Could not remount %s (%s): %s", mount_point, device, exc)
+            notes.append(replug + ".")
+            continue
+        if on.returncode != 0:
+            reason = (on.stderr or on.stdout or "").strip().splitlines()
+            logger.warning("Could not mount %s (%s) again: %s", mount_point, device, reason[-1] if reason else "")
+            notes.append(f"  {name}: was unmounted but could not be mounted again; plug it in again.")
+            continue
+        now = next((mp for dev, mp, _fs, _opts in _mount_table() if dev == device), None)
+        if now and now != mount_point:
+            notes.append(f"  {name}: mounted again at {now} (not {mount_point}); share that folder instead.")
+        else:
+            notes.append(f"  {name}: remounted so the shared Aurora can save there.")
+        logger.info("Remounted %s (%s) for the shared Aurora", mount_point, device)
+    return notes
 
 
 def _folder_args(folders: list) -> list:
@@ -632,6 +1044,13 @@ class EngineSharingView(APIView):
                 logger.warning("Sharing turned off by %s", record.get("name"))
                 _restart_soon()
                 return done(restarting=True)
+            if stray_share(service, shared):
+                engineConfig.write_config(mode=engineConfig.MODE_LOCAL)
+                logger.warning("Sharing (left on by a developer run) turned off by %s; the network port "
+                               "closes when Aurora is opened again.", record.get("name"))
+                from pipeline import engineAuth  # engineAuth imports this module
+                engineAuth.end_sessions_where(lambda r: bool(r.get("remote")), "Sharing was turned off on this computer.")
+                return done(reopen_needed=True)
             if not service:
                 return refuse("Sharing is not running as a service here; nothing to turn off.")
             try:
@@ -704,6 +1123,26 @@ class EngineSharingView(APIView):
             except OSError:
                 pass
             return done()
+
+        if action == "check_folders":
+            # Settings shows these before sharing is turned on or a change is asked for:
+            # refused folders (with the reason) and the risks of the others. Changes nothing.
+            raw = data.get("folders") if isinstance(data.get("folders"), list) else []
+            checks = [review_folder(f.strip(), must_exist=not service)
+                      for f in raw[:MAX_FOLDERS] if isinstance(f, str) and f.strip()]
+            return Response({"checks": checks}, status=status.HTTP_200_OK)
+
+        if action == "fix_mount":
+            # Warning icon beside the Working Directory path: change the mount holding the
+            # open folder so Aurora can save there (network drive mounted by hand, read-only).
+            if record.get("remote") or service:
+                return refuse("Do this at the computer: run the command shown in the dialog in a terminal.")
+            if not sys.platform.startswith("linux"):
+                return refuse("Changing a mount from here is only available on Linux.")
+            ok, detail = run_fix_mount(str(data.get("path") or ""))
+            if not ok:
+                return refuse(detail)
+            return done(message=detail)
 
         if action == "remember_folders":
             # Sharing off: the folders chosen in Settings are kept for when it is turned on
@@ -778,7 +1217,12 @@ class EngineSharingView(APIView):
                 return refuse(detail)
             # Remember the choice for next time (this desktop config stays in local mode).
             engineConfig.write_config(shared_folders=folders, network_port=port)
-            _quit_soon(3.0)
+            if dev_mode():
+                # run_aurora.sh starts again, waits while the service runs this checkout,
+                # and comes back here once sharing is turned off.
+                _restart_soon(3.0)
+            else:
+                _quit_soon(3.0)
             return done(handover=True, helper_output=detail)
 
         return refuse("Unknown action.")

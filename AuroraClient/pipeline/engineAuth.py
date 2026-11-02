@@ -10,7 +10,8 @@ Flow (one lab round trip per sign-in, nothing per request):
 2. Lab ``/auroraHandoff`` signs a short pass for that engine (Ed25519):
    ``base64url(json claims) + "." + base64url(signature over the first segment)``.
    Claims: v, iss (lab origin), aud (engine_id), sub (lab user id), name, level, iat,
-   exp, nonce, kid (signing key id).
+   exp, nonce, kid (signing key id), and beta=1 for Aurora beta testers (lab
+   Profile.beta_tester; see ui_src/components/aurora/auroraBetaFeatures.js).
 3. The packaged SPA posts the pass to ``/engine-auth/start/``. We verify it against the
    lab's public key (fetched once from ``<iss>/auroraEngineKeys`` over HTTPS, then cached
    on disk), check audience, time window and single use, and set an HttpOnly,
@@ -354,6 +355,9 @@ def create_session(claims: dict, remote: bool = False) -> tuple:
         "user_id": str(claims.get("sub", "")),
         "name": str(claims.get("name", ""))[:200],
         "level": level,
+        # Aurora beta tester (signed by the lab). Sessions saved before this claim existed
+        # have no key and count as not beta (is_beta_session).
+        "beta_tester": claims.get("beta") == 1,
         "lab_origin": claims.get("iss"),
         "remote": bool(remote),
         "created_at": now,
@@ -392,6 +396,15 @@ def get_session(session_id: Optional[str]) -> Optional[dict]:
                     _ended_reasons[key] = NETWORK_IDLE_MESSAGE
             return None
         return record
+
+
+def is_beta_session(record: Optional[dict]) -> bool:
+    """True when the engine session belongs to an Aurora beta tester (request.aurora_session).
+
+    Used to keep beta-only engine offers (e.g. the DINOv3 model download) away from other
+    users. The UI gates the same features with auroraBetaFeatures.js.
+    """
+    return bool(record and record.get("beta_tester"))
 
 
 def _idle_limit() -> int:
@@ -602,6 +615,8 @@ def _session_payload(record: Optional[dict]) -> dict:
         payload.update({
             "name": record["name"],
             "level": record["level"],
+            # Network-mode tabs take this instead of the lab's /testToken answer.
+            "beta_tester": is_beta_session(record),
             "expires_at": record["expires_at"],
             # Opened from another computer: the SPA has no lab token then and takes the
             # name and level from here (the lab token never leaves the lab for a server).

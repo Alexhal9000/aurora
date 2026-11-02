@@ -13,11 +13,17 @@ from .foundation_download import (
     status_payload,
 )
 from .foundation_models import enabled_models, get_spec
+from pipeline.engineAuth import is_beta_session
+
+
+def _beta(request) -> bool:
+    """Beta-only models (DINOv3) are listed and downloadable for beta testers only."""
+    return is_beta_session(getattr(request, "aurora_session", None))
 
 
 class FoundationModelStatusView(APIView):
     def get(self, request):
-        return Response(status_payload(), status=status.HTTP_200_OK)
+        return Response(status_payload(include_beta=_beta(request)), status=status.HTTP_200_OK)
 
 
 class FoundationModelDownloadView(APIView):
@@ -33,7 +39,7 @@ class FoundationModelDownloadView(APIView):
             raw_ids = [raw_ids]
         model_ids = [str(item) for item in raw_ids if str(item)]
         if not model_ids:
-            model_ids = [item["id"] for item in enabled_models()]
+            model_ids = [item["id"] for item in enabled_models(include_beta=_beta(request))]
         for model_id in model_ids:
             if get_spec(model_id) is None:
                 return Response(
@@ -46,13 +52,14 @@ class FoundationModelDownloadView(APIView):
                 token=str(body.get("token") or ""),
                 lab_origin=str(body.get("lab_origin") or ""),
                 user_name=str(body.get("user_name") or ""),
+                include_beta=_beta(request),
             )
         except DownloadError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(status_payload(), status=status.HTTP_202_ACCEPTED)
+        return Response(status_payload(include_beta=_beta(request)), status=status.HTTP_202_ACCEPTED)
 
 
 class FoundationModelCancelView(APIView):
     def post(self, request):
         cancel_download()
-        return Response(status_payload(), status=status.HTTP_200_OK)
+        return Response(status_payload(include_beta=_beta(request)), status=status.HTTP_200_OK)
