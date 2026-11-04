@@ -25,6 +25,7 @@ import numpy as np
 from .crashSafety import (
     atomic_ants_write,
 )
+from .torchCompute import compute_provenance
 
 FIREANTS_MIN_AXIS_VOXELS = 32
 DEFAULT_GPU_RIGID_SCALES = (8, 4, 2, 1)
@@ -86,22 +87,21 @@ ProgressCallback = Optional[Callable[[str], None]]
 
 
 def ensure_gpu_rigid_cuda():
-    try:
-        import torch
-    except ImportError as exc:
-        raise GpuRigidError(
-            "GPU Rigid requires PyTorch with CUDA. PyTorch is not installed."
-        ) from exc
-    if not torch.cuda.is_available():
-        raise GpuRigidError(
-            "GPU Rigid requires a CUDA GPU. No CUDA device is available."
-        )
+    """Fail fast without a CUDA device or FireANTs; return the ``torch.device``.
+
+    No CPU mode (offer_cpu=False): FireANTs on the CPU offers nothing over the
+    ANTs rigid method. See ``pipeline/torchCompute.py``.
+    """
+    from .torchCompute import select_torch_device
+
+    device = select_torch_device("GPU Rigid", GpuRigidError, offer_cpu=False)
     try:
         import fireants  # noqa: F401
     except ImportError as exc:
         raise GpuRigidError(
             "GPU Rigid requires the fireants package. Install with: pip install fireants==1.5.0"
         ) from exc
+    return device
 
 
 def is_ants_style_physical_rigid_method(method) -> bool:
@@ -592,11 +592,14 @@ def run_gpu_rigid_registration(
     debug_dir: Optional[str] = None,
     reference_name: Optional[str] = None,
 ):
-    """Moments init + optional multi-scale rigid refine; return best-scoring R,t."""
+    """Moments init + optional multi-scale rigid refine; return best-scoring R,t.
+
+    The result's ``compute`` records the GPU and torch build for provenance.
+    """
     import torch
     from fireants.io.image import BatchedImages
 
-    ensure_gpu_rigid_cuda()
+    torch_device = ensure_gpu_rigid_cuda()
     ra = _rigid_alignment()
     estimation_shape = tuple(int(s) for s in fixed_image.shape)
     opts = adapt_gpu_rigid_opts_to_grid(
@@ -641,7 +644,7 @@ def run_gpu_rigid_registration(
             notes="paste-aligned, R=I",
         )
 
-    device = "cuda"
+    device = torch_device.type  # always "cuda" (ensure_gpu_rigid_cuda)
     transl_mode = str(opts.get("transl_mode", DEFAULT_GPU_RIGID_TRANSL_MODE)).lower()
     moments_scales, moments_iters, refine_scales, refine_iters = _split_moments_refine_pyramid(
         opts["scales"], opts["iterations"]
@@ -790,6 +793,7 @@ def run_gpu_rigid_registration(
             "initializer_used": opts.get("initializer", "moments"),
             "success": True,
             "debug_dir": debug_dir,
+            "compute": compute_provenance(device, "float32"),
         }
     except Exception as exc:
         if debug_writer is not None:

@@ -59,6 +59,7 @@ from pydicom import dcmread
 
 from .ALPACA import ALPACA, LandmarkUploadAlignment
 from . import networkFolders
+from . import skyscanReconstruction  # Bruker SkyScan/NRecon reconstruction folders (voxel size from the log)
 from . import antsWorker  # ANTs registrations run in a worker process (engine stays responsive)
 from . import gridPreviewWorker  # Regular grid previews, built in parallel worker processes
 # Crash-safe protocol: atomic writes, read-only mask loads, per-subject transactions and
@@ -295,6 +296,48 @@ LANDMARK_UPLOAD_COORDINATE_SUGGESTION = "Use x,y,z columns only"
 def load_image_from_bytes(file_bytes):
     image = Image.open(io.BytesIO(file_bytes))
     return np.array(image)
+
+
+# ImageJ/Fiji TIFFs state their physical unit in the ImageJ metadata ('unit'); the
+# XResolution/YResolution tags (ResolutionUnit "none") and the z 'spacing' are both in
+# that unit. Until 2026-11-04 Aurora read them as mm whatever the unit said, so a stack
+# saved in microns came in 1000x too large. Decision (Alejandro, 2026-11-04): follow the
+# unit the file declares, with no size-based guessing; a file whose unit is wrong is the
+# data's problem and is fixed outside Aurora (or with Overwrite voxel size). A missing or
+# unknown unit keeps the old reading (mm) and says so in the scan's scanner_metadata.
+_IMAGEJ_UNIT_TO_MM = {
+    'mm': 1.0, 'millimeter': 1.0, 'millimetre': 1.0, 'millimeters': 1.0, 'millimetres': 1.0,
+    'um': 1e-3, 'µm': 1e-3, 'micron': 1e-3, 'microns': 1e-3,
+    'micrometer': 1e-3, 'micrometre': 1e-3, 'micrometers': 1e-3, 'micrometres': 1e-3,
+    'nm': 1e-6, 'nanometer': 1e-6, 'nanometre': 1e-6, 'nanometers': 1e-6, 'nanometres': 1e-6,
+    'cm': 10.0, 'centimeter': 10.0, 'centimetre': 10.0, 'centimeters': 10.0, 'centimetres': 10.0,
+    'm': 1000.0, 'meter': 1000.0, 'metre': 1000.0, 'meters': 1000.0, 'metres': 1000.0,
+    'in': 25.4, 'inch': 25.4, 'inches': 25.4,
+}
+
+
+def imagej_unit_to_mm(unit):
+    """mm per one ImageJ 'unit', or None when the unit is missing or not a length
+    (e.g. 'pixel'). Accepts the micro sign spellings ImageJ writes (µ, μ, \\u00B5)."""
+    if not isinstance(unit, str):
+        return None
+    key = unit.strip().lower().replace('\\u00b5', 'µ').replace('μ', 'µ')
+    return _IMAGEJ_UNIT_TO_MM.get(key)
+
+
+def imagej_unit_record(ij_meta):
+    """(mm-per-unit factor or None, provenance dict) for a TIFF's ImageJ metadata
+    (TiffFile.imagej_metadata; None or {} for files not written by ImageJ/Fiji)."""
+    ij_meta = ij_meta or {}
+    unit = ij_meta.get('unit')
+    factor = imagej_unit_to_mm(unit)
+    if factor is not None:
+        note = f'ImageJ unit {unit!r} converted to mm (x{factor:g})'
+    elif unit:
+        note = f'ImageJ unit {unit!r} is not a length Aurora knows; values read as mm'
+    else:
+        note = 'no unit stated in the file; values read as mm'
+    return factor, {'declared_unit': unit, 'mm_per_unit': factor, 'note': note}
 
 
 class FileUploadView(APIView):
@@ -2578,6 +2621,13 @@ class ExtractScansView(APIView):
                 image_data, _ = self.load_zeiss_image(scan_folder)
                 return image_data, None
 
+            if scan_subtype == skyscanReconstruction.SUBTYPE:
+                try:
+                    image_data, _, _ = skyscanReconstruction.load_reconstruction(os.path.join(directory, scan_name))
+                except skyscanReconstruction.SkyScanImportError as exc:
+                    return None, f"{scan_name}: {exc}"
+                return image_data, None
+
             if scan_subtype == "DICOM":
                 scan_folder = os.path.join(directory, scan_name)
                 _, image_data, _ = self.load_dicom_image(scan_folder)
@@ -3493,6 +3543,9 @@ class ExtractScansView(APIView):
 
             
 
+            # Import caveats the person should read (e.g. lossy JPEG SkyScan slices); they are
+            # also kept in each scan's scanner_metadata. Returned with the success message.
+            extraction_warnings = []
             for idx, scan in enumerate(scans):
                 scan_name = scan['name']
                 scan_subtype = scan['subtype']   
@@ -3562,6 +3615,22 @@ class ExtractScansView(APIView):
                             image_data, intensity_options=intensity_options, scan_name=scan_name
                         )
                     
+                    elif scan_subtype == skyscanReconstruction.SUBTYPE:
+                        # Voxel size only from the NRecon log (refused without it); provenance
+                        # and lossy-JPEG warnings land in scanner_metadata.skyscan.
+                        try:
+                            image_data, voxel_sizes, scanner_metadata = skyscanReconstruction.load_reconstruction(
+                                os.path.join(directory, scan_name))
+                        except skyscanReconstruction.SkyScanImportError as exc:
+                            raise ValueError(f"{scan_name}: {exc}") from exc
+                        extraction_warnings.extend(
+                            f"{scan_name}: {w}" for w in scanner_metadata['skyscan']['warnings'])
+
+                        # Standardize data type
+                        image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
+                            image_data, intensity_options=intensity_options, scan_name=scan_name
+                        )
+
                     elif scan_subtype == "DICOM":
                         scan_folder = os.path.join(directory, scan_name)
                         if os.path.exists(os.path.join(scan_folder, "DICOMDIR")) or any(f.endswith('.dcm') for f in os.listdir(scan_folder)):
@@ -3592,8 +3661,10 @@ class ExtractScansView(APIView):
                         
                         image_data, voxel_size, scanner_metadata = self.load_multi_page_tiff(scan_folder)
                     
-                        # For now, assume isotropic for TIFF (can be enhanced)
-                        voxel_sizes = (voxel_size, voxel_size, voxel_size)
+                        # x, y from the TIFF resolution, z from ImageJ spacing when the file states
+                        # one (see load_multi_page_tiff); otherwise isotropic as before.
+                        xyz = (scanner_metadata or {}).get('voxel_sizes_xyz')
+                        voxel_sizes = tuple(xyz) if xyz else (voxel_size, voxel_size, voxel_size)
                     
                         # Standardize data type
                         image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
@@ -3950,7 +4021,7 @@ class ExtractScansView(APIView):
                     }
                 )
 
-            return Response({'message': 'Scans extracted successfully'})
+            return Response({'message': 'Scans extracted successfully', 'warnings': extraction_warnings})
 
         except Exception as e:
             print(e)
@@ -4047,29 +4118,36 @@ class ExtractScansView(APIView):
                             x_resolution_value = float(x_res)
                             print(f"DEBUG: X resolution value (direct): {x_resolution_value}")
                         
-                        # Check resolution unit
-                        resolution_unit = tags.get('ResolutionUnit', 1).value
+                        # Check resolution unit (missing tag = 1, "none")
+                        resolution_unit_tag = tags.get('ResolutionUnit')
+                        resolution_unit = int(resolution_unit_tag.value) if resolution_unit_tag is not None else 1
                         print(f"DEBUG: Resolution unit: {resolution_unit}")
+                        # ImageJ unit (TiffFile-level metadata), read the way ImageJ does.
+                        ij_unit_factor, ij_unit_info = imagej_unit_record(tif.imagej_metadata)
                         
                         # Properly invert resolution to get voxel size
                         # Resolution is pixels per unit, voxel size is unit per pixel
-                        if resolution_unit == 2:  # Inches
+                        if x_resolution_value > 0 and ij_unit_factor is not None:
+                            voxel_size = ij_unit_factor / x_resolution_value  # ImageJ unit -> mm
+                            print(f"DEBUG: Calculated voxel size ({ij_unit_info['note']}): {voxel_size:.6f} mm")
+                        elif resolution_unit == 2:  # Inches
                             voxel_size = 25.4 / x_resolution_value  # Convert inches to mm
                         elif resolution_unit == 3:  # Centimeters
                             voxel_size = 10.0 / x_resolution_value  # Convert cm to mm
                         else:  # Default/unknown unit
                             voxel_size = 1.0 / x_resolution_value if x_resolution_value > 0 else 1.0
-                            print(f"DEBUG: Calculated voxel size (unknown unit): {voxel_size:.6f} mm")
+                            print(f"DEBUG: Calculated voxel size ({ij_unit_info['note']}): {voxel_size:.6f} mm")
                         
                         print(f"Resolution: {x_resolution_value:.4f} pixels per unit (unit={resolution_unit})")
                         print(f"Extracted voxel size from TIFF metadata: {voxel_size:.6f} mm")
                     
                     # Check for ImageJ metadata which might contain voxel spacing
-                    if voxel_size is None and hasattr(page, 'imagej_metadata') and page.imagej_metadata:
-                        ij_meta = page.imagej_metadata
+                    if voxel_size is None and tif.imagej_metadata:
+                        ij_meta = tif.imagej_metadata
                         if 'spacing' in ij_meta:
-                            voxel_size = float(ij_meta['spacing'])
-                            print(f"Extracted voxel size from ImageJ metadata: {voxel_size:.3f} mm")
+                            ij_unit_factor, ij_unit_info = imagej_unit_record(ij_meta)
+                            voxel_size = float(ij_meta['spacing']) * (ij_unit_factor or 1.0)
+                            print(f"Extracted voxel size from ImageJ metadata: {voxel_size:.3f} mm ({ij_unit_info['note']})")
         
         except Exception as e:
             print(f"Could not extract voxel size from TIFF metadata: {e}")
@@ -4355,6 +4433,12 @@ class ExtractScansView(APIView):
                 if tif.pages:
                     page = tif.pages[0]
                     tags = page.tags
+                    # ImageJ metadata lives on the TiffFile (tifffile has no page.imagej_metadata,
+                    # so the old page-level check never ran and the z spacing was never read).
+                    ij_meta = tif.imagej_metadata or {}
+                    ij_unit_factor, ij_unit_info = imagej_unit_record(ij_meta)
+                    voxel_source = {'source': 'default 1 mm (no size in the file)', **ij_unit_info}
+                    xy_size = None
                     
                     # Look for X and Y resolution
                     if 'XResolution' in tags and 'YResolution' in tags:
@@ -4373,34 +4457,69 @@ class ExtractScansView(APIView):
                         else:
                             y_pixels_per_unit = float(y_res)
                         
-                        # Check resolution unit
-                        resolution_unit = tags.get('ResolutionUnit', 1).value
+                        # Check resolution unit (missing tag = 1, "none")
+                        resolution_unit_tag = tags.get('ResolutionUnit')
+                        resolution_unit = int(resolution_unit_tag.value) if resolution_unit_tag is not None else 1
                         
-                        if resolution_unit == 2:  # Inches
+                        if x_pixels_per_unit <= 0:
+                            pass  # no usable resolution; keep the default below
+                        elif ij_unit_factor is not None:
+                            # ImageJ file with a length unit: resolution is pixels per that unit
+                            # (ImageJ's own reading, whatever ResolutionUnit says).
+                            xy_size = ij_unit_factor / x_pixels_per_unit
+                            voxel_source['source'] = 'TIFF XResolution in the ImageJ unit'
+                        elif resolution_unit == 2:  # Inches
                             # Convert from pixels per inch to mm per pixel
-                            voxel_size = 25.4 / x_pixels_per_unit  # 25.4 mm per inch
+                            xy_size = 25.4 / x_pixels_per_unit  # 25.4 mm per inch
+                            voxel_source['source'] = 'TIFF XResolution (ResolutionUnit inch)'
                         elif resolution_unit == 3:  # Centimeters
                             # Convert from pixels per cm to mm per pixel
-                            voxel_size = 10.0 / x_pixels_per_unit  # 10 mm per cm
+                            xy_size = 10.0 / x_pixels_per_unit  # 10 mm per cm
+                            voxel_source['source'] = 'TIFF XResolution (ResolutionUnit cm)'
                         else:
-                            voxel_size = 1.0 / x_pixels_per_unit if x_pixels_per_unit > 0 else 1.0
-                            print(f"DEBUG: Calculated voxel size (unknown unit): {voxel_size:.6f} mm")
+                            xy_size = 1.0 / x_pixels_per_unit
+                            voxel_source['source'] = 'TIFF XResolution (no unit; read as mm)'
                         
-                        print(f"Extracted voxel size from TIFF metadata: {voxel_size:.3f} mm")
+                        if xy_size is not None:
+                            # TIFF stores resolution as a rational: drop float noise
+                            # (0.00999999998 -> 0.01); 7 digits keep scanner values like 10.00007 um.
+                            xy_size = float(f'{xy_size:.7g}')
+                            print(f"Extracted voxel size from TIFF metadata: {xy_size:.6f} mm")
 
                         scanner_metadata['geometry'] = {
                             'x_resolution': x_pixels_per_unit,
                             'y_resolution': y_pixels_per_unit,
                             'resolution_unit': resolution_unit,
-                            'voxel_size_mm': voxel_size
+                            'voxel_size_mm': xy_size
                         }
                     
-                    # Check for ImageJ metadata which might contain voxel spacing
-                    if hasattr(page, 'imagej_metadata') and page.imagej_metadata:
-                        ij_meta = page.imagej_metadata
-                        if 'spacing' in ij_meta:
-                            voxel_size = float(ij_meta['spacing'])
-                            scanner_metadata['imagej'] = ij_meta
+                    # ImageJ 'spacing' is the z step between pages, in the same unit.
+                    z_size = None
+                    if 'spacing' in ij_meta:
+                        try:
+                            z_size = float(ij_meta['spacing']) * (ij_unit_factor or 1.0)
+                        except (TypeError, ValueError):
+                            z_size = None
+                        if z_size is not None and z_size <= 0:
+                            z_size = None
+                    if ij_meta:
+                        scanner_metadata['imagej'] = {k: v for k, v in ij_meta.items()
+                                                      if isinstance(v, (str, int, float, bool))}
+
+                    # x, y from the resolution; z from ImageJ spacing when stated (a different z
+                    # goes through the anisotropic resampling like DICOM slice thickness).
+                    if xy_size is None and z_size is not None:
+                        xy_size = z_size
+                        voxel_source['source'] = 'ImageJ spacing (no XY resolution in the file)'
+                    if xy_size is not None:
+                        voxel_size = xy_size
+                    voxel_sizes_xyz = [voxel_size, voxel_size, z_size if z_size is not None else voxel_size]
+                    scanner_metadata['voxel_sizes_xyz'] = voxel_sizes_xyz
+                    voxel_source['voxel_sizes_xyz_mm'] = voxel_sizes_xyz
+                    voxel_source['z_source'] = 'ImageJ spacing' if z_size is not None else 'same as x/y (not stated)'
+                    scanner_metadata['voxel_size_source'] = voxel_source
+                    print(f"Voxel size (x, y, z) {voxel_sizes_xyz} mm from {voxel_source['source']}; "
+                          f"z: {voxel_source['z_source']}; {voxel_source['note']}")
                     
                     # Extract other relevant tags
                     metadata_tags = {}
@@ -5087,6 +5206,12 @@ class ExtractJsonView(APIView):
 
             return Response(json_data, status=status.HTTP_200_OK)
 
+        except PermissionError as e:
+            # Shared Aurora: an item the owner has not opened up to members. Same answer as
+            # sharedFolderAccess.api_exception_handler, so the page can say what it is.
+            from pipeline import sharedFolderAccess
+            return sharedFolderAccess.api_exception_handler(e, {}) or Response(
+                {'error': str(e)}, status=status.HTTP_403_FORBIDDEN)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         

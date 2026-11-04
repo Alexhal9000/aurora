@@ -39,6 +39,12 @@ on Windows and macOS (beta). A change asked for in the panel goes through one of
   person at this computer (same steps and owner confirmation as `aurora-tools pair`).
 * pause / resume: members (not the owner or managers) cannot open the server from other
   computers until resumed; engine.json "members_paused", enforced here and on the website.
+* Folder access (Linux, since 2026-11-04): Turn on gives the service each shared folder
+  itself only, never every file inside (fast, and private items stay private).
+  status "folder_access" says per folder what the service cannot open or change
+  (sharedFolderAccess.py, checked as the service account in the background);
+  recheck_access runs it again; request_full_access asks, through the same confirm step
+  as a request, to give the service access to everything in one shared folder.
 """
 
 from __future__ import annotations
@@ -63,7 +69,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from AuroraClient import engineConfig
-from pipeline import engineJobs, networkFolders, networkMode
+from pipeline import engineJobs, networkFolders, networkMode, sharedFolderAccess
 
 logger = logging.getLogger(__name__)
 
@@ -582,6 +588,20 @@ def _in_use_by_other(record: dict) -> bool:
     return any(str(job.get("user_id") or "") not in ("", user_id) for job in engineJobs.running())
 
 
+# Id of the last waiting request that asked for full folder access: once it is gone
+# (confirmed or discarded at the computer) the folder access is checked again.
+_watched_full_access_request = None
+
+
+def _recheck_after_full_access(pending) -> None:
+    global _watched_full_access_request
+    if pending and pending.get("full_access"):
+        _watched_full_access_request = pending.get("id")
+    elif _watched_full_access_request and not pending:
+        _watched_full_access_request = None
+        sharedFolderAccess.start_checks(current_folders(), force=True)
+
+
 def status_payload(record: dict) -> dict:
     config = engineConfig.load_config()
     service = networkFolders.running_as_service()
@@ -590,6 +610,8 @@ def status_payload(record: dict) -> dict:
     pairing = networkMode.pairing_state() or {}
     raw = engineConfig._read_raw()
     pending = pending_request() if service else None
+    if service:
+        _recheck_after_full_access(pending)
     payload = {
         "platform": sys.platform,
         "running_as_service": service,
@@ -642,6 +664,15 @@ def status_payload(record: dict) -> dict:
                               networkFolders.member_folders(record.get("user_id"))]
     if payload["can_manage"] and shared:
         payload["member_folders"] = member_folders_payload()
+    # Only the service's own account gives a true answer (a desktop or direct run would
+    # check the owner's rights); "give access to everything" exists in the Linux helper.
+    payload["full_access_supported"] = service and linux_helper
+    if payload["can_manage"] and service and linux_helper:
+        payload["folder_access"] = [
+            # For someone on another computer: what to paste in a terminal on this one.
+            {**entry, "grant_command": "sudo aurora-tools network grant-all " + shlex.quote(entry["folder"])}
+            for entry in sharedFolderAccess.status(current_folders())
+        ]
     if not service and not shared and payload["can_turn_on"] and not payload["direct_mode"] and _service_installed():
         # The shared service is set up but this desktop Aurora is running anyway
         # (developer run, or the service failed to start): do not offer a second one.
@@ -673,6 +704,47 @@ def _quit_soon(seconds: float) -> None:
     threading.Thread(target=stop, name="aurora-handover", daemon=True).start()
 
 
+# Turning sharing on can take minutes after the password (folder permissions over large
+# shared folders), so the helper gets 30 min and its lines go to the Aurora terminal as
+# they come instead of all at the end: the terminal used to look frozen (2026-11-04).
+HELPER_TIMEOUT_SECONDS = 30 * 60
+
+
+def _run_helper_streaming(command: list, timeout: float) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output=True, text=True, timeout=...) that also logs each
+    stdout line of the helper while it runs. Raises TimeoutExpired after killing it."""
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    out_lines, err_lines = [], []
+
+    def drain_stderr():
+        for line in proc.stderr:
+            err_lines.append(line)
+            logger.warning("Sharing helper: %s", line.rstrip())
+
+    err_thread = threading.Thread(target=drain_stderr, name="aurora-sharing-helper-stderr", daemon=True)
+    err_thread.start()
+    timed_out = threading.Event()
+
+    def on_timeout():
+        timed_out.set()
+        proc.kill()
+
+    timer = threading.Timer(timeout, on_timeout)
+    timer.daemon = True
+    timer.start()
+    try:
+        for line in proc.stdout:
+            out_lines.append(line)
+            logger.info("Sharing helper: %s", line.rstrip())
+        proc.wait()
+    finally:
+        timer.cancel()
+    err_thread.join(timeout=5)
+    if timed_out.is_set():
+        raise subprocess.TimeoutExpired(command, timeout, output="".join(out_lines), stderr="".join(err_lines))
+    return subprocess.CompletedProcess(command, proc.returncode, "".join(out_lines), "".join(err_lines))
+
+
 def turn_on(folders: list, port: int, pair_owner: str = "") -> tuple:
     """Run the admin side with the system's admin prompt on this screen. pair_owner: the
     lab account of the person turning it on; the shared service then pairs only with it."""
@@ -685,11 +757,12 @@ def turn_on(folders: list, port: int, pair_owner: str = "") -> tuple:
         command += ["--folder", folder]
     command += ["--port", str(port), *_owner_args(pair_owner), *dev_source_args()]
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        result = _run_helper_streaming(command, HELPER_TIMEOUT_SECONDS)
     except FileNotFoundError:
         return False, "pkexec is missing on this computer. In a terminal: sudo aurora-tools network enable"
     except subprocess.TimeoutExpired:
-        return False, "The password window was not answered in time."
+        return False, ("Sharing did not finish within 30 minutes (the password window was not answered, or "
+                       "the shared folders are very large). See the Aurora terminal for the last step.")
     if result.returncode in (126, 127) and "Error:" not in (result.stderr or ""):
         return False, "Sharing was not turned on: the password was not entered."
     if result.returncode != 0:
@@ -1154,6 +1227,74 @@ class EngineSharingView(APIView):
             except ValueError as exc:
                 return refuse(str(exc))
             engineConfig.write_config(shared_folders=folders)
+            return done()
+
+        if action == "recheck_access":
+            if not service:
+                return refuse("Folder access is checked by the shared service.")
+            sharedFolderAccess.start_checks(current_folders(), force=True)
+            return done()
+
+        if action == "browse_access":
+            # Settings' folder view of what members cannot open (one level at a time).
+            if not service:
+                return refuse("Folder access is checked by the shared service.")
+            folder = str(data.get("folder") or "")
+            if folder not in current_folders():
+                return refuse("That folder is not one of the shared folders.")
+            try:
+                return Response(sharedFolderAccess.browse(folder, str(data.get("path") or "")),
+                                status=status.HTTP_200_OK)
+            except ValueError as exc:
+                return refuse(str(exc))
+
+        if action == "request_full_access":
+            # "Give members access to everything in this folder": the owner's explicit choice
+            # per folder, applied with admin rights at the computer (aurora-tools confirm).
+            if not service or not (sys.platform.startswith("linux") and os.access(HELPER, os.X_OK)):
+                return refuse("Giving access to everything in a folder is done by the shared service on Linux.")
+            if record.get("remote"):
+                # Confirmed without a y/N question once the admin password is given, so only
+                # the person at this computer may ask; others get the grant-all command.
+                return refuse("Do this at the computer itself, or run the command shown in a terminal there.")
+            folder = str(data.get("folder") or "")
+            now_folders = current_folders()
+            if folder not in now_folders:
+                return refuse("That folder is not one of the shared folders.")
+            # Optional "path": a folder or file inside it, chosen in Settings' folder view, so
+            # only that part is opened up (Alejandro, 2026-11-04). The helper checks it again.
+            try:
+                target, rel = sharedFolderAccess.resolve_inside(folder, str(data.get("path") or ""))
+            except ValueError as exc:
+                return refuse(str(exc))
+            last = next((e for e in sharedFolderAccess.status(now_folders) if e.get("folder") == folder), {})
+            if rel == "." and last.get("checked_at") and last.get("complete") and not last.get("fixable", 1):
+                # Everything left belongs to other accounts: the helper would change nothing.
+                return refuse("Nothing in that folder that members cannot open belongs to its owner; "
+                              "the accounts that own those items decide.")
+            pending = pending_request()
+            full = [target]
+            if pending:
+                same = (pending.get("folders") == now_folders
+                        and int(pending.get("port") or 0) == engineConfig.load_config()["network_port"])
+                if not same:
+                    return refuse("A change is already waiting for confirmation. Confirm or cancel it first.")
+                full = sorted(set(pending.get("full_access") or []) | {target})
+            request_data = {
+                "id": secrets.token_hex(8),
+                "requested_at": time.time(),
+                "expires_at": time.time() + REQUEST_TTL_SECONDS,
+                "by": {"name": str(record.get("name") or "")[:120], "role": session_role(record),
+                       "user_id": str(record.get("user_id") or "")},
+                "folders": now_folders,
+                "port": engineConfig.load_config()["network_port"],
+                "full_access": full,
+            }
+            path = _request_path()
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(request_data, indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+            logger.info("Full access to %s requested by %s", ", ".join(full), record.get("name"))
             return done()
 
         try:

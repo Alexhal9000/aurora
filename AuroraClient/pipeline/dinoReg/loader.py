@@ -33,18 +33,42 @@ def default_checkpoint_path() -> str:
 DEFAULT_CHECKPOINT = default_checkpoint_path
 
 
-def ensure_dino_reg_cuda():
-    """Fail fast if CUDA is unavailable. Does not load the model."""
-    try:
-        import torch
-    except ImportError as exc:
-        raise DinoRegError(
-            "DINO-Reg requires PyTorch with CUDA. PyTorch is not installed."
-        ) from exc
-    if not torch.cuda.is_available():
-        raise DinoRegError(
-            "DINO-Reg requires a CUDA GPU. No CUDA device is available."
-        )
+def ensure_dino_reg_cuda(allow_cpu: bool = False):
+    """Fail fast if CUDA is unavailable. Does not load the model.
+
+    Returns the ``torch.device`` DINO-Reg will run on: CUDA, else the Apple GPU
+    (MPS) on a Mac. With ``allow_cpu`` (the user confirmed the slow CPU run in
+    the UI) a machine with neither gets the CPU; otherwise DinoRegError carries
+    ``code`` = CPU_FALLBACK_CODE so the UI can offer that choice. See
+    ``pipeline/torchCompute.py``. (Name kept for existing imports.)
+    """
+    from ..torchCompute import select_torch_device
+
+    return select_torch_device(
+        "DINO-Reg", DinoRegError, allow_cpu=allow_cpu, allow_mps=True,
+    )
+
+
+def dino_reg_device():
+    """Device of the loaded DINOv3 model (else the best available: CUDA, MPS, CPU)."""
+    import torch
+
+    from ..torchCompute import mps_available
+
+    if _DEVICE is not None:
+        return _DEVICE
+    if torch.cuda.is_available():
+        return torch.device("cuda", 0)
+    return torch.device("mps") if mps_available() else torch.device("cpu")
+
+
+def dino_reg_precision(device) -> str:
+    """Numeric precision of the DINOv3 encoder on ``device`` (for provenance)."""
+    import torch
+
+    # float16 autocast is only used on CUDA, where it is fast and well supported.
+    # MPS and CPU run float32: fewer unsupported-op surprises, same as the model.
+    return "float16 autocast" if torch.device(device).type == "cuda" else "float32"
 
 
 class _Dinov3PatchEncoder:
@@ -80,14 +104,16 @@ class _Dinov3PatchEncoder:
         return {"x_norm_patchtokens": hidden[:, prefix:, :]}
 
 
-def get_dino_model(checkpoint_path: str | None = None):
-    """Return ``(model, device)``, loading once per process."""
+def get_dino_model(checkpoint_path: str | None = None, allow_cpu: bool = False):
+    """Return ``(model, device)``, loading once per process.
+
+    ``allow_cpu``: load on the CPU when no CUDA device is usable (user opt-in).
+    """
     global _MODEL, _DEVICE
     if _MODEL is not None:
         return _MODEL, _DEVICE
 
-    ensure_dino_reg_cuda()
-    import torch
+    device = ensure_dino_reg_cuda(allow_cpu=allow_cpu)
 
     try:
         from transformers import AutoModel
@@ -97,7 +123,6 @@ def get_dino_model(checkpoint_path: str | None = None):
             "Install with: pip install 'transformers>=4.56.0'"
         ) from exc
 
-    device = torch.device("cuda", 0)
     weights_dir = checkpoint_path or default_checkpoint_path()
     if os.path.isfile(weights_dir):
         weights_dir = os.path.dirname(weights_dir)

@@ -2611,6 +2611,7 @@ def build_alignment_rigid_provenance(
     gpu_initializer=None,
     dino_reg_result=None,
     scale_factor=None,
+    compute=None,
 ):
     """
     Serializable rigid-alignment provenance for Scientific Report Methods and audit trails.
@@ -2673,6 +2674,14 @@ def build_alignment_rigid_provenance(
                 bag[key] = str(val)
         if bag:
             provenance["dino_reg_result"] = bag
+    if isinstance(compute, dict) and compute:
+        # Where the tool ran (torchCompute.compute_provenance): device, precision,
+        # torch / CUDA build, GPU name. A CPU float32 run is not bit-identical to
+        # a GPU float16 run, so the Scientific Report names CPU runs.
+        provenance["compute"] = {
+            str(k): (v if isinstance(v, (str, int, float, bool)) or v is None else str(v))
+            for k, v in compute.items()
+        }
     return provenance
 
 
@@ -3911,6 +3920,13 @@ class AlignToReferenceView(APIView):
             scaling = bool(scaling)
         outer_surface = request.data.get('outer_surface', False)
         scale_match = 1
+        # DINO-Reg on the CPU when no CUDA device is usable: only after the
+        # user confirmed it in the UI (pipeline/torchCompute.py, CPU_FALLBACK_CODE).
+        allow_cpu = request.data.get('allow_cpu', False)
+        if isinstance(allow_cpu, str):
+            allow_cpu = allow_cpu.strip().lower() in ('1', 'true', 'yes', 'on')
+        else:
+            allow_cpu = bool(allow_cpu)
         # Linking is the opt-in: children skipped by the batch inherit the main's transform.
         propagate_linked = bool(request.data.get('propagate_linked', True))
 
@@ -3935,6 +3951,7 @@ class AlignToReferenceView(APIView):
             run_gpu_rigid_registration,
         )
         from .gpuRigidDebug import resolve_gpu_rigid_debug_dir
+        from .torchCompute import compute_provenance, error_response_body
         gpu_rigid_opts = normalize_gpu_rigid_options(request.data if request.data else {})
         
         print(f"Using alignment method: {method}")
@@ -4080,7 +4097,7 @@ class AlignToReferenceView(APIView):
             if method_key == "dino-reg":
                 from .dinoRegRigid import DinoRegError, ensure_dino_reg_cuda, get_dino_model
                 try:
-                    ensure_dino_reg_cuda()
+                    dino_device = ensure_dino_reg_cuda(allow_cpu=allow_cpu)
                     channel_layer = get_channel_layer()
                     if channel_layer is not None:
                         async_to_sync(channel_layer.group_send)(
@@ -4089,14 +4106,17 @@ class AlignToReferenceView(APIView):
                                 'type': 'send_progress',
                                 'progress': 0,
                                 'scan_name': scan_names[0] if scan_names else reference,
-                                'custom_message': 'Loading DINOv3 model for DINO-Reg...',
+                                'custom_message': {
+                                    'cuda': 'Loading DINOv3 model for DINO-Reg...',
+                                    'mps': 'Loading DINOv3 model for DINO-Reg on the Apple GPU...',
+                                }.get(dino_device.type, 'Loading DINOv3 model for DINO-Reg on the CPU (slow)...'),
                                 'total': max(len(scan_names), 1),
                                 'current': 0,
                             }
                         )
-                    get_dino_model()
+                    get_dino_model(allow_cpu=allow_cpu)
                 except DinoRegError as exc:
-                    return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+                    return Response(error_response_body(exc), status=status.HTTP_400_BAD_REQUEST)
             if method_key == "gpu-rigid":
                 try:
                     ensure_gpu_rigid_cuda()
@@ -4114,7 +4134,7 @@ class AlignToReferenceView(APIView):
                             }
                         )
                 except GpuRigidError as exc:
-                    return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+                    return Response(error_response_body(exc), status=status.HTTP_400_BAD_REQUEST)
         elif method_key in ("alpaca", "manual-guidepoints"):
             pass
         else:
@@ -4285,6 +4305,7 @@ class AlignToReferenceView(APIView):
                     ants_initializer_record = None
                     gpu_initializer_record = None
                     dino_reg_result = None
+                    rigid_compute_record = None  # DINO-Reg / GPU Rigid device + precision
                     print(f"Processing scan {idx + 1}/{total_scans}: {scan_name}")
                     scale_match = 1.0
 
@@ -5441,6 +5462,7 @@ class AlignToReferenceView(APIView):
                                     )
                                 continue
                             gpu_initializer_record = gpu_result.get("initializer_record")
+                            rigid_compute_record = gpu_result.get("compute")
                             mat_path = gpu_result["mat_path"]
                             gpu_rigid_R = gpu_result.get("R")
                             gpu_rigid_t = gpu_result.get("t")
@@ -5912,9 +5934,10 @@ class AlignToReferenceView(APIView):
                                 fixed_threshold=reference_threshold,
                                 debug_dir=dino_debug_dir,
                                 progress_callback=_dino_progress,
+                                allow_cpu=allow_cpu,
                             )
                         except DinoRegError as exc:
-                            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+                            return Response(error_response_body(exc), status=status.HTTP_400_BAD_REQUEST)
 
                         if pose is None:
                             print(
@@ -5922,6 +5945,10 @@ class AlignToReferenceView(APIView):
                                 "(semantic landmarks / refine / pyramid); skipping"
                             )
                             continue
+
+                        from .dinoReg.loader import dino_reg_device, dino_reg_precision
+                        _dino_dev = dino_reg_device()
+                        rigid_compute_record = compute_provenance(_dino_dev, dino_reg_precision(_dino_dev))
 
                         # Pose extras → alignment_rigid_provenance.dino_reg_result for Scientific Report.
                         dino_reg_result = {
@@ -6204,6 +6231,7 @@ class AlignToReferenceView(APIView):
                         gpu_initializer_record if method.lower() == 'gpu-rigid' else None,
                         dino_reg_result if method.lower() == 'dino-reg' else None,
                         scale_factor=scale_match,
+                        compute=rigid_compute_record,
                     )
                     # Use original_voxel_size: voxel_size may have been overwritten when resampling to reference spacing
                     scan_metadata['alignment_previous_voxel_size'] = original_voxel_size

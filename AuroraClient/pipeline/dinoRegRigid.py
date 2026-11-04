@@ -29,11 +29,13 @@ from skimage.transform import resize
 from .dinoReg.loader import (
     DinoRegError,
     PATCH_SIZE,
+    dino_reg_device,
     ensure_dino_reg_cuda,
     get_dino_model,
     get_dinov2_model,
 )
 from .registrationTools import RegistrationTools
+from .torchCompute import empty_device_cache
 REG_FEATURE_DIM = 24
 SLICE_GAP = 2
 # Pass 2: try the largest ViT grid first (112×96 ≈ paper's high setting).
@@ -50,6 +52,12 @@ REFINED_COSINE_CLUSTER_FALLBACK = 0.28
 # Starting hint only — actual batch is probed per (feat_h, feat_w) and shrunk on OOM.
 ENCODE_BATCH_SIZE = 4
 ENCODE_BATCH_MAX = 32
+# CPU runs (user opt-in, see pipeline/torchCompute.py) use a fixed batch: the
+# VRAM probe would only spend minutes of full ViT-L forwards to fill system RAM.
+CPU_ENCODE_BATCH = 4
+# Apple GPU (MPS) shares system RAM and may page instead of raising OOM, so the
+# probe stops here rather than at ENCODE_BATCH_MAX.
+MPS_ENCODE_BATCH_MAX = 8
 MAX_PCA_FIT_TOKENS = 250_000
 # Full FG token clouds are too large for an all-pairs similarity matrix.
 # Spatial stride + a hard cap keeps matching in the same regime as voxel-patch RANSAC.
@@ -163,8 +171,24 @@ def _foreground_z_extent(mask):
     return int(z_idx[0]), int(z_idx[-1]) + 1
 
 
+def _empty_cache():
+    """Free cached GPU memory on the DINO-Reg device (CUDA or Apple MPS)."""
+    empty_device_cache(dino_reg_device())
+
+
+def _encoder_autocast(device):
+    """float16 autocast on CUDA; plain float32 on Apple MPS and the CPU."""
+    import contextlib
+
+    import torch
+
+    if torch.device(device).type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return contextlib.nullcontext()
+
+
 def _encode_slice_batch(model, device, slices_bhw, input_h, input_w):
-    """GPU bilinear resize + ImageNet norm + fp16 DINOv3. slices_bhw: (B, H, W) float32."""
+    """Bilinear resize + ImageNet norm + DINOv3 (fp16 on GPU, fp32 on CPU). slices_bhw: (B, H, W) float32."""
     import torch
     import torch.nn.functional as F
 
@@ -176,7 +200,7 @@ def _encode_slice_batch(model, device, slices_bhw, input_h, input_w):
     mean = x.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
     std = x.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
     x = (x - mean) / std
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
+    with torch.inference_mode(), _encoder_autocast(device):
         tokens = model.forward_features(x)["x_norm_patchtokens"].float()
     return tokens.detach().cpu().numpy()
 
@@ -194,7 +218,7 @@ def _encode_slice_batch_gpu(model, device, slices_bhw, input_h, input_w):
     mean = x.new_tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
     std = x.new_tensor(IMAGENET_STD).view(1, 3, 1, 1)
     x = (x - mean) / std
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
+    with torch.inference_mode(), _encoder_autocast(device):
         tokens = model.forward_features(x)["x_norm_patchtokens"].float()
     return tokens
 
@@ -212,7 +236,7 @@ def _shrink_encode_batch(bs, scan_name=None, label="encode"):
     """
     import torch
 
-    torch.cuda.empty_cache()
+    _empty_cache()
     new_bs = max(1, int(bs) // 2)
     if new_bs >= int(bs):
         return None
@@ -246,6 +270,12 @@ def _probe_encode_batch_size(
     if sample.ndim != 2:
         raise ValueError("sample_hw must be a 2D slice")
     max_bs = max(1, int(max_bs))
+    if torch.device(device).type == "cpu":
+        best = min(max_bs, CPU_ENCODE_BATCH)
+        _log(scan_name, f"{label}: CPU run, fixed encode batch={best}")
+        return int(best)
+    if torch.device(device).type == "mps":
+        max_bs = min(max_bs, MPS_ENCODE_BATCH_MAX)
     best = 1
     candidates = []
     c = 1
@@ -263,11 +293,11 @@ def _probe_encode_batch_size(
         try:
             toks = _encode_slice_batch_gpu(model, device, batch, input_h, input_w)
             del toks
-            torch.cuda.empty_cache()
+            _empty_cache()
             best = int(cand)
         except RuntimeError as exc:
             if _is_cuda_oom(exc):
-                torch.cuda.empty_cache()
+                _empty_cache()
                 break
             raise
     _log(
@@ -349,7 +379,10 @@ def _fit_pca_basis_gpu(fit_tokens_nc, n_components, device):
     """
     import torch
 
-    x_fit = torch.from_numpy(np.ascontiguousarray(fit_tokens_nc, dtype=np.float32)).to(device)
+    # Apple MPS: fit on the CPU (pca_lowrank's QR/SVD have patchy MPS support),
+    # then move mean/basis to MPS for the projections. Same maths, float32.
+    fit_device = torch.device("cpu") if torch.device(device).type == "mps" else device
+    x_fit = torch.from_numpy(np.ascontiguousarray(fit_tokens_nc, dtype=np.float32)).to(fit_device)
     mean = x_fit.mean(dim=0)
     x_fit = x_fit - mean
     n_comp = min(int(n_components), int(x_fit.shape[0]) - 1, int(x_fit.shape[1]))
@@ -359,7 +392,7 @@ def _fit_pca_basis_gpu(fit_tokens_nc, n_components, device):
     _u, _s, v = torch.pca_lowrank(x_fit, q=q, niter=4)
     basis = v[:, :n_comp].contiguous()
     del x_fit, _u, _s, v
-    return mean, basis
+    return mean.to(device), basis.to(device)
 
 
 def _project_tokens_gpu(tokens_bnC, mean_1C, basis_Ck):
@@ -747,7 +780,7 @@ def encode_pair_triplanar_joint_pca(
     mov_feat = _fuse_one(moving_volume, moving_mask, "moving")
     fix_feat = _fuse_one(fixed_volume, fixed_mask, "fixed")
     del mean_1C, basis_Ck
-    torch.cuda.empty_cache()
+    _empty_cache()
     return mov_feat, fix_feat
 
 
@@ -2699,7 +2732,7 @@ def _score_feature_cosine_at_R(
     """Masked 24-D feature cosine at a centroid-locked rotation (high-res grid)."""
     import torch
 
-    device = torch.device("cuda", 0)
+    device = dino_reg_device()
     tensors = _prepare_feature_map_volumes(
         mov_feat,
         fix_feat,
@@ -2737,7 +2770,7 @@ def _score_feature_cosine_at_R(
         )
         cos = float(cos_t.detach().cpu())
     del tensors
-    torch.cuda.empty_cache()
+    _empty_cache()
     return cos
 
 
@@ -2792,7 +2825,7 @@ def _encode_pair_highest_res(
 
                 mov_feat = fix_feat = None
                 gc.collect()
-                torch.cuda.empty_cache()
+                _empty_cache()
                 continue
             raise DinoRegError(f"DINOv3 feature extraction failed: {exc}") from exc
     else:
@@ -3244,7 +3277,7 @@ def _rigid_from_octahedral_feature_probe(
 
     from .rigidAlignment import _rigid_rotation_angle_deg
 
-    device = torch.device("cuda", 0)
+    device = dino_reg_device()
     c_m = np.asarray(c_m, dtype=np.float64).reshape(3)
     c_f = np.asarray(c_f, dtype=np.float64).reshape(3)
     c_m_t = torch.as_tensor(c_m, dtype=torch.float32, device=device)
@@ -3302,7 +3335,7 @@ def _rigid_from_octahedral_feature_probe(
                 best = (name, R, score_val, dice_val, cos_val)
 
     del probe_tensors
-    torch.cuda.empty_cache()
+    _empty_cache()
 
     identity_probe = next((p for p in probes if p["name"] == "x+y+z+"), None)
     id_score = identity_probe["score"] if identity_probe else -999.0
@@ -3358,7 +3391,7 @@ def _rigid_from_octahedral_feature_probe(
         aa_refined = hit1["axis_angle"].detach().cpu().numpy().astype(np.float32)
         delta_refined = hit1["delta"].detach().cpu().numpy().astype(np.float32)
         del tensors_p2
-        torch.cuda.empty_cache()
+        _empty_cache()
     else:
         hit1 = None
         aa_refined = aa0
@@ -3393,7 +3426,7 @@ def _rigid_from_octahedral_feature_probe(
         final_dice = hit2["dice"]
         final_cos = hit2["cosine"]
         del tensors_p1
-        torch.cuda.empty_cache()
+        _empty_cache()
     elif hit1 is not None:
         final_aa = hit1["axis_angle"]
         final_delta = hit1["delta"]
@@ -3652,7 +3685,7 @@ def _optimize_rigid_on_feature_maps(
 
     from .rigidAlignment import _rigid_rotation_angle_deg
 
-    device = torch.device("cuda", 0)
+    device = dino_reg_device()
     c_m = np.asarray(c_m, dtype=np.float64).reshape(3)
     c_f = np.asarray(c_f, dtype=np.float64).reshape(3)
     zero_delta = np.zeros(3, dtype=np.float32)
@@ -3987,7 +4020,7 @@ def _adam_refine_from_coarse_rt(
     c_m = np.asarray(c_m, dtype=np.float64).reshape(3)
     c_f = np.asarray(c_f, dtype=np.float64).reshape(3)
     angle0 = float(_rigid_rotation_angle_deg(R0))
-    device = torch.device("cuda", 0)
+    device = dino_reg_device()
     aa0 = _rotation_to_axis_angle(R0).astype(np.float32)
     delta0 = (t0 - c_f + R0 @ c_m).astype(np.float32)
 
@@ -4045,7 +4078,7 @@ def _adam_refine_from_coarse_rt(
                 ),
             )
         del tensors_p2
-        torch.cuda.empty_cache()
+        _empty_cache()
     else:
         aa_r, delta_r = aa0, delta0
 
@@ -4078,7 +4111,7 @@ def _adam_refine_from_coarse_rt(
         final_cos = float(hit2["cosine"])
         final_score = float(hit2["score"])
         del tensors_p1
-        torch.cuda.empty_cache()
+        _empty_cache()
     elif hit1 is not None:
         final_aa = hit1["axis_angle"]
         final_delta = hit1["delta"]
@@ -4405,7 +4438,7 @@ def _rigid_from_semantic_landmarks_and_refine(
         dbg_mov_scales = dbg_fix_scales = None
         dbg_mov_origin = dbg_fix_origin = None
 
-    device = torch.device("cuda", 0)
+    device = dino_reg_device()
     rank_tensors = _prepare_feature_map_volumes(
         mov_feat,
         fix_feat,
@@ -4621,7 +4654,7 @@ def _rigid_from_semantic_landmarks_and_refine(
 
     if rank_tensors is not None:
         del rank_tensors
-        torch.cuda.empty_cache()
+        _empty_cache()
 
     meta = {
         "trials": trials,
@@ -4711,7 +4744,7 @@ def _rigid_from_semantic_landmarks_and_refine(
             fix_origin_native_mm=dbg_fix_origin,
             fix_scales_native_mm=dbg_fix_scales,
         )
-    device = torch.device("cuda", 0)
+    device = dino_reg_device()
     aa0 = _rotation_to_axis_angle(R0).astype(np.float32)
     # p_fixed = R @ p_moving + t  ⇒  delta = t - (c_f - R @ c_m) with centroid form
     # p_fixed = R @ (p_moving - c_m) + c_f + delta  ⇒  delta = t - c_f + R @ c_m
@@ -4766,7 +4799,7 @@ def _rigid_from_semantic_landmarks_and_refine(
                 fix_centroids_mm=_fc,
             )
         del tensors_p2
-        torch.cuda.empty_cache()
+        _empty_cache()
     else:
         aa_r, delta_r = aa0, delta0
 
@@ -4799,7 +4832,7 @@ def _rigid_from_semantic_landmarks_and_refine(
         final_cos = float(hit2["cosine"])
         final_score = float(hit2["score"])
         del tensors_p1
-        torch.cuda.empty_cache()
+        _empty_cache()
     elif hit1 is not None:
         final_aa = hit1["axis_angle"]
         final_delta = hit1["delta"]
@@ -5108,8 +5141,7 @@ def _release_dinov2_vram(model=None):
     loader._MODEL = None
     loader._DEVICE = None
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _empty_cache()
     _log(None, "DINOv3 weights released from GPU")
 
 
@@ -5125,6 +5157,7 @@ def find_dino_reg_rigid_pose(
     fixed_threshold=None,
     debug_dir=None,
     progress_callback: ProgressCallback = None,
+    allow_cpu: bool = False,
 ) -> Optional[dict]:
     """
     Estimate a physical rigid pose from DINOv3 (two-pass).
@@ -5161,6 +5194,7 @@ def find_dino_reg_rigid_pose(
             fixed_threshold=fixed_threshold,
             debug=debug,
             progress_callback=progress_callback,
+            allow_cpu=allow_cpu,
         )
     finally:
         if debug is not None:
@@ -5179,12 +5213,17 @@ def _find_dino_reg_correspondences_impl(
     fixed_threshold=None,
     debug=None,
     progress_callback: ProgressCallback = None,
+    allow_cpu: bool = False,
 ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     from .rigidAlignment import _rigid_rotation_angle_deg
 
-    ensure_dino_reg_cuda()
+    ensure_dino_reg_cuda(allow_cpu=allow_cpu)
     _notify(progress_callback, f"Loading DINOv3 for {scan_name or 'scan'}...")
-    model, device = get_dino_model()
+    model, device = get_dino_model(allow_cpu=allow_cpu)
+    if device.type == "mps":
+        _log(scan_name, "running on the Apple GPU (MPS) in float32")
+    elif device.type != "cuda":
+        _log(scan_name, "running on the CPU in float32 (no GPU; user opted in)")
 
     fixed_vs = float(fixed_voxel_size)
     moving_vs = float(moving_voxel_size)
@@ -5272,7 +5311,7 @@ def _find_dino_reg_correspondences_impl(
 
     import torch
 
-    torch.cuda.empty_cache()
+    _empty_cache()
 
     mov_feat, fix_feat, feat_h, feat_w = _encode_pair_highest_res(
         moving_crop_p2,

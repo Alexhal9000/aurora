@@ -11,7 +11,15 @@ https://docs.djangoproject.com/en/5.0/ref/settings/
 """
 
 import os
+import sys
 from pathlib import Path
+
+# macOS: DINO-Reg runs on the Apple GPU (MPS). A few of its ops (3-D grid_sample,
+# 3-D pooling, PCA) may have no MPS kernel in the pinned PyTorch; with this they
+# run on the CPU for that op instead of failing. PyTorch reads it at import, so it
+# is set here, before any pipeline module imports torch (pipeline/torchCompute.py).
+if sys.platform == "darwin":
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -145,6 +153,9 @@ REST_FRAMEWORK = {
         'pipeline.networkFolders.NetworkPathPermission',
         'pipeline.crashSafety.RecoverInterruptedWork',
     ],
+    # Shared service: an item the owner has not opened up (PermissionError) answers 403
+    # with what to do, not a bare server error (pipeline/sharedFolderAccess.py).
+    'EXCEPTION_HANDLER': 'pipeline.sharedFolderAccess.api_exception_handler',
 }
 
 ROOT_URLCONF = 'AuroraClient.urls'
