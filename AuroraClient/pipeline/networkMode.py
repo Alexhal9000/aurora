@@ -47,6 +47,11 @@ LAB_ORIGIN_PRODUCTION = "https://hallgrimssonlab.ca"
 CHECK_IN_SECONDS = 5 * 60
 CHECK_IN_BUSY_SECONDS = 20    # while a job runs and someone has My Aurora servers open (lab says "watched")
 CHECK_IN_BUSY_UNWATCHED_SECONDS = 120  # while a job runs and nobody is looking: spares the lab server
+# While someone has Aurora open here and someone has My Aurora servers open (watched): a
+# manager's End session (a pending kick, delivered only in a check-in answer, since the lab
+# cannot reach into this network) then takes effect within seconds instead of at the next
+# 5-minute check-in.
+CHECK_IN_PRESENT_WATCHED_SECONDS = 10
 MIN_EVENT_GAP_SECONDS = 15    # someone arriving/leaving or a job starting/ending checks in at once, at most this often
 POLL_SECONDS = 30  # how often the engine notices a new pairing or retries a failed check-in
 PAIR_POLL_SECONDS = 4
@@ -699,20 +704,30 @@ def start_check_in_thread() -> None:
         # Pairing happens in a separate process (aurora-tools pair), so poll the pairing
         # file every POLL_SECONDS: a newly paired engine shows as online within seconds.
         # After that: every CHECK_IN_SECONDS, every CHECK_IN_BUSY_SECONDS while a job runs,
+        # every CHECK_IN_PRESENT_WATCHED_SECONDS while Aurora is open here and watched,
         # and soon after any change in who is using it (at most every MIN_EVENT_GAP_SECONDS).
         last_ok = 0.0
         last_attempt = 0.0
         last_failed = False
         reported_key = None
         while True:
-            wake.wait(CHECK_IN_BUSY_SECONDS if reported_key and reported_key[2] else POLL_SECONDS)
+            if reported_key and reported_key[1] and _lab_watching["value"]:
+                wait = CHECK_IN_PRESENT_WATCHED_SECONDS
+            elif reported_key and reported_key[2]:
+                wait = CHECK_IN_BUSY_SECONDS
+            else:
+                wait = POLL_SECONDS
+            wake.wait(wait)
             wake.clear()
             if not pairing_state().get("lab_origin"):
                 last_ok, reported_key = 0.0, None
                 continue
             now = time.time()
             key = engineActivity.state_key()
-            if key[2]:
+            if key[1] and _lab_watching["value"]:
+                # Someone uses it and someone may be about to end that session.
+                interval = CHECK_IN_PRESENT_WATCHED_SECONDS
+            elif key[2]:
                 interval = CHECK_IN_BUSY_SECONDS if _lab_watching["value"] else CHECK_IN_BUSY_UNWATCHED_SECONDS
             else:
                 interval = CHECK_IN_SECONDS

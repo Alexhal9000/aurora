@@ -29,11 +29,15 @@ from typing import Callable, Dict, Optional
 from pipeline import engineJobs
 
 PRESENCE_SECONDS = 150
+# After a tab says it is closing (leaving=1), its session keeps the computer this long so
+# a reload (which beats again a few seconds later) does not hand it to someone else.
+LEAVE_GRACE_SECONDS = 20
 LABEL_MAX = 160
 
 _lock = threading.Lock()
 _presence: Dict[str, dict] = {}     # session key -> {user_id, name, last_beat, first_beat}
-_last_activity: Dict[str, float] = {}  # session key -> last heartbeat or request (lease grace)
+_last_activity: Dict[str, float] = {}  # session key -> last heartbeat or request (lease)
+_left_at: Dict[str, float] = {}     # session key -> its tab said it was closing (leaving=1)
 _listeners: list = []
 
 
@@ -70,7 +74,9 @@ def heartbeat(session_key: str, record: dict, leaving: bool = False) -> None:
         _last_activity[session_key] = now
         if leaving:
             _presence.pop(session_key, None)
+            _left_at[session_key] = now
         else:
+            _left_at.pop(session_key, None)
             entry = _presence.setdefault(session_key, {"first_beat": now})
             entry.update({
                 "user_id": str(record.get("user_id", "")),
@@ -87,6 +93,7 @@ def forget_session(session_key: str) -> None:
     with _lock:
         removed = _presence.pop(session_key, None) is not None
         _last_activity.pop(session_key, None)
+        _left_at.pop(session_key, None)
     if removed:
         _notify()
 
@@ -113,17 +120,31 @@ def touch(session_key: str) -> None:
     """Note activity for a session (lease claimed or refreshed)."""
     with _lock:
         _last_activity[session_key] = _now()
+        _left_at.pop(session_key, None)
 
 
-def session_idle_seconds(session_key: str) -> float:
-    """Seconds since this session last beat or made a request; 0 while a request runs.
-    The lease (engineAuth) frees a holder that has been idle longer than its grace period."""
-    if engineJobs.session_busy(session_key):
-        return 0.0
+def holds_computer(session_key: str, user_id: str = "") -> bool:
+    """Whether the lease holder (engineAuth) still uses the computer, by the same rule the
+    lab's servers page shows "Free right now" with (snapshot, sent at each check-in):
+
+    * a job of theirs is running (engineJobs.has_running_job), even with Aurora closed, or
+    * their tab is open: it beat or made a request within PRESENCE_SECONDS, unless it said
+      it was closing more than LEAVE_GRACE_SECONDS ago and has not come back.
+
+    Before 1.9.9 the holder kept the computer for 10 minutes after the last beat, and for
+    as long as any request of theirs was open (job or not), so a member opening a computer
+    the servers page showed as free was told "This computer is in use"."""
+    if engineJobs.has_running_job(session_key, user_id):
+        return True
     now = _now()
     with _lock:
         last = _last_activity.get(session_key)
-    return float("inf") if last is None else max(0.0, now - last)
+        left = _left_at.get(session_key)
+    if last is None:
+        return False
+    if left is not None and left >= last:
+        return now - left <= LEAVE_GRACE_SECONDS
+    return now - last <= PRESENCE_SECONDS
 
 
 # ---------------------------------------------------------------------------

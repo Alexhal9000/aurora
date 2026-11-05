@@ -25,7 +25,8 @@ finishes, to ~/.aurora/job_history.jsonl (about 300-600 bytes each; progress is 
 written). When the file would pass LOG_MAX_BYTES it becomes job_history.1.jsonl and a new
 file starts, so the two files never hold more than about 5 MB. A start without an end
 means the engine stopped mid-job (crash, power cut, update): the next start marks it
-"interrupted". Writing is best effort: a full disk or a read-only folder skips the line
+"interrupted". The cross on the progress bar (engineCancel) writes "cancelled"
+end lines itself before it restarts the engine. Writing is best effort: a full disk or a read-only folder skips the line
 and never touches the job.
 
 Stdlib only (networkMode imports engineActivity, which imports this, before Django is
@@ -60,6 +61,10 @@ PATH_MAX = 300
 SCAN_NAMES_MAX = 5
 STEPS_MAX = 30                   # staged-tool steps kept per job for the end line
 
+# Not read-only (2026-11-05): /extract-scans-preflight/ reads every unextracted scan in
+# full or sampled (minutes for many SkyScan JPEG folders) and reports per-scan progress, so
+# it is a job: it holds the computer (engineActivity.holds_computer) and a tab that takes
+# over follows its progress.
 # Never jobs, even when slow: sign-in, polling, files streamed to the browser, previews and
 # other reads that only show something in the tab that asked.
 _IGNORED_PREFIXES = ("/engine-auth/", "/engine-jobs/", "/engine-sharing/", "/get-version/", "/local_aurora/",
@@ -67,7 +72,7 @@ _IGNORED_PREFIXES = ("/engine-auth/", "/engine-jobs/", "/engine-sharing/", "/get
 _READ_ONLY_PREFIXES = (
     "/upload", "/list-", "/get-", "/load-", "/display-", "/preview-", "/download-",
     "/quick-access-paths/", "/projection-png/", "/ensure-quick-grid-projections/",
-    "/extract-scans-preflight/", "/nifti-header-info/", "/full-resolution-value-histogram/",
+    "/nifti-header-info/", "/full-resolution-value-histogram/",
     "/elastic-slice-ncc-heatmap/", "/edge-detection-preview/", "/registration-heatmap/",
     "/registration-subject-data/", "/memory-monitor/", "/ai-models/foundation/status/",
     "/ai-finetune/discover/", "/ai-finetune/validate/", "/ai-finetune/gpu/",
@@ -565,6 +570,30 @@ def running() -> List[dict]:
     return result
 
 
+def running_owners() -> List[tuple]:
+    """(user_id, name) of every running job (see running()), for engineCancel.may_cancel."""
+    now = _now()
+    with _lock:
+        return [(job["user_id"], job["name"]) for job in _running.values()
+                if job["visible"] or _would_show(job, now)]
+
+
+def cancel_running(error: str) -> None:
+    """Universal cancel (engineCancel): the engine is about to end itself, so every running
+    job gets its end line now with status "cancelled" instead of "interrupted" at the next
+    start. Jobs not yet shown get no line (they never started one)."""
+    now = _now()
+    with _lock:
+        jobs = [job for job in _running.values() if job["visible"] or _would_show(job, now)]
+        for job in jobs:
+            _running.pop(job["id"], None)
+    for job in jobs:
+        if not job["visible"]:
+            job["visible"] = True
+            _log_start(job)
+        _finish(job, "cancelled", error)
+
+
 def _would_show(job: dict, now: float) -> bool:
     return job["candidate"] and job["kind"] == "request" and now - job["started"] >= JOB_AFTER_SECONDS
 
@@ -583,3 +612,26 @@ def session_busy(session_key: str) -> bool:
     with _lock:
         return any(job.get("session") == session_key for job in _running.values()
                    if job["kind"] == "request")
+
+
+def has_running_job(session_key: str, user_id: str) -> bool:
+    """A job (see running(): shown, or a tool request past JOB_AFTER_SECONDS) of this
+    session, or of the same lab user in another session, is running. This is what the
+    lab's servers page sees as the computer being used while nobody has Aurora open
+    (engineActivity.snapshot), so the lease follows it (engineActivity.holds_computer).
+    A running non-GET request of this session counts too, even on a read-only route that
+    is never shown as a job: the extraction preflight (POST /extract-scans-preflight/,
+    reads every scan, sends no progress) is the first half of an extraction, and a busy
+    engine can answer the tab's heartbeat late. GET requests (previews, downloads, a read
+    stuck after its tab closed) never hold the computer on their own."""
+    now = _now()
+    user_id = str(user_id or "")
+    with _lock:
+        return any(
+            ((job["visible"] or _would_show(job, now))
+             and ((session_key and job.get("session") == session_key)
+                  or (user_id and str(job.get("user_id") or "") == user_id)))
+            or (session_key and job.get("session") == session_key and job["kind"] == "request"
+                and job.get("method") not in ("GET", "HEAD", "OPTIONS"))
+            for job in _running.values()
+        )

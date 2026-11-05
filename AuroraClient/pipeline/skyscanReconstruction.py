@@ -42,6 +42,15 @@ SUBTYPE = "SkyScan Reconstruction"
 SLICE_RE = re.compile(r"^(?P<prefix>.+)_rec(?P<index>\d+)\.(?P<ext>jpe?g|bmp|png|tiff?)$", re.IGNORECASE)
 LOSSY_EXTENSIONS = {"jpg", "jpeg"}
 
+# Slices read by probe_reconstruction (extract preflight): evenly spaced, first and last
+# included. Enough to tell the dtype and a representative grey range without decoding
+# every JPEG of every folder before extraction even starts.
+PROBE_MAX_SLICES = 32
+
+# The lossy-JPEG advice is the same for every folder, so the terminal prints it once per
+# engine run (each scan's provenance still records it in scanner_metadata.skyscan).
+_lossy_notice_printed = False
+
 # Log keys (compared case-insensitively, inside [Reconstruction]).
 KEY_PIXEL_SIZE = "pixel size (um)"
 KEY_STEP = "section to section step"
@@ -54,6 +63,10 @@ PROVENANCE_KEYS = {
     "last section": "last_section",
 }
 SYSTEM_KEYS = {"scanner": "scanner", "instrument s/n": "instrument_serial"}
+
+
+LOSSY_WARNING = ("Slices are JPEG: lossy and 8-bit, so fine grey-level detail was lost when NRecon saved them. "
+                 "Prefer TIF/BMP/PNG output from NRecon for new reconstructions.")
 
 
 class SkyScanImportError(ValueError):
@@ -148,6 +161,30 @@ def _read_slice(path: str) -> np.ndarray:
         return np.asarray(image)
 
 
+def probe_reconstruction(scan_folder: str, max_slices: int = PROBE_MAX_SLICES) -> np.ndarray:
+    """A small stack of evenly spaced slices (first and last included) for the extract
+    preflight, which only needs the dtype and an approximate grey range.
+
+    No log checks, no warnings printed: the full checks run at extraction
+    (load_reconstruction). Callers that need exact extrema (dtypes that ask the person for
+    a value window: float, 32-bit) must load the full volume instead.
+    Raises SkyScanImportError for folders find_slices refuses or colour slices.
+    """
+    _, _, slices = find_slices(scan_folder)
+    count = len(slices)
+    picks = sorted({int(round(i)) for i in np.linspace(0, count - 1, num=min(count, max(1, int(max_slices))))})
+    arrays = [_read_slice(os.path.join(scan_folder, slices[k][1])) for k in picks]
+    first = arrays[0]
+    if first.ndim != 2:
+        raise SkyScanImportError(f"{slices[0][1]} is not a 2D greyscale slice.")
+    for k, array in zip(picks, arrays):
+        if array.shape != first.shape or array.dtype != first.dtype:
+            raise SkyScanImportError(
+                f"{slices[k][1]} is {array.shape[1]}x{array.shape[0]} {array.dtype}, unlike the first slice "
+                f"({first.shape[1]}x{first.shape[0]} {first.dtype}).")
+    return np.stack(arrays, axis=0)
+
+
 def load_reconstruction(scan_folder: str) -> tuple:
     """Load a SkyScan reconstruction folder.
 
@@ -198,9 +235,7 @@ def load_reconstruction(scan_folder: str) -> tuple:
             f"The log reports {int(expected)} sections but the folder has {len(slices)} slices "
             "(was the copy interrupted, or only part of the reconstruction saved?).")
     if ext in LOSSY_EXTENSIONS:
-        warnings.append(
-            "Slices are JPEG: lossy and 8-bit, so fine grey-level detail was lost when NRecon saved them. "
-            "Prefer TIF/BMP/PNG output from NRecon for new reconstructions.")
+        warnings.append(LOSSY_WARNING)
 
     paths = [os.path.join(scan_folder, name) for _, name in slices]
     first = _read_slice(paths[0])
@@ -250,7 +285,12 @@ def load_reconstruction(scan_folder: str) -> tuple:
         if key in system:
             provenance[name] = system[key]
 
+    global _lossy_notice_printed
     for warning in warnings:
+        if warning == LOSSY_WARNING:
+            if _lossy_notice_printed:
+                continue  # same advice for every JPEG folder: printed once per engine run
+            _lossy_notice_printed = True
         print(f"\033[93mSkyScan import warning ({prefix}): {warning}\033[0m")
     print(f"SkyScan import {prefix}: {len(slices)} {ext.upper()} slices, voxel {pixel_um} um "
           f"(step {step}) from {log_name}")

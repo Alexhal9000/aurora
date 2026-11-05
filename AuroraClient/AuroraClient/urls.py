@@ -52,6 +52,7 @@ from pipeline.engineAuth import (
 )
 from pipeline.engineSharing import EngineSharingView
 from pipeline.engineTerminal import EngineReportView, EngineTerminalPageView, EngineTerminalView
+from pipeline.engineCancel import EngineCancelView
 from pipeline.staticMediaViews import StaticMediaView
 from pipeline.aiModels.foundation_views import (
     FoundationModelCancelView,
@@ -74,6 +75,7 @@ urlpatterns = [
     path('engine-terminal/', EngineTerminalView.as_view(), name='engine_terminal'),
     path('terminal/', EngineTerminalPageView.as_view(), name='engine_terminal_page'),
     path('engine-report/', EngineReportView.as_view(), name='engine_report'),
+    path('engine-cancel/', EngineCancelView.as_view(), name='engine_cancel'),
     path('upload/', FileUploadView.as_view(), name='upload_file'),
     path('list-directories/', ListDirectoriesView.as_view(), name='list_directories'),
     path('quick-access-paths/', QuickAccessPathsView.as_view(), name='quick_access_paths'),

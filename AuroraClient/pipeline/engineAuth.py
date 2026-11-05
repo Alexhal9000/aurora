@@ -31,9 +31,10 @@ not come from this computer itself:
 * An offline second check against the last member list (networkMode.group_access), and
   after every check-in sessions of removed, blocked or kicked people end.
 * One user at a time (the lease, for every session in network mode): the first signed-in
-  session holds it while it keeps beating or working, and frees it after
-  LEASE_GRACE_SECONDS idle. Others get 409 engine_in_use; the same person on another
-  device may take over (/engine-auth/take-over/).
+  session holds it while its tab is open (beating) or a job of theirs runs, and frees it
+  as soon as the lab's servers page would show the computer free
+  (engineActivity.holds_computer). Others get 409 engine_in_use; the same person on
+  another device may take over (/engine-auth/take-over/).
 * Sessions end after a time without real use (requests; the tab heartbeat and background
   reads never count): NETWORK_SESSION_SECONDS (12 h) for every session while network mode
   is on, whether opened here or from another computer, and LOCAL_SESSION_SECONDS (7 d) with
@@ -64,7 +65,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from AuroraClient import engineConfig
-from pipeline import engineActivity, engineJobs, engineSharing, networkMode
+from pipeline import engineActivity, engineCancel, engineJobs, engineSharing, networkMode
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +82,9 @@ SESSION_RENEW_INTERVAL_SECONDS = 3600
 # Shown by the tab whose network session ended for lack of use (engine_session_ended).
 NETWORK_IDLE_MESSAGE = ("Signed off from this computer after 12 hours without use. "
                         "Your lab account is still signed in; choose Open again to continue.")
-# A lease holder that has neither beaten nor made a request for this long (tab closed,
-# laptop asleep, connection lost) frees the computer for the next person.
-LEASE_GRACE_SECONDS = 10 * 60
+# The lease holder frees the computer for the next person once its tab is gone (closed,
+# laptop asleep, connection lost) and no job of theirs runs: engineActivity.holds_computer,
+# the same rule as "Free right now" on the lab's servers page (PRESENCE_SECONDS, 150 s).
 
 SESSION_COOKIE = "aurora_engine_session"
 
@@ -103,6 +104,7 @@ PUBLIC_PATH_PREFIXES = (
 LEASE_FREE_PATH_PREFIXES = (
     "/engine-terminal/",
     "/engine-report/",   # the report button works even while someone else uses Aurora
+    "/engine-cancel/",   # the owner or a manager may cancel a member's task (engineCancel)
 )
 # Reads that do not use the computer: they neither need the lease nor refresh it (the
 # header's servers icon asks /engine-sharing/ every minute, which must not keep an idle
@@ -491,12 +493,45 @@ def apply_group_update(group: dict) -> None:
             reason = "You were removed from this computer's group."
         elif remote and entry.get("blocked"):
             reason = "The owner of this computer has blocked your access."
-        elif kick and str(kick.get("user_id")) == user_id:
-            # The lab hands each kick over once, so it ends whatever sessions exist now.
-            reason = "The owner or a manager of this computer ended your session."
+        elif kick and _kick_applies(kick, record):
+            reason = KICK_MESSAGE
         if reason:
             logger.info("Ending engine session of lab user %s: %s", user_id, reason)
             _end_session_key(key, reason)
+
+
+KICK_MESSAGE = "The owner or a manager of this computer ended your session."
+
+
+def _kick_applies(kick: dict, record: dict) -> bool:
+    """A kick ({"user_id", "requested_at"} from the lab) ends that person's sessions opened
+    before the click. The same kick can arrive twice (in the next person's sign-in pass and
+    in a check-in answer), and the kicked person may have come back in between: a session
+    opened after requested_at is theirs to keep. A kick without a time ends them all."""
+    if str(kick.get("user_id")) != str(record.get("user_id", "")):
+        return False
+    try:
+        requested_at = float(kick.get("requested_at"))
+    except (TypeError, ValueError):
+        return True
+    return float(record.get("created_at", 0)) <= requested_at
+
+
+def apply_kick(kick) -> None:
+    """End sessions named by a kick that arrived in a network sign-in pass (signed by the
+    lab like the rest of the pass): a manager's End session frees the computer the moment
+    the next person opens it, without waiting for this engine's next check-in. The kicked
+    tab is told why at its next request or heartbeat (engine_session_ended)."""
+    if not isinstance(kick, dict) or not engineConfig.is_network_mode():
+        return
+    with _sessions_lock:
+        _load_sessions()
+        records = list(_sessions.items())
+    for key, record in records:
+        if _kick_applies(kick, record):
+            logger.info("Ending engine session of lab user %s: %s (from a sign-in pass)",
+                        record.get("user_id"), KICK_MESSAGE)
+            _end_session_key(key, KICK_MESSAGE)
 
 
 networkMode.on_group_update(apply_group_update)
@@ -530,11 +565,11 @@ def release_lease(session_key: str) -> None:
 
 def lease_holder() -> Optional[dict]:
     """Who holds the computer now ({"user_id", "name", "since"}), or None when the lease is
-    free: nobody holds it, or the holder has been idle past the grace period (the next
-    claim_lease would take it)."""
+    free: nobody holds it, or the holder no longer uses the computer (tab gone, no job of
+    theirs running; engineActivity.holds_computer), so the next claim_lease would take it."""
     with _lease_lock:
         holder = _lease
-    if holder is None or engineActivity.session_idle_seconds(holder["session"]) > LEASE_GRACE_SECONDS:
+    if holder is None or not engineActivity.holds_computer(holder["session"], holder["user_id"]):
         return None
     return {"user_id": holder["user_id"], "name": holder["name"], "since": holder["since"]}
 
@@ -551,7 +586,7 @@ def claim_lease(session_key: str, record: dict, take_over: bool = False) -> Opti
         free = (
             holder is None
             or holder["session"] == session_key
-            or engineActivity.session_idle_seconds(holder["session"]) > LEASE_GRACE_SECONDS
+            or not engineActivity.holds_computer(holder["session"], holder["user_id"])
             or (take_over and holder["user_id"] == user_id)
         )
         if free:
@@ -630,10 +665,13 @@ def _session_payload(record: Optional[dict]) -> dict:
 def engine_identity() -> dict:
     """Public fields merged into /get-version/ so the lab knows whom to sign for. "service":
     the shared background Aurora (1.9.4 network sharing), which launchers and the Settings
-    hand-over wait for."""
+    hand-over wait for. "boot_id": see engineCancel."""
     return {"engine_id": engineConfig.engine_id(), "engine_auth": PASS_VERSION,
             "service": os.environ.get("AURORA_SERVICE") == "1",
-            "dev_lab": dev_lab_origin()}
+            "dev_lab": dev_lab_origin(),
+            # New at every engine start: after the cross on the progress bar restarts
+            # Aurora (engineCancel), the page reloads once it sees a different one.
+            "boot_id": engineCancel.boot_id()}
 
 
 def dev_lab_origin() -> str:
@@ -844,6 +882,9 @@ class EngineAuthStartView(APIView):
         if remote and engineSharing.refuses_member({"remote": True, "user_id": str(claims.get("sub", ""))}):
             return Response({"error": engineSharing.PAUSED_MESSAGE, "code": "engine_paused"},
                             status=status.HTTP_403_FORBIDDEN)
+        if remote and claims.get("net") == 1:
+            # A manager's End session not yet picked up by a check-in (auroraServerOpen).
+            apply_kick(claims.get("kick"))
         # A new sign-in replaces whatever session this browser held.
         end_session(request.COOKIES.get(SESSION_COOKIE))
         session_id, record = create_session(claims, remote=remote)

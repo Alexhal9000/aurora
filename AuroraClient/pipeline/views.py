@@ -2207,13 +2207,17 @@ class ExtractScansView(APIView):
             'scale_group': group_label,
         }
 
-    def _collect_mesh_infos(self, directory, scans):
+    def _collect_mesh_infos(self, directory, scans, on_scan=None):
+        """Mesh summaries for the extract preflight. on_scan(scan_name), if given, is called
+        before each mesh is loaded (progress for the preflight dialog)."""
         infos = []
         for scan in scans:
             scan_name = scan.get('name')
             scan_subtype = scan.get('subtype')
             if not scan_name or not self._is_mesh_subtype(scan_subtype):
                 continue
+            if on_scan is not None:
+                on_scan(scan_name)
             mesh_path = self._mesh_source_path(directory, scan_name, scan_subtype)
             if not mesh_path:
                 continue
@@ -2622,8 +2626,16 @@ class ExtractScansView(APIView):
                 return image_data, None
 
             if scan_subtype == skyscanReconstruction.SUBTYPE:
+                # A full SkyScan folder is hundreds to thousands of slices (JPEG decoding), and
+                # extraction reads it again anyway. 8/16-bit slices never ask for a value
+                # window (native/passthrough), so a sample of evenly spaced slices is enough
+                # here; only dtypes that do ask (float, 32-bit) read the whole folder so the
+                # window offered is the true range. Log checks run at extraction.
+                scan_folder = os.path.join(directory, scan_name)
                 try:
-                    image_data, _, _ = skyscanReconstruction.load_reconstruction(os.path.join(directory, scan_name))
+                    image_data = skyscanReconstruction.probe_reconstruction(scan_folder)
+                    if self._intensity_dtype_family(image_data.dtype) in ('float', 'int32+', 'other'):
+                        image_data, _, _ = skyscanReconstruction.load_reconstruction(scan_folder)
                 except skyscanReconstruction.SkyScanImportError as exc:
                     return None, f"{scan_name}: {exc}"
                 return image_data, None
@@ -2672,12 +2684,16 @@ class ExtractScansView(APIView):
         except Exception as e:
             return None, str(e)
 
-    def _collect_intensity_scan_stats(self, directory, volume_scans):
+    def _collect_intensity_scan_stats(self, directory, volume_scans, on_scan=None):
+        """Per-scan intensity stats for the extract preflight. on_scan(scan_name), if given,
+        is called before each scan is read (progress for the preflight dialog)."""
         stats = []
         for scan in volume_scans:
             scan_name = scan.get('name')
             if not scan_name:
                 continue
+            if on_scan is not None:
+                on_scan(scan_name)
             image_data, error = self._load_raw_volume_for_probe(directory, scan)
             if error or image_data is None:
                 stats.append({
@@ -3624,7 +3640,7 @@ class ExtractScansView(APIView):
                         except skyscanReconstruction.SkyScanImportError as exc:
                             raise ValueError(f"{scan_name}: {exc}") from exc
                         extraction_warnings.extend(
-                            f"{scan_name}: {w}" for w in scanner_metadata['skyscan']['warnings'])
+                            (scan_name, w) for w in scanner_metadata['skyscan']['warnings'])
 
                         # Standardize data type
                         image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
@@ -4021,7 +4037,16 @@ class ExtractScansView(APIView):
                     }
                 )
 
-            return Response({'message': 'Scans extracted successfully', 'warnings': extraction_warnings})
+            # The same caveat for many scans (every JPEG SkyScan folder gets the lossy-JPEG
+            # advice) is shown once, naming the scans, instead of once per scan.
+            merged_warnings = {}
+            for scan_label, text in extraction_warnings:
+                merged_warnings.setdefault(text, []).append(scan_label)
+            warning_lines = []
+            for text, scan_labels in merged_warnings.items():
+                shown = ', '.join(scan_labels[:5]) + (f' and {len(scan_labels) - 5} more' if len(scan_labels) > 5 else '')
+                warning_lines.append(f"{shown}: {text}")
+            return Response({'message': 'Scans extracted successfully', 'warnings': warning_lines})
 
         except Exception as e:
             print(e)
@@ -4988,7 +5013,34 @@ class ExtractScansPreflightView(APIView):
             if not extractor._is_mesh_subtype(scan.get('subtype')) and _needs_extraction(scan)
         ]
 
-        mesh_infos = extractor._collect_mesh_infos(directory, mesh_scans)
+        # Progress, one step per scan read: the "Analyzing Scans" dialog shows it, and since
+        # this POST sends progress, engineJobs lists it as a running job, so a tab that takes
+        # over (or reopens) meanwhile shows the progress bar instead of an idle page.
+        total_to_check = len(mesh_scans) + len(volume_scans)
+        checked = {'count': 0}
+
+        def _preflight_progress(scan_name):
+            checked['count'] += 1
+            print(f"Extract preflight: checking scan {checked['count']} of {total_to_check} - {scan_name}")
+            channel_layer = get_channel_layer()
+            if channel_layer is None:
+                return
+            try:
+                async_to_sync(channel_layer.group_send)(
+                    'progress_group',
+                    {
+                        'type': 'send_progress',
+                        'progress': (checked['count'] - 1) / total_to_check if total_to_check else 0,
+                        'scan_name': scan_name,
+                        'total': total_to_check,
+                        'custom_message': f'Checking {scan_name} before extraction...',
+                        'current': checked['count'],
+                    }
+                )
+            except Exception as e:  # progress is cosmetic; never fail the preflight over it
+                print(f"Extract preflight: could not send progress ({e})")
+
+        mesh_infos = extractor._collect_mesh_infos(directory, mesh_scans, on_scan=_preflight_progress)
         groups = extractor._group_mesh_infos_by_scale(mesh_infos)
         subject_scale_groups = {}
         for group in groups:
@@ -4996,7 +5048,8 @@ class ExtractScansPreflightView(APIView):
                 subject_scale_groups[subject] = group.get('label')
 
         existing_intensity_policy = extractor._infer_existing_intensity_policy(extracted_dir)
-        intensity_scan_stats = extractor._collect_intensity_scan_stats(directory, volume_scans)
+        intensity_scan_stats = extractor._collect_intensity_scan_stats(
+            directory, volume_scans, on_scan=_preflight_progress)
         intensity_groups = extractor._group_intensity_stats_by_value_family(intensity_scan_stats)
         needs_intensity_options = any(
             s.get('needs_range_decision') for s in intensity_scan_stats if not s.get('error')

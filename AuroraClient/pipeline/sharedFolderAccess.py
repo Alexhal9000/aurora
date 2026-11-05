@@ -30,13 +30,20 @@ Symbolic links are never followed (same rule as the folder grants: links are ign
 
 from __future__ import annotations
 
-import grp
 import logging
 import os
-import pwd
 import stat
 import threading
 import time
+
+# grp and pwd exist only on Linux/macOS. This module is imported at startup on every
+# platform (engineAuth -> engineSharing), so a top-level import crashed Aurora 1.9.9 on
+# Windows (ModuleNotFoundError: grp). Without them, owner and group show as numbers.
+try:
+    import grp
+    import pwd
+except ImportError:   # Windows
+    grp = pwd = None
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +107,7 @@ def _account(uid: int) -> str:
     if key not in _names:
         try:
             _names[key] = pwd.getpwuid(uid).pw_name
-        except (KeyError, OverflowError):
+        except (KeyError, OverflowError, AttributeError):   # AttributeError: no pwd (Windows)
             _names[key] = str(uid)
     return _names[key]
 
@@ -110,7 +117,7 @@ def _group(gid: int) -> str:
     if key not in _names:
         try:
             _names[key] = grp.getgrgid(gid).gr_name
-        except (KeyError, OverflowError):
+        except (KeyError, OverflowError, AttributeError):   # AttributeError: no grp (Windows)
             _names[key] = str(gid)
     return _names[key]
 
