@@ -39,6 +39,7 @@ import matplotlib.pyplot as plt
 from skimage.filters import threshold_otsu, butterworth, median
 import skimage.morphology
 from scipy.signal import convolve
+from .niftiVoxels import nifti_voxels  # stored-dtype voxel loads without get_fdata()'s float64 copy (same values)
 from .ALPACA import ALPACA
 from skimage import exposure
 # Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
@@ -69,6 +70,7 @@ import threading
 from multiprocessing import Manager
 import torch
 from .GPUTorchNLMDenoise import nlm3d
+from .torchCompute import configure_cuda_allocator
 
 from .registrationTools import RegistrationTools
 from .preprocessingTools import cleanup_memory, build_denoise_settings
@@ -697,8 +699,8 @@ class DenoiseAllScansView(APIView):
                     if torch.cuda.is_available():
                         device = torch.device("cuda")
                         print(f"Using GPU: {device}")
-                        os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
-                        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+                        # Linux only (see torchCompute.configure_cuda_allocator)
+                        configure_cuda_allocator()
                     else:
                         raise RuntimeError("No CUDA-capable GPU detected.")
                 except Exception as e:
@@ -738,8 +740,8 @@ class DenoiseAllScansView(APIView):
                     if torch.cuda.is_available():
                         device = torch.device("cuda")
                         print(f"Using GPU: {device}")
-                        os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
-                        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+                        # Linux only (see torchCompute.configure_cuda_allocator)
+                        configure_cuda_allocator()
                     else:
                         raise RuntimeError("No CUDA-capable GPU detected.")
                 except Exception as e:
@@ -1014,7 +1016,7 @@ class DenoiseAllScansView(APIView):
                     time_start = time.time()
                     nifti_img = nib.load(scan_path)
                     original_dtype = nifti_img.get_data_dtype()
-                    scan_data = nifti_img.get_fdata().astype(original_dtype)
+                    scan_data = nifti_voxels(nifti_img, original_dtype)
                     scan_affine = nifti_img.affine
                     time_end = time.time()
                     print(f"Time taken to load {scan_name}: {time_end - time_start} seconds")

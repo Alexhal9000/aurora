@@ -57,9 +57,13 @@ from skimage.measure import block_reduce
 from PIL import Image, ImageDraw, ImageFont
 from pydicom import dcmread
 
+from .niftiVoxels import nifti_voxels  # stored-dtype voxel loads without get_fdata()'s float64 copy (same values)
+from .lowMemoryVolumeOps import axis_extents  # identical lower-memory volume steps (tests: test_low_memory_volume_ops)
 from .ALPACA import ALPACA, LandmarkUploadAlignment
 from . import networkFolders
 from . import skyscanReconstruction  # Bruker SkyScan/NRecon reconstruction folders (voxel size from the log)
+from . import channelCombination  # multichannel volumes at extraction (pick, combine or split into linked subjects)
+from . import nd2Import  # Nikon NIS-Elements .nd2 stacks (calibrated voxel size required; nd2 package imported lazily)
 from . import antsWorker  # ANTs registrations run in a worker process (engine stays responsive)
 from . import gridPreviewWorker  # Regular grid previews, built in parallel worker processes
 # Crash-safe protocol: atomic writes, read-only mask loads, per-subject transactions and
@@ -172,6 +176,7 @@ from .rigidAlignment import (
     first_aligned_edit_number,
 )
 from .resampleAnisotropicVoxels import DeformationBasedMRIInterpolator
+from . import isotropicResampling  # anisotropic voxels the registration-based path does not cover
 from .averagePooling import apply_extract_scaling, normalize_scaling_factor
 from .maskOperations import *
 from .denoiseTools import *
@@ -185,7 +190,7 @@ from .documentationViews import (
     DocsFigureView,
 )
 from .batch_flag_filter import load_flagged_subject_names, apply_flag_filter, normalize_flag_filter_value
-from .linkedScans import filter_out_linked_children
+from .linkedScans import filter_out_linked_children, load_scan_metadata
 from .atlas_paths import (
     resolve_atlas_dir,
     atlas_sub_path,
@@ -609,6 +614,73 @@ class FlagSubjectsView(APIView):
             'updated': updated,
             'errors': errors,
             'confirmed_flags': confirmed_flags,
+        })
+
+
+class FaultySubjectsView(APIView):
+    """
+    Set metadata 'faulty' on one or more subject JSON files under extracted/<name>/<name>.json.
+    Batch counterpart of ReportBadFileView, used by the faulty selection mode in the list and
+    grid views (same shape as FlagSubjectsView, so the UI can update in place without a reload).
+    Expects: directory (project root), filenames (list of subject folder names), faulty (bool, default True).
+    Returns confirmed_faulty: {name: value re-read from disk} for every subject written.
+    """
+
+    # CRASH-SAFE PROTOCOL (see pipeline/crashSafety.py): every file this writes goes through
+    # an atomic_* helper, so a crash never leaves a half-written file. Subject data written
+    # here is covered by the transaction that the calling view or batch loop opens. Adding a
+    # new derivative file? Use an atomic_* helper and keep it inside that transaction.
+    def post(self, request, *args, **kwargs):
+        directory = request.data.get('directory')
+        filenames = request.data.get('filenames')
+        faulty = request.data.get('faulty', True)
+
+        if not directory:
+            return Response({'error': 'directory is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if filenames is None:
+            return Response({'error': 'filenames is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(filenames, list):
+            filenames = [filenames]
+        if len(filenames) == 0:
+            return Response({'error': 'filenames must be a non-empty list.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Always stored as a real boolean (pipeline checks use `faulty is True` / `!== true`).
+        faulty_bool = bool(faulty)
+        errors = []
+        updated = []
+        confirmed_faulty = {}
+
+        for filename in filenames:
+            if not filename or not isinstance(filename, str):
+                errors.append({'filename': filename, 'error': 'invalid name'})
+                continue
+            metadata_json_path = os.path.join(directory, "extracted", filename, f"{filename}.json")
+            if not os.path.isfile(metadata_json_path):
+                errors.append({'filename': filename, 'error': 'metadata json not found'})
+                continue
+            try:
+                with open(metadata_json_path, 'r') as json_file:
+                    metadata_data = json.load(json_file)
+                metadata_data['faulty'] = faulty_bool
+                atomic_write_json(metadata_json_path, metadata_data, indent=4)
+                # Re-read to confirm the persisted value
+                with open(metadata_json_path, 'r') as json_file:
+                    confirmed_data = json.load(json_file)
+                confirmed_faulty[filename] = confirmed_data.get('faulty', faulty_bool) is True
+                updated.append(filename)
+            except (json.JSONDecodeError, OSError) as e:
+                errors.append({'filename': filename, 'error': str(e)})
+
+        if not updated and errors:
+            return Response(
+                {'error': 'No metadata files updated', 'details': errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response({
+            'message': 'Faulty status updated successfully',
+            'updated': updated,
+            'errors': errors,
+            'confirmed_faulty': confirmed_faulty,
         })
 
 
@@ -2562,8 +2634,11 @@ class ExtractScansView(APIView):
     def _compute_intensity_scan_stats(self, scan_name, image_data):
         """Per-scan dtype/range probe used by intensity extract preflight."""
         arr = np.asarray(image_data)
-        if arr.ndim > 3:
-            arr = self._reduce_extra_dims_to_3d(arr)
+        # Multichannel volumes: channel count for the Extraction Options dialog, and extrema
+        # over every channel, so the window offered also holds any channel, the mean, the max
+        # or the luma of the channels (see channelCombination).
+        channel_info = channelCombination.describe_channels(arr)
+        arr = channelCombination.reduce_to_4d(arr)
         dtype_str = str(arr.dtype)
         is_uint16 = arr.dtype == np.uint16
         is_binary = False if is_uint16 else self._is_binary_label_image(arr)
@@ -2602,12 +2677,39 @@ class ExtractScansView(APIView):
             'needs_range_decision': needs_range_decision,
             'range_policy': range_policy,
             'range_key': self._intensity_range_key(data_min, data_max),
+            **channel_info,
         }
+
+    @staticmethod
+    def _group_scans_by_channel_count(intensity_scan_stats):
+        """
+        Multichannel scans for the Extraction Options dialog: one group per channel count
+        (single-channel scans are left out). 'unsigned' is True when every member is unsigned
+        integer data, the only data the sum and multiply modes are defined for (they use the
+        type's fixed range; see channelCombination).
+        """
+        by_count = {}
+        for stat in intensity_scan_stats:
+            if stat.get('error') or int(stat.get('channel_count') or 1) <= 1:
+                continue
+            by_count.setdefault(int(stat['channel_count']), []).append(stat)
+        return [
+            {
+                'channel_count': count,
+                'subjects': [stat['name'] for stat in members],
+                'dtypes': sorted({stat['dtype'] for stat in members}),
+                'unsigned': all(channelCombination.is_unsigned_integer(stat['dtype']) for stat in members),
+            }
+            for count, members in sorted(by_count.items())
+        ]
 
     def _load_raw_volume_for_probe(self, directory, scan):
         """
         Load raw volume voxels for intensity preflight (no dtype standardization).
-        Returns (image_data, error_message).
+        Returns (image_data, error_message, voxel_sizes). voxel_sizes are read the same
+        way extraction reads them, in the loader's order ((x, y, z) for slice stacks),
+        or None when this probe cannot know them (SkyScan 8/16-bit sample, read at
+        extraction) or loading failed.
         """
         scan_name = scan.get('name')
         scan_subtype = scan.get('subtype')
@@ -2617,13 +2719,16 @@ class ExtractScansView(APIView):
                 if not os.path.exists(aim_file):
                     aim_file = os.path.join(directory, f"{scan_name}.AIM")
                 if not os.path.exists(aim_file):
-                    return None, f"AIM file not found for {scan_name}"
-                return aim2numpy.extract(aim_file), None
+                    return None, f"AIM file not found for {scan_name}", None
+                voxel_sizes = self._extract_3d_voxel_sizes(
+                    scan_subtype, scan_name, directory,
+                    aim_file=aim_file, header_data=aim2numpy.get_header_info(aim_file))
+                return aim2numpy.extract(aim_file), None, voxel_sizes
 
             if scan_subtype == "TIFF Folder":
                 scan_folder = os.path.join(directory, scan_name)
-                image_data, _ = self.load_zeiss_image(scan_folder)
-                return image_data, None
+                image_data, voxel_size = self.load_zeiss_image(scan_folder)
+                return image_data, None, (voxel_size, voxel_size, voxel_size)
 
             if scan_subtype == skyscanReconstruction.SUBTYPE:
                 # A full SkyScan folder is hundreds to thousands of slices (JPEG decoding), and
@@ -2632,18 +2737,21 @@ class ExtractScansView(APIView):
                 # here; only dtypes that do ask (float, 32-bit) read the whole folder so the
                 # window offered is the true range. Log checks run at extraction.
                 scan_folder = os.path.join(directory, scan_name)
+                voxel_sizes = None
                 try:
                     image_data = skyscanReconstruction.probe_reconstruction(scan_folder)
                     if self._intensity_dtype_family(image_data.dtype) in ('float', 'int32+', 'other'):
-                        image_data, _, _ = skyscanReconstruction.load_reconstruction(scan_folder)
+                        image_data, voxel_sizes, _ = skyscanReconstruction.load_reconstruction(scan_folder)
                 except skyscanReconstruction.SkyScanImportError as exc:
-                    return None, f"{scan_name}: {exc}"
-                return image_data, None
+                    return None, f"{scan_name}: {exc}", None
+                return image_data, None, voxel_sizes
 
             if scan_subtype == "DICOM":
                 scan_folder = os.path.join(directory, scan_name)
-                _, image_data, _ = self.load_dicom_image(scan_folder)
-                return image_data, None
+                _, image_data, dicom_metadata = self.load_dicom_image(scan_folder)
+                voxel_sizes = self._extract_3d_voxel_sizes(
+                    scan_subtype, scan_name, directory, scanner_metadata=dicom_metadata)
+                return image_data, None, voxel_sizes
 
             if scan_subtype == "Multi-page TIFF":
                 scan_folder_tiff = os.path.join(directory, scan_name + ".tiff")
@@ -2653,36 +2761,92 @@ class ExtractScansView(APIView):
                 elif os.path.exists(scan_folder_tif):
                     scan_folder = scan_folder_tif
                 else:
-                    return None, f"TIFF not found for {scan_name}"
-                image_data, _, _ = self.load_multi_page_tiff(scan_folder)
-                return image_data, None
+                    return None, f"TIFF not found for {scan_name}", None
+                image_data, voxel_size, tiff_metadata = self.load_multi_page_tiff(scan_folder)
+                xyz = (tiff_metadata or {}).get('voxel_sizes_xyz')
+                return image_data, None, tuple(xyz) if xyz else (voxel_size, voxel_size, voxel_size)
 
             if scan_subtype == "NIfTI (.nii.gz)":
                 path = os.path.join(directory, f"{scan_name}.nii.gz")
                 if not os.path.exists(path):
-                    return None, f"NIfTI not found for {scan_name}"
-                return np.asanyarray(nib.load(path).dataobj), None
+                    return None, f"NIfTI not found for {scan_name}", None
+                nii_img = nib.load(path)
+                return np.asanyarray(nii_img.dataobj), None, self._extract_3d_voxel_sizes(
+                    scan_subtype, scan_name, directory, nii_img=nii_img)
 
             if scan_subtype == "NIfTI (.nii)":
                 path = os.path.join(directory, f"{scan_name}.nii")
                 if not os.path.exists(path):
-                    return None, f"NIfTI not found for {scan_name}"
-                return np.asanyarray(nib.load(path).dataobj), None
+                    return None, f"NIfTI not found for {scan_name}", None
+                nii_img = nib.load(path)
+                return np.asanyarray(nii_img.dataobj), None, self._extract_3d_voxel_sizes(
+                    scan_subtype, scan_name, directory, nii_img=nii_img)
 
             if scan_subtype == "MINC":
                 mnc_file = os.path.join(directory, f"{scan_name}.mnc")
                 if not os.path.exists(mnc_file):
                     mnc_file = os.path.join(directory, f"{scan_name}.MNC")
                 if not os.path.exists(mnc_file):
-                    return None, f"MINC not found for {scan_name}"
-                image_data, _, _ = self.load_minc_image(mnc_file)
+                    return None, f"MINC not found for {scan_name}", None
+                image_data, minc_voxel_sizes, _ = self.load_minc_image(mnc_file)
                 if image_data is None:
-                    return None, f"Failed to load MINC for {scan_name}"
-                return image_data, None
+                    return None, f"Failed to load MINC for {scan_name}", None
+                return image_data, None, minc_voxel_sizes
 
-            return None, f"Unsupported subtype for intensity probe: {scan_subtype}"
+            if scan_subtype == nd2Import.SUBTYPE:
+                nd2_file = self._nd2_source_path(directory, scan_name)
+                if not nd2_file:
+                    return None, f"ND2 file not found for {scan_name}", None
+                try:
+                    image_data, voxel_sizes, _ = nd2Import.load_nd2(nd2_file)
+                except nd2Import.ND2ImportError as exc:
+                    return None, f"{scan_name}: {exc}", None
+                return image_data, None, voxel_sizes
+
+            return None, f"Unsupported subtype for intensity probe: {scan_subtype}", None
         except Exception as e:
-            return None, str(e)
+            return None, str(e), None
+
+    @staticmethod
+    def _voxel_size_stats(voxel_sizes):
+        """
+        Voxel-size facts for the extract preflight (Extraction Options > Anisotropic
+        voxels): the spacings as the loader reports them and the extraction path they
+        will take (isotropicResampling.classify_voxel_sizes; the classification does not
+        depend on axis order). Unknown spacings (None) are reported as such.
+        """
+        try:
+            sizes = [float(v) for v in voxel_sizes]
+            if len(sizes) != 3 or min(sizes) <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return {'voxel_sizes': None, 'anisotropy_path': 'unknown'}
+        return {
+            'voxel_sizes': sizes,
+            'anisotropy_path': isotropicResampling.classify_voxel_sizes(sizes),
+        }
+
+    @staticmethod
+    def _anisotropic_scan_summary(intensity_scan_stats):
+        """
+        Anisotropic scans for the Extraction Options dialog, one entry per scan:
+        name, voxel sizes, path ('registration' or 'resample') and the isotropic spacing
+        each target choice would give.
+        """
+        summary = []
+        for stat in intensity_scan_stats:
+            path = stat.get('anisotropy_path')
+            if stat.get('error') or path not in ('registration', 'resample'):
+                continue
+            sizes = stat['voxel_sizes']
+            summary.append({
+                'name': stat['name'],
+                'voxel_sizes': sizes,
+                'path': path,
+                'finest_spacing': isotropicResampling.target_spacing(sizes, 'finest'),
+                'coarsest_spacing': isotropicResampling.target_spacing(sizes, 'coarsest'),
+            })
+        return summary
 
     def _collect_intensity_scan_stats(self, directory, volume_scans, on_scan=None):
         """Per-scan intensity stats for the extract preflight. on_scan(scan_name), if given,
@@ -2694,7 +2858,7 @@ class ExtractScansView(APIView):
                 continue
             if on_scan is not None:
                 on_scan(scan_name)
-            image_data, error = self._load_raw_volume_for_probe(directory, scan)
+            image_data, error, voxel_sizes = self._load_raw_volume_for_probe(directory, scan)
             if error or image_data is None:
                 stats.append({
                     'name': scan_name,
@@ -2713,7 +2877,9 @@ class ExtractScansView(APIView):
                 })
                 continue
             try:
-                stats.append(self._compute_intensity_scan_stats(scan_name, image_data))
+                scan_stats = self._compute_intensity_scan_stats(scan_name, image_data)
+                scan_stats.update(self._voxel_size_stats(voxel_sizes))
+                stats.append(scan_stats)
             except Exception as e:
                 stats.append({
                     'name': scan_name,
@@ -3306,60 +3472,120 @@ class ExtractScansView(APIView):
         required_keys = ('name', 'voxel_size', 'threshold', 'original_format')
         return all(key in metadata for key in required_keys)
 
-    def _check_and_resample_if_anisotropic(self, image_data, voxel_sizes, verbose=False):
+    # Slice-stack importers return arrays as (slices, rows, cols), i.e. (z, y, x), while
+    # _extract_3d_voxel_sizes and the loaders report spacings as (x, y, z). NIfTI and MINC
+    # report one spacing per array axis already. Resampling must pair every spacing with
+    # its own array axis, otherwise a thick-slice stack would be stretched along x.
+    _SPACING_ORDER_ZYX_SUBTYPES = ("SCANCO vivaCT", "TIFF Folder", "Multi-page TIFF")
+
+    def _voxel_sizes_in_array_axis_order(self, scan_subtype, voxel_sizes):
         """
-        Check if voxel sizes are anisotropic and resample if needed.
-        
+        Spacing of each array axis (axis 0, 1, 2) in mm, from the loader's voxel sizes.
+
+        SCANCO AIM (reshaped to dims[::-1]), Zeiss TIFF folders, multi-page TIFFs,
+        SkyScan reconstructions and Nikon ND2 stacks are (z, y, x) arrays with (x, y, z)
+        spacings: reversed.
+        DICOM stacks are (slice, row, col) with (row spacing, column spacing, slice
+        thickness): the slice spacing moves to the front. NIfTI and MINC (and voxelized
+        meshes, which are isotropic) are already per array axis.
+        """
+        sizes = tuple(float(v) for v in voxel_sizes)
+        if (scan_subtype in self._SPACING_ORDER_ZYX_SUBTYPES
+                or scan_subtype in (skyscanReconstruction.SUBTYPE, nd2Import.SUBTYPE)):
+            return sizes[::-1]
+        if scan_subtype == "DICOM":
+            return (sizes[2], sizes[0], sizes[1])
+        return sizes
+
+    def _check_and_resample_if_anisotropic(self, image_data, voxel_sizes, verbose=False,
+                                           target='finest', is_binary=False):
+        """
+        Bring an anisotropic volume onto an isotropic grid (see isotropicResampling.py).
+
         Args:
             image_data: 3D numpy array
-            voxel_sizes: tuple of (x, y, z) voxel sizes in mm
+            voxel_sizes: spacing of each ARRAY axis in mm (_voxel_sizes_in_array_axis_order)
             verbose: enable verbose output
-            
+            target: 'finest' or 'coarsest' isotropic spacing, from Extraction Options;
+                the registration-based path always produces the finest spacing
+            is_binary: two-label volume (labels are never blended)
+
+        Paths (isotropicResampling.classify_voxel_sizes):
+            isotropic     spacings equal within 0.1 %: unchanged, voxel_sizes[0] kept.
+            registration  one axis > 10 % thicker and the other two equal: the
+                          registration-based interslice interpolation
+                          (resampleAnisotropicVoxels.py), as before.
+            resample      any other anisotropy (one axis finer, all three different,
+                          1-10 % differences): physical-space resampling.
+        If the registration-based interpolation fails, the volume is resampled to the
+        same finest grid instead and a warning is returned. If resampling itself fails
+        the error is raised: a volume is never saved with a spacing it does not have.
+
         Returns:
-            tuple: (resampled_image_data, isotropic_voxel_size, was_resampled)
+            tuple: (image_data, isotropic_voxel_size, resampling_metadata, warning_or_None)
         """
-        # Check if any dimension is significantly different (>10% difference)
-        min_voxel = min(voxel_sizes)
-        max_voxel = max(voxel_sizes)
-        anisotropy_ratio = max_voxel / min_voxel
-        
+        sizes = tuple(float(v) for v in voxel_sizes)
+        path = isotropicResampling.classify_voxel_sizes(sizes)
+
         if verbose:
-            print(f"Voxel sizes: {voxel_sizes}")
-            print(f"Anisotropy ratio: {anisotropy_ratio:.3f}")
-        
-        # If anisotropy ratio > 1.1 (10% difference), consider it anisotropic
-        if anisotropy_ratio > 1.1:
-            print(f"🔄 Anisotropic voxels detected (ratio: {anisotropy_ratio:.2f}), resampling to isotropic...")
-            
+            print(f"Voxel sizes (array axis order): {sizes}")
+            print(f"Anisotropy ratio: {isotropicResampling.anisotropy_ratio(sizes):.3f} -> {path}")
+
+        if path == 'isotropic':
+            if verbose:
+                print("✅ Voxels are already isotropic")
+            return image_data, sizes[0], {
+                'performed': False,
+                'voxel_sizes': list(sizes),
+                'reason': 'already_isotropic',
+            }, None
+
+        registration_error = None
+        if path == 'registration':
+            print(f"🔄 Thick-slice voxels {sizes}: registration-based interslice interpolation...")
             try:
-                # Create interpolator
                 interpolator = DeformationBasedMRIInterpolator(
                     registration_type='SyNOnly',  # Use SyNOnly for better performance
                     verbose=verbose
                 )
-                
-                # Resample to isotropic
-                resampled_data = interpolator.interpolate_anisotropic_to_isotropic(
-                    image_data, voxel_sizes
-                )
-                
+                resampled_data = interpolator.interpolate_anisotropic_to_isotropic(image_data, sizes)
                 # The target voxel size is the minimum of the original voxel sizes
-                isotropic_voxel_size = min(voxel_sizes)
-                
+                isotropic_voxel_size = min(sizes)
                 print(f"✅ Resampling completed. New shape: {resampled_data.shape}")
                 print(f"✅ Isotropic voxel size: {isotropic_voxel_size:.3f} mm")
-                
-                return resampled_data, isotropic_voxel_size, True
-                
+                return resampled_data, isotropic_voxel_size, {
+                    'performed': True,
+                    'original_voxel_sizes': list(sizes),
+                    'final_isotropic_voxel_size': isotropic_voxel_size,
+                    'resampling_method': 'deformation_based_interpolation',
+                }, None
             except Exception as e:
-                print(f"⚠️ Warning: Anisotropic resampling failed: {e}")
-                print("Proceeding with original anisotropic data...")
-                # Fall back to using minimum voxel size
-                return image_data, min(voxel_sizes), False
-        else:
-            if verbose:
-                print("✅ Voxels are already isotropic")
-            return image_data, voxel_sizes[0], False
+                registration_error = str(e)
+                print(f"⚠️ Warning: registration-based interpolation failed ({e}); "
+                      f"resampling to the same finest grid instead")
+                target = 'finest'
+
+        print(f"🔄 Anisotropic voxels {sizes}: resampling to the {target} isotropic spacing...")
+        resampled_data, isotropic_voxel_size, details = isotropicResampling.resample_to_isotropic(
+            image_data, sizes, target=target, is_binary=is_binary)
+        print(f"✅ Resampling completed ({', '.join(details['interpolation_per_axis'])}). "
+              f"New shape: {resampled_data.shape}, isotropic voxel size: {isotropic_voxel_size:.4f} mm")
+
+        metadata = {
+            'performed': True,
+            'original_voxel_sizes': list(sizes),
+            'final_isotropic_voxel_size': isotropic_voxel_size,
+            'resampling_method': details.pop('method'),
+        }
+        metadata.update(details)
+        warning = None
+        if registration_error:
+            metadata['registration_interpolation_error'] = registration_error
+            warning = (
+                "registration-based interslice interpolation failed "
+                f"({registration_error}); resampled to the finest spacing with cubic B-splines instead"
+            )
+        return resampled_data, isotropic_voxel_size, metadata, warning
 
     def _extract_3d_voxel_sizes(self, scan_subtype, scan_name, directory, **kwargs):
         """
@@ -3521,6 +3747,16 @@ class ExtractScansView(APIView):
                 intensity_options = dict(intensity_options)
                 intensity_options['subject_windows'] = subject_windows
 
+            # Multichannel scans: what to do with their channels, per scan (Extraction Options;
+            # scans not listed keep channel 1 as before). See channelCombination.
+            channel_choices = channelCombination.choices_by_subject(request.data.get('channel_extraction_options'))
+            # Extraction Options > Anisotropic voxels: 'finest' (default) or 'coarsest' isotropic
+            # spacing for volumes the registration-based interpolation does not cover.
+            anisotropy_options = request.data.get('anisotropy_extraction_options')
+            anisotropy_target = isotropicResampling.normalize_target_choice(
+                anisotropy_options.get('target') if isinstance(anisotropy_options, dict) else None)
+            requested_names = {s.get('name') for s in (request.data.get('scans') or [])}
+
             total_scans = len(scans)
 
             # If nothing to do, send a final progress (if possible) and return
@@ -3592,7 +3828,25 @@ class ExtractScansView(APIView):
                 # written here and removes the folder again, so no half-extracted subject is left for
                 # the other tools to read. New extraction outputs go inside this block, written with
                 # the atomic_* helpers.
-                with transaction_over([scan_out_folder], 'extract'):
+                # A channel split also writes the subjects <scan>_ch<k>; their folders join this
+                # transaction, so a crash rolls every channel back together.
+                split_names = channelCombination.split_subject_names(scan_name, channel_choices.get(scan_name))
+                # A name is free when no scan has it, or when it is this scan's own channel from an
+                # earlier split (re-extracting an incomplete scan rewrites its channels).
+                clashes = [
+                    name for name in split_names
+                    if name in requested_names
+                    and ((load_scan_metadata(directory, name) or {}).get('channel_extraction') or {}).get('source_scan') != scan_name
+                ]
+                if clashes:
+                    raise ValueError(
+                        f"{scan_name}: cannot split its channels, the project already has a scan named "
+                        f"{', '.join(clashes)}.")
+                split_folders = [os.path.join(extracted_dir, name) for name in split_names]
+                for folder in split_folders:
+                    os.makedirs(folder, exist_ok=True)
+
+                with transaction_over([scan_out_folder] + split_folders, 'extract'):
                     scanner_metadata = None 
                     image_data = None
                     voxel_sizes = None  # Change to store 3D voxel sizes
@@ -3613,11 +3867,7 @@ class ExtractScansView(APIView):
                             scan_subtype, scan_name, directory, 
                             aim_file=aim_file, header_data=header_data
                         )
-                    
-                        # Standardize data type
-                        image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                            image_data, intensity_options=intensity_options, scan_name=scan_name
-                        )
+
                     
                     elif scan_subtype == "TIFF Folder":
                         scan_folder = os.path.join(directory, scan_name)
@@ -3625,11 +3875,7 @@ class ExtractScansView(APIView):
                     
                         # For now, assume isotropic for TIFF (can be enhanced)
                         voxel_sizes = (voxel_size, voxel_size, voxel_size)
-                    
-                        # Standardize data type
-                        image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                            image_data, intensity_options=intensity_options, scan_name=scan_name
-                        )
+
                     
                     elif scan_subtype == skyscanReconstruction.SUBTYPE:
                         # Voxel size only from the NRecon log (refused without it); provenance
@@ -3642,10 +3888,6 @@ class ExtractScansView(APIView):
                         extraction_warnings.extend(
                             (scan_name, w) for w in scanner_metadata['skyscan']['warnings'])
 
-                        # Standardize data type
-                        image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                            image_data, intensity_options=intensity_options, scan_name=scan_name
-                        )
 
                     elif scan_subtype == "DICOM":
                         scan_folder = os.path.join(directory, scan_name)
@@ -3657,11 +3899,7 @@ class ExtractScansView(APIView):
                                 scan_subtype, scan_name, directory,
                                 scanner_metadata=scanner_metadata
                             )
-                        
-                            # Standardize data type
-                            image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                                image_data, intensity_options=intensity_options, scan_name=scan_name
-                            )
+
                         
                     elif scan_subtype == "Multi-page TIFF":
                         scan_folder_tiff = os.path.join(directory, scan_name + ".tiff")
@@ -3681,11 +3919,7 @@ class ExtractScansView(APIView):
                         # one (see load_multi_page_tiff); otherwise isotropic as before.
                         xyz = (scanner_metadata or {}).get('voxel_sizes_xyz')
                         voxel_sizes = tuple(xyz) if xyz else (voxel_size, voxel_size, voxel_size)
-                    
-                        # Standardize data type
-                        image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                            image_data, intensity_options=intensity_options, scan_name=scan_name
-                        )
+
                     
                     elif scan_subtype == "NIfTI (.nii.gz)":
                         nii_gz_file = os.path.join(directory, f"{scan_name}.nii.gz")
@@ -3699,11 +3933,7 @@ class ExtractScansView(APIView):
                                 scan_subtype, scan_name, directory,
                                 nii_img=nii_img
                             )
-                        
-                            # Standardize data type
-                            image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                                image_data, intensity_options=intensity_options, scan_name=scan_name
-                            )
+
                         
                             # Extract scanner metadata from NIfTI header
                             scanner_metadata = self._extract_nifti_metadata(nii_img)
@@ -3722,11 +3952,7 @@ class ExtractScansView(APIView):
                                 scan_subtype, scan_name, directory,
                                 nii_img=nii_img
                             )
-                        
-                            # Standardize data type
-                            image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                                image_data, intensity_options=intensity_options, scan_name=scan_name
-                            )
+
                         
                             # Extract scanner metadata from NIfTI header
                             scanner_metadata = self._extract_nifti_metadata(nii_img)
@@ -3742,12 +3968,24 @@ class ExtractScansView(APIView):
                             image_data, voxel_sizes, scanner_metadata = self.load_minc_image(mnc_file)
                             if image_data is None:
                                 continue
-                            # Standardize data type
-                            image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
-                                image_data, intensity_options=intensity_options, scan_name=scan_name
-                            )
                         else:
                             continue
+
+                    elif scan_subtype == nd2Import.SUBTYPE:
+                        # Nikon ND2: first time point / XY position, (z, y, x[, channels]) with
+                        # (x, y, z) mm spacings from the calibration and the Z loop step (refused
+                        # without them). Channels go to channelCombination, anisotropy to the
+                        # resampler; provenance and warnings land in scanner_metadata.nd2.
+                        nd2_file = self._nd2_source_path(directory, scan_name)
+                        if not nd2_file:
+                            print(f"Warning: {scan_name}.nd2 not found, skipping...")
+                            continue
+                        try:
+                            image_data, voxel_sizes, scanner_metadata = nd2Import.load_nd2(nd2_file)
+                        except nd2Import.ND2ImportError as exc:
+                            raise ValueError(f"{scan_name}: {exc}") from exc
+                        extraction_warnings.extend(
+                            (scan_name, w) for w in scanner_metadata['nd2']['warnings'])
 
                     elif self._is_mesh_subtype(scan_subtype):
                         if scan_name in skipped_mesh_subjects:
@@ -3880,146 +4118,171 @@ class ExtractScansView(APIView):
                     else:
                         continue
 
-                    if image_data is not None and image_data.ndim > 3:
-                        channel_axis = int(np.argmin(image_data.shape))
-                        print(
-                            f"4D+ volume (shape {image_data.shape}), "
-                            f"reducing to 3D via channel axis {channel_axis}"
-                        )
-                        image_data = self._reduce_extra_dims_to_3d(image_data)
-
-                    # 🔄 NEW: Check for anisotropic voxels and resample if needed
-                    if image_data is not None and voxel_sizes is not None:
-                        print(f"Processing {scan_name}: shape {image_data.shape}, voxel sizes {voxel_sizes}")
-                    
-                        # Check and resample if anisotropic
-                        image_data, final_voxel_size, was_resampled = self._check_and_resample_if_anisotropic(
-                            image_data, voxel_sizes, verbose=True
-                        )
-                    
-                        if was_resampled:
-                            print(f"✅ {scan_name} resampled from {voxel_sizes} to isotropic {final_voxel_size:.3f} mm")
-                        
-                            # Update scanner metadata to indicate resampling was performed
-                            if scanner_metadata is None:
-                                scanner_metadata = {}
-                            scanner_metadata['anisotropic_resampling'] = {
-                                'performed': True,
-                                'original_voxel_sizes': voxel_sizes,
-                                'final_isotropic_voxel_size': final_voxel_size,
-                                'resampling_method': 'deformation_based_interpolation'
-                            }
-                        else:
-                            if scanner_metadata is None:
-                                scanner_metadata = {}
-                            scanner_metadata['anisotropic_resampling'] = {
-                                'performed': False,
-                                'voxel_sizes': voxel_sizes,
-                                'reason': 'already_isotropic' if max(voxel_sizes) / min(voxel_sizes) <= 1.1 else 'resampling_failed'
-                            }
-                    else:
-                        # Fallback for when we couldn't extract proper voxel sizes
-                        final_voxel_size = 1.0
-                        print(f"⚠️ Warning: Could not extract voxel sizes for {scan_name}, using default")
-
-                    if image_data is not None:
-                        image_data, final_voxel_size, applied_scaling = apply_extract_scaling(
-                            image_data, final_voxel_size, scaling_factor
-                        )
-                        if applied_scaling > 1:
-                            print(
-                                f"Average-pooled {scan_name} by {applied_scaling}; "
-                                f"voxel size {final_voxel_size}"
+                    # Channels -> subject(s) (channelCombination): a 3D scan passes through once; a
+                    # multichannel one is picked/combined as chosen in Extraction Options (channel 1
+                    # by default) or split into linked subjects. Inside the loop scan_name and
+                    # scan_out_folder name the subject being written; source_name is the scan the
+                    # file came from (its intensity window and segmentation apply to every channel).
+                    source_name = scan_name
+                    source_scanner_metadata = scanner_metadata
+                    # A voxelized mesh arrives ready (binary volume, is_binary set above) and skips the
+                    # dtype standardisation, exactly as before.
+                    source_is_binary, source_mapping = is_binary, intensity_value_mapping
+                    standardize = not self._is_mesh_subtype(scan_subtype)
+                    channel_outputs = channelCombination.channel_outputs(
+                        image_data, source_name, channel_choices.get(source_name))
+                    image_data = None  # the generator keeps the loaded volume until the last subject
+                    for scan_name, image_data, channel_json in channel_outputs:
+                        scan_out_folder = os.path.join(extracted_dir, scan_name)
+                        # Own copy per subject: the resampling note below is added to it.
+                        scanner_metadata = dict(source_scanner_metadata) if source_scanner_metadata else None
+                        is_binary, intensity_value_mapping = source_is_binary, source_mapping
+                        if standardize and image_data is not None:
+                            # Standardize data type (binary labels, intensity window, uint16)
+                            image_data, is_binary, intensity_value_mapping = self._prepare_scan_image_data(
+                                image_data, intensity_options=intensity_options, scan_name=source_name
                             )
-                    else:
-                        applied_scaling = scaling_factor
 
-                    # Save as NIfTI using the final voxel size
-                    if image_data is not None:
-                        nifti_file = os.path.join(scan_out_folder, scan_name)
-                        self.save_as_nifti(image_data, final_voxel_size, nifti_file)
-                        self.save_as_lossy_nifti(image_data, final_voxel_size, nifti_file)                    
-                            
-                    print(scan_name+" saved")
+                        # Anisotropic voxels -> isotropic grid (registration-based interslice
+                        # interpolation for one thick axis, physical-space resampling otherwise;
+                        # see _check_and_resample_if_anisotropic). Runs per output subject, so
+                        # every channel of a split scan is resampled the same way.
+                        if image_data is not None and voxel_sizes is not None:
+                            array_voxel_sizes = self._voxel_sizes_in_array_axis_order(scan_subtype, voxel_sizes)
+                            print(f"Processing {scan_name}: shape {image_data.shape}, voxel sizes {voxel_sizes} "
+                                  f"(per array axis {array_voxel_sizes})")
+                            try:
+                                image_data, final_voxel_size, resampling_metadata, resampling_warning = (
+                                    self._check_and_resample_if_anisotropic(
+                                        image_data, array_voxel_sizes, verbose=True,
+                                        target=anisotropy_target, is_binary=is_binary,
+                                    )
+                                )
+                            except Exception as exc:
+                                raise ValueError(
+                                    f"{scan_name}: could not bring voxels {tuple(voxel_sizes)} mm to an "
+                                    f"isotropic grid ({exc})") from exc
+                            if resampling_metadata.get('performed'):
+                                print(f"✅ {scan_name} resampled from {voxel_sizes} to isotropic {final_voxel_size:.4f} mm")
+                            if resampling_warning:
+                                extraction_warnings.append((scan_name, resampling_warning))
 
-                    # Update the JSON metadata
-                    json_file = os.path.join(scan_out_folder, f"{scan_name}.json")
-                    if os.path.exists(json_file):
-                        with open(json_file, 'r') as jf:
-                            json_metadata = json.load(jf)
-                    else:
-                        json_metadata = {}
-
-                    # Add scanner metadata if available
-                    if scanner_metadata:
-                        json_metadata['scanner_metadata'] = scanner_metadata
-
-                    def find_major_peaks(histogram, bin_edges, min_distance=10):
-                        # Find all peaks
-                        peaks, _ = signal.find_peaks(histogram, distance=min_distance)
-                    
-                        if len(peaks) == 0:
-                            return []
-                    
-                        # Sort peaks by their height (prominence)
-                        peak_heights = histogram[peaks]
-                        sorted_indices = np.argsort(peak_heights)[::-1]  # Sort in descending order
-                        sorted_peaks = peaks[sorted_indices]
-                    
-                        # Return the bin values (intensity levels) for the peaks
-                        peak_intensities = bin_edges[sorted_peaks]
-                        return peak_intensities
-
-                    if is_binary:
-                        threshold = self.BINARY_UINT16_THRESHOLD
-                        print("Binary image — using fixed uint16 midpoint threshold: "+str(threshold))
-                        image_data = None
-                        gc.collect()
-                    else:
-                        # Calculate histogram on a downsampled version if image is very large
-                        if image_data.size > 100000000:  # Arbitrary threshold, adjust as needed
-                            image_data = gaussian_filter(image_data, sigma=2.0)
-                            blurred_image_data = block_reduce(image_data, block_size=(4, 4, 4), func=np.mean)
+                            if scanner_metadata is None:
+                                scanner_metadata = {}
+                            # Spacings as the loader reported them (x, y, z for slice stacks);
+                            # array_axis_voxel_sizes is the order the resampling used.
+                            if resampling_metadata.get('performed'):
+                                resampling_metadata['original_voxel_sizes'] = [float(v) for v in voxel_sizes]
+                            else:
+                                resampling_metadata['voxel_sizes'] = [float(v) for v in voxel_sizes]
+                            resampling_metadata['array_axis_voxel_sizes'] = [float(v) for v in array_voxel_sizes]
+                            scanner_metadata['anisotropic_resampling'] = resampling_metadata
                         else:
-                            blurred_image_data = gaussian_filter(image_data, sigma=2.0)
+                            # Fallback for when we couldn't extract proper voxel sizes
+                            final_voxel_size = 1.0
+                            print(f"⚠️ Warning: Could not extract voxel sizes for {scan_name}, using default")
 
-                        # Free image data as we no longer need it
-                        image_data = None
-                        gc.collect()  # Encourage garbage collection
+                        if image_data is not None:
+                            image_data, final_voxel_size, applied_scaling = apply_extract_scaling(
+                                image_data, final_voxel_size, scaling_factor
+                            )
+                            if applied_scaling > 1:
+                                print(
+                                    f"Average-pooled {scan_name} by {applied_scaling}; "
+                                    f"voxel size {final_voxel_size}"
+                                )
+                        else:
+                            applied_scaling = scaling_factor
 
-                        threshold = self._compute_extraction_threshold(blurred_image_data, find_major_peaks)
+                        # Save as NIfTI using the final voxel size
+                        if image_data is not None:
+                            nifti_file = os.path.join(scan_out_folder, scan_name)
+                            self.save_as_nifti(image_data, final_voxel_size, nifti_file)
+                            self.save_as_lossy_nifti(image_data, final_voxel_size, nifti_file)                    
+                            
+                        print(scan_name+" saved")
 
-                    # Update JSON metadata
-                    json_metadata.update({
-                        'name': scan_name,
-                        'voxel_size': final_voxel_size,
-                        'original_voxel_sizes': voxel_sizes,
-                        'scaling_factor': applied_scaling,
-                        'threshold': threshold,
-                        'original_format': scan_subtype,
-                    })
-                    if extra_json_metadata:
-                        json_metadata.update(extra_json_metadata)
-                    if intensity_value_mapping:
-                        raw_mapping = dict(intensity_value_mapping)
-                        raw_mapping['filename'] = f"{scan_name}_lossy.nii.gz"
-                        json_metadata['intensity_value_mapping'] = [raw_mapping]
-                    elif 'intensity_value_mapping' in json_metadata:
-                        # Passthrough / individual stretch must not retain a stale factor pair
-                        del json_metadata['intensity_value_mapping']
+                        # Update the JSON metadata
+                        json_file = os.path.join(scan_out_folder, f"{scan_name}.json")
+                        if os.path.exists(json_file):
+                            with open(json_file, 'r') as jf:
+                                json_metadata = json.load(jf)
+                        else:
+                            json_metadata = {}
+
+                        # Add scanner metadata if available
+                        if scanner_metadata:
+                            json_metadata['scanner_metadata'] = scanner_metadata
+
+                        def find_major_peaks(histogram, bin_edges, min_distance=10):
+                            # Find all peaks
+                            peaks, _ = signal.find_peaks(histogram, distance=min_distance)
                     
-                    atomic_write_json(json_file, json_metadata, indent=4)
+                            if len(peaks) == 0:
+                                return []
+                    
+                            # Sort peaks by their height (prominence)
+                            peak_heights = histogram[peaks]
+                            sorted_indices = np.argsort(peak_heights)[::-1]  # Sort in descending order
+                            sorted_peaks = peaks[sorted_indices]
+                    
+                            # Return the bin values (intensity levels) for the peaks
+                            peak_intensities = bin_edges[sorted_peaks]
+                            return peak_intensities
 
-                    # If a segmentation exists for this scan, load and save masks (full and lossy)
-                    try:
-                        if scan_name in segmentation_map:
-                            seg_path = segmentation_map[scan_name]
-                            seg_mask = self._load_segmentation_mask(seg_path)
-                            if seg_mask is not None:
-                                self._save_segmentation_masks(scan_out_folder, scan_name, seg_mask)
-                                print(f"Segmentation processed for {scan_name}: {os.path.basename(seg_path)}")
-                    except Exception as e:
-                        print(f"Warning: Could not process segmentation for {scan_name}: {e}")
+                        if is_binary:
+                            threshold = self.BINARY_UINT16_THRESHOLD
+                            print("Binary image — using fixed uint16 midpoint threshold: "+str(threshold))
+                            image_data = None
+                            gc.collect()
+                        else:
+                            # Calculate histogram on a downsampled version if image is very large
+                            if image_data.size > 100000000:  # Arbitrary threshold, adjust as needed
+                                image_data = gaussian_filter(image_data, sigma=2.0)
+                                blurred_image_data = block_reduce(image_data, block_size=(4, 4, 4), func=np.mean)
+                            else:
+                                blurred_image_data = gaussian_filter(image_data, sigma=2.0)
+
+                            # Free image data as we no longer need it
+                            image_data = None
+                            gc.collect()  # Encourage garbage collection
+
+                            threshold = self._compute_extraction_threshold(blurred_image_data, find_major_peaks)
+
+                        # Update JSON metadata
+                        json_metadata.update({
+                            'name': scan_name,
+                            'voxel_size': final_voxel_size,
+                            'original_voxel_sizes': voxel_sizes,
+                            'scaling_factor': applied_scaling,
+                            'threshold': threshold,
+                            'original_format': scan_subtype,
+                        })
+                        if extra_json_metadata:
+                            json_metadata.update(extra_json_metadata)
+                        if channel_json:
+                            # channel_extraction provenance (+ linked_to for split channels)
+                            json_metadata.update(channel_json)
+                        if intensity_value_mapping:
+                            raw_mapping = dict(intensity_value_mapping)
+                            raw_mapping['filename'] = f"{scan_name}_lossy.nii.gz"
+                            json_metadata['intensity_value_mapping'] = [raw_mapping]
+                        elif 'intensity_value_mapping' in json_metadata:
+                            # Passthrough / individual stretch must not retain a stale factor pair
+                            del json_metadata['intensity_value_mapping']
+                    
+                        atomic_write_json(json_file, json_metadata, indent=4)
+
+                        # If a segmentation exists for this scan, load and save masks (full and lossy)
+                        try:
+                            if source_name in segmentation_map:
+                                seg_path = segmentation_map[source_name]
+                                seg_mask = self._load_segmentation_mask(seg_path)
+                                if seg_mask is not None:
+                                    self._save_segmentation_masks(scan_out_folder, scan_name, seg_mask)
+                                    print(f"Segmentation processed for {scan_name}: {os.path.basename(seg_path)}")
+                        except Exception as e:
+                            print(f"Warning: Could not process segmentation for {scan_name}: {e}")
 
             # Send progress update via WebSocket
             progress = 1
@@ -4562,14 +4825,10 @@ class ExtractScansView(APIView):
                 if image_data.ndim == 2:
                     # Single page TIFF - add a singleton dimension
                     image_data = image_data[np.newaxis, ...]
-                elif image_data.ndim > 3:
-                    channel_axis = int(np.argmin(image_data.shape))
-                    print(
-                        f"4D+ TIFF (shape {image_data.shape}), "
-                        f"taking index 0 along channel axis {channel_axis}"
-                    )
-                    image_data = self._reduce_extra_dims_to_3d(image_data)
-                
+                # 4D+ (multichannel) TIFFs are returned as they are: the extract preflight counts
+                # the channels and extraction combines, picks or splits them as chosen in
+                # Extraction Options (channelCombination; channel 1 by default, as before).
+
                 print(f"Loaded TIFF: {image_data.shape}, voxel size: {voxel_size:.3f} mm")
                 
         except Exception as e:
@@ -4879,6 +5138,16 @@ class ExtractScansView(APIView):
             return None
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _nd2_source_path(directory, scan_name):
+        """Path of <scan_name>.nd2 in directory (any extension case), or None."""
+        for ext in nd2Import.EXTENSIONS:
+            for candidate in (scan_name + ext, scan_name + ext.upper()):
+                path = os.path.join(directory, candidate)
+                if os.path.isfile(path):
+                    return path
+        return None
+
     # MINC support (no MINC toolkit required)
     # MINC1 is NetCDF-based (needs netCDF4 or nibabel's built-in reader).
     # MINC2 is HDF5-based (needs h5py).
@@ -5051,6 +5320,8 @@ class ExtractScansPreflightView(APIView):
         intensity_scan_stats = extractor._collect_intensity_scan_stats(
             directory, volume_scans, on_scan=_preflight_progress)
         intensity_groups = extractor._group_intensity_stats_by_value_family(intensity_scan_stats)
+        channel_groups = extractor._group_scans_by_channel_count(intensity_scan_stats)
+        anisotropic_scans = extractor._anisotropic_scan_summary(intensity_scan_stats)
         needs_intensity_options = any(
             s.get('needs_range_decision') for s in intensity_scan_stats if not s.get('error')
         )
@@ -5114,6 +5385,13 @@ class ExtractScansPreflightView(APIView):
             'existing_intensity_policy': existing_intensity_policy,
             'incremental_assignments': incremental_assignments,
             'new_subgroup_alerts': new_subgroup_alerts,
+            # Multichannel scans grouped by channel count (Extraction Options > Channels)
+            'channel_groups': channel_groups,
+            'needs_channel_options': len(channel_groups) > 0,
+            # Anisotropic voxels (Extraction Options > Anisotropic voxels). Only scans the
+            # registration-based path does not cover need a choice of target spacing.
+            'anisotropic_scans': anisotropic_scans,
+            'needs_anisotropy_options': any(entry['path'] == 'resample' for entry in anisotropic_scans),
         })
 
 
@@ -6428,7 +6706,7 @@ class MarchingCubesView(APIView):
             # Read in place (crash-safe rule 2): the file is never renamed to be read.
             mask_img = load_nifti_readonly(mask_path)
             # Round before astype to avoid truncating floats
-            mask_volume = np.round(mask_img.get_fdata()).astype(np.uint8)
+            mask_volume = nifti_voxels(mask_img, np.uint8, round_values=True)
             # Swap axes to match volume orientation
             mask_volume = np.swapaxes(mask_volume, 0, 2)
 
@@ -6578,7 +6856,7 @@ class MarchingCubesView(APIView):
                     # Load and process the mask
                     mask_img = load_nifti_readonly(mask_path)
                     # Round before astype to avoid truncating floats
-                    mask_volume = np.round(mask_img.get_fdata()).astype(np.uint8)
+                    mask_volume = nifti_voxels(mask_img, np.uint8, round_values=True)
                     
                     # Swap axes to match volume orientation
                     mask_volume = np.swapaxes(mask_volume, 0, 2)
@@ -8772,14 +9050,16 @@ class ApplyRotationView(APIView):
 
     def get_tight_bbox(self, data, threshold):
         # Find points above threshold
-        points = np.argwhere(data > threshold)
-        if len(points) == 0:
+        # Per-axis extents of the voxels above threshold: the same numbers as min/max over
+        # np.argwhere(data > threshold), without its 24-bytes-per-voxel coordinate list.
+        extents = axis_extents(data > threshold)
+        if extents is None:
             return (0, 0, 0), data.shape
         
         # Get min and max coordinates
         padding = 40
-        bbox_min = np.min(points, axis=0) - padding
-        bbox_max = np.max(points, axis=0) + padding
+        bbox_min = extents[0] - padding
+        bbox_max = extents[1] + padding
         
         # Ensure bbox is within image bounds
         bbox_min = np.maximum(bbox_min, 0)
@@ -9102,7 +9382,7 @@ class ApplyRotationView(APIView):
         main_nifti = nib.load(main_image_path)
         original_dtype = main_nifti.get_data_dtype()
         reference_shape = main_nifti.header.get_data_shape()
-        main_nifti_data = main_nifti.get_fdata().astype(original_dtype)    
+        main_nifti_data = nifti_voxels(main_nifti, original_dtype)    
 
         # Get center of rotation from the main image
         main_center = np.array(main_metadata['quick_mesh_properties']['center'])
@@ -9261,7 +9541,7 @@ class ApplyRotationView(APIView):
                 mask_img = load_nifti_readonly(source_mask_path)
                 mask_dtype = mask_img.get_data_dtype()
                 # Round before astype to avoid truncating floats
-                mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                mask_data = nifti_voxels(mask_img, mask_dtype, round_values=True)
 
                 # Build target box for mask using stored embedding
                 target_shape = self._rotation_embed['target_shape']
@@ -9454,7 +9734,7 @@ class ApplyRotationView(APIView):
                     print(f"Scan {scan} has different shape {scan_shape} than reference {reference_shape}, skipping")
                     continue
             
-                scan_nifti_data = scan_nifti.get_fdata().astype(original_dtype)
+                scan_nifti_data = nifti_voxels(scan_nifti, original_dtype)
                 voxel_size = scan_metadata.get('voxel_size', 1.0)
 
                 background_value = self.registration_tools.get_background_value(scan_nifti_data, mode="border")
@@ -9524,7 +9804,7 @@ class ApplyRotationView(APIView):
                         mask_img = load_nifti_readonly(source_mask_path)
                         mask_dtype = mask_img.get_data_dtype()
                         # Round before astype to avoid truncating floats
-                        mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                        mask_data = nifti_voxels(mask_img, mask_dtype, round_values=True)
 
                         # Build target box for mask using stored embedding
                         target_shape = self._rotation_embed['target_shape']
@@ -9708,7 +9988,7 @@ class ApplyRotationView(APIView):
         print("nifti_path: "+nifti_path)
         nifti_img = nib.load(nifti_path)
         original_dtype = nifti_img.get_data_dtype()
-        nifti_data = nifti_img.get_fdata().astype(original_dtype)
+        nifti_data = nifti_voxels(nifti_img, original_dtype)
         source_shape = tuple(int(s) for s in nifti_data.shape)
 
         # Load the metadata JSON to get the center of rotation
@@ -9971,7 +10251,7 @@ class ApplyRotationView(APIView):
                 mask_img = load_nifti_readonly(mask_src_path)
                 mask_dtype = mask_img.get_data_dtype()
                 # Round before astype to avoid truncating floats
-                mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                mask_data = nifti_voxels(mask_img, mask_dtype, round_values=True)
 
                 # Build target box for mask using stored embedding
                 target_shape = self._rotation_embed['target_shape']
@@ -10148,7 +10428,7 @@ class ApplyCropView(APIView):
         print("nifti_path: "+nifti_path)
         nifti_img = nib.load(nifti_path)
         original_dtype = nifti_img.get_data_dtype()
-        nifti_data = nifti_img.get_fdata().astype(original_dtype)
+        nifti_data = nifti_voxels(nifti_img, original_dtype)
 
         # Load the metadata JSON to get voxel size and other info
         json_path = os.path.join(directory, "extracted", filename, filename+".json")
@@ -10225,7 +10505,7 @@ class ApplyCropView(APIView):
                 mask_img = load_nifti_readonly(mask_src_path)
                 mask_dtype = mask_img.get_data_dtype()
                 # Round before astype to avoid truncating floats
-                mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                mask_data = nifti_voxels(mask_img, mask_dtype, round_values=True)
 
                 # Apply identical crop and padding (nearest neighbor via slicing)
                 mask_cropped = mask_data[z_min:z_max, y_min:y_max, x_min:x_max]
@@ -10513,7 +10793,7 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
         print(f"Loading {nifti_path}")
         nifti_img = nib.load(nifti_path)
         original_dtype = nifti_img.get_data_dtype()
-        nifti_data = nifti_img.get_fdata().astype(original_dtype)
+        nifti_data = nifti_voxels(nifti_img, original_dtype)
         shape_before = tuple(int(v) for v in nifti_data.shape)
 
         background_value = self.registration_tools.get_background_value(
@@ -10575,7 +10855,7 @@ class ApplyCropToAllScansView(MeshEditMixin, APIView):
 
                 mask_img = load_nifti_readonly(mask_src_path)
                 mask_dtype = mask_img.get_data_dtype()
-                mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                mask_data = nifti_voxels(mask_img, mask_dtype, round_values=True)
                 mask_cropped = mask_data[z_min:z_max, y_min:y_max, x_min:x_max]
                 mask_cropped = np.pad(
                     mask_cropped,
@@ -12276,7 +12556,7 @@ class RandomLandmarkingView(APIView):
         original_dtype = nifti_img.get_data_dtype()
         # caching='unchanged': nibabel would otherwise keep its own float64 copy of the
         # whole volume on nifti_img for the rest of the request (incl. the ANTs wait).
-        nifti_data = nifti_img.get_fdata(caching='unchanged').astype(original_dtype)
+        nifti_data = nifti_voxels(nifti_img, original_dtype)
 
         # Get threshold from json metadata
         threshold = json_metadata['threshold']
@@ -14384,19 +14664,19 @@ class ElasticRegistrationView(APIView):
                     displacement_field_affine = displacement_field.affine
                     displacement_field_header = displacement_field.header
                     original_dtype_displacement_field = displacement_field.get_data_dtype()
-                    displacement_field_numpy = displacement_field.get_fdata().astype(original_dtype_displacement_field)
+                    displacement_field_numpy = nifti_voxels(displacement_field, original_dtype_displacement_field)
                     A = displacement_field_numpy
 
                     # load the displacement fields in order
                     displacement_field = nib.load(nii_transforms_inv[len(nii_transforms_inv)-2])
                     original_dtype_displacement_field = displacement_field.get_data_dtype()
-                    displacement_field_numpy = displacement_field.get_fdata().astype(original_dtype_displacement_field)
+                    displacement_field_numpy = nifti_voxels(displacement_field, original_dtype_displacement_field)
                     B_inv = displacement_field_numpy
 
                     # load the displacement fields in order
                     displacement_field = nib.load(nii_transforms[len(nii_transforms)-2])
                     original_dtype_displacement_field = displacement_field.get_data_dtype()
-                    displacement_field_numpy = displacement_field.get_fdata().astype(original_dtype_displacement_field)
+                    displacement_field_numpy = nifti_voxels(displacement_field, original_dtype_displacement_field)
                     B = displacement_field_numpy
                 
                     displacement_field = None
@@ -14882,7 +15162,7 @@ class ElasticRegistrationView(APIView):
                         mask_img = nib.load(mask_src_temp)
                         mask_dtype = mask_img.get_data_dtype()
                         # Round before astype to avoid truncating floats
-                        mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                        mask_data = nifti_voxels(mask_img, mask_dtype, round_values=True)
                         if reference_is_preserved_mesh:
                             mask_data = _swap_voxel_volume_xz(mask_data)
                         
@@ -16305,7 +16585,7 @@ def _load_upload_mesh_and_metadata(directory, filename, edit):
     nifti_path = os.path.join(directory, sub_path, edit + ".nii.gz")
     nifti_img = nib.load(nifti_path)
     original_dtype = nifti_img.get_data_dtype()
-    nifti_data = nifti_img.get_fdata().astype(original_dtype)
+    nifti_data = nifti_voxels(nifti_img, original_dtype)
     nifti_data = gaussian_filter(nifti_data, sigma=0.3)
 
     threshold = json_metadata['threshold']
@@ -17108,7 +17388,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                 # Load the reference nifti data
                 reference_nifti_data = nib.load(os.path.join(directory, "extracted", reference, f"{reference_file}.nii.gz"))
                 reference_nifti_data_type = reference_nifti_data.get_data_dtype()
-                reference_nifti_data = reference_nifti_data.get_fdata().astype(reference_nifti_data_type)
+                reference_nifti_data = nifti_voxels(reference_nifti_data, reference_nifti_data_type)
                 reference_nifti_data = gaussian_filter(reference_nifti_data, sigma=0.3)
 
                 # Add validation:
@@ -17333,7 +17613,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                         # Load the reference nifti data
                         current_nifti_data = nib.load(os.path.join(directory, "extracted", folder, f"{edit_file}.nii.gz"))
                         current_nifti_data_type = current_nifti_data.get_data_dtype()
-                        current_nifti_data = current_nifti_data.get_fdata().astype(current_nifti_data_type)
+                        current_nifti_data = nifti_voxels(current_nifti_data, current_nifti_data_type)
                         current_nifti_data = gaussian_filter(current_nifti_data, sigma=0.3)
 
                         # Load json metadata
@@ -17630,7 +17910,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                         # Load the reference nifti data
                         current_nifti_data = nib.load(os.path.join(directory, "extracted", folder, f"{edit_file}.nii.gz"))
                         current_nifti_data_type = current_nifti_data.get_data_dtype()
-                        current_nifti_data = current_nifti_data.get_fdata().astype(current_nifti_data_type)
+                        current_nifti_data = nifti_voxels(current_nifti_data, current_nifti_data_type)
                         current_nifti_data = gaussian_filter(current_nifti_data, sigma=0.3)
 
                         # Load json metadata
@@ -17806,7 +18086,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                 # Load the atlas nifti data
                 atlas_nifti_data = nib.load(os.path.join(resolve_atlas_dir(directory), atlas_file+".nii.gz"))
                 atlas_nifti_data_type = atlas_nifti_data.get_data_dtype()
-                atlas_nifti_data = atlas_nifti_data.get_fdata().astype(atlas_nifti_data_type)
+                atlas_nifti_data = nifti_voxels(atlas_nifti_data, atlas_nifti_data_type)
                 atlas_nifti_data = gaussian_filter(atlas_nifti_data, sigma=0.3)
 
                 # Load json metadata
@@ -18107,9 +18387,7 @@ class TransferLandmarksView(MeshElasticRegistrationMixin, APIView):
                         )
                     )
                     reference_nifti_data_type = reference_nifti_data.get_data_dtype()
-                    reference_nifti_data = reference_nifti_data.get_fdata().astype(
-                        reference_nifti_data_type
-                    )
+                    reference_nifti_data = nifti_voxels(reference_nifti_data, reference_nifti_data_type)
                     reference_nifti_data = gaussian_filter(reference_nifti_data, sigma=0.3)
 
                     if np.any(np.isnan(reference_nifti_data)) or np.any(np.isinf(reference_nifti_data)):
@@ -18337,10 +18615,10 @@ class PropagateMaskView(APIView):
             else ants.image_read(fov_image_path)
         )
         
-        print(f"Source image shape: {source_image.numpy().shape}, spacing: {source_image.spacing}")
-        print(f"Target image shape: {target_image.numpy().shape}, spacing: {target_image.spacing}")
+        print(f"Source image shape: {source_image.shape}, spacing: {source_image.spacing}")
+        print(f"Target image shape: {target_image.shape}, spacing: {target_image.spacing}")
         if fov_image_path != source_image_path:
-            print(f"FOV heal image: {fov_image_path}, shape: {fov_image.numpy().shape}")
+            print(f"FOV heal image: {fov_image_path}, shape: {fov_image.shape}")
 
         # Shrink-path elastic_inv/fwd can have wrong pixdim (FOV larger than the
         # reference). Heal in-place before apply so existing projects re-propagate cleanly.
@@ -18368,13 +18646,13 @@ class PropagateMaskView(APIView):
         mask_img = load_nifti_readonly(mask_src_path)
         mask_dtype = mask_img.get_data_dtype()
         # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-        mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+        mask_data = nifti_voxels(mask_img, mask_dtype, round_values=True)
         
         print(f"Loaded mask with shape {mask_data.shape} and dtype {mask_dtype}")
         print(f"Mask data value range: {mask_data.min()} to {mask_data.max()}")
         
         # Create lightweight proxy for ANTs target image using the actual target image
-        proxy_array = np.zeros(target_image.numpy().shape, dtype=np.float32)
+        proxy_array = np.zeros(target_image.shape, dtype=np.float32)
         target_proxy = ants.from_numpy(
             proxy_array,
             spacing=target_image.spacing,
@@ -18415,7 +18693,7 @@ class PropagateMaskView(APIView):
                     mask_merge_read_temp = output_path.replace('.nii.mask.gz', '_mask_merge_read_temp.nii.gz')
                     mask_dest = load_nifti_readonly(output_path)
                     # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-                    mask_dest_data = np.round(mask_dest.get_fdata()).astype(mask_dtype)
+                    mask_dest_data = nifti_voxels(mask_dest, mask_dtype, round_values=True)
                     if mask_dest_data.shape != mask_transformed.shape:
                         raise ValueError(
                             f"Cannot merge selected_label: existing mask shape {mask_dest_data.shape} "
@@ -19524,7 +19802,7 @@ class PropagateMaskView(APIView):
             # Read in place (crash-safe rule 2): the mask is never renamed to be read.
             mask_img = load_nifti_readonly(mask_path)
             # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-            mask_data = np.round(mask_img.get_fdata()).astype(mask_img.get_data_dtype())
+            mask_data = nifti_voxels(mask_img, mask_img.get_data_dtype(), round_values=True)
             
             # Load image
             image_img = nib.load(image_path)
@@ -19642,7 +19920,7 @@ class PropagateMaskView(APIView):
             # Load mask data
             mask_nifti = load_nifti_readonly(mask_path)
             # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-            mask_data_3d = np.round(mask_nifti.get_fdata()).astype(mask_nifti.get_data_dtype())
+            mask_data_3d = nifti_voxels(mask_nifti, mask_nifti.get_data_dtype(), round_values=True)
             
             # Keep a copy of the original mask data (to preserve any pre-existing labels)
             original_mask_data_3d = mask_data_3d.copy()
@@ -19753,7 +20031,7 @@ class PropagateMaskView(APIView):
             src_img   = load_nifti_readonly(source_mask_path)
             mask_dtype = src_img.get_data_dtype()
             # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-            src_data  = np.round(src_img.get_fdata()).astype(mask_dtype)
+            src_data  = nifti_voxels(src_img, mask_dtype, round_values=True)
 
             final_data = src_data
 
@@ -19763,7 +20041,7 @@ class PropagateMaskView(APIView):
                 dst_temp = elastic_mask_path.replace('.nii.mask.gz', '_ecopy_dst_temp.nii.gz')
                 dst_img  = load_nifti_readonly(elastic_mask_path)
                 # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-                dst_data = np.round(dst_img.get_fdata()).astype(mask_dtype)
+                dst_data = nifti_voxels(dst_img, mask_dtype, round_values=True)
                 # Remove old region for selected_label, then paint new region from src
                 cleaned  = np.where(dst_data == selected_label, 0, dst_data).astype(mask_dtype)
                 final_data = np.where(src_data == selected_label, selected_label, cleaned).astype(mask_dtype)
@@ -19955,7 +20233,7 @@ class SnapToMeshView(APIView):
         nifti_path = os.path.join(directory, sub_path, edit)
         nifti_img = nib.load(nifti_path)
         nifti_data_type = nifti_img.get_data_dtype()
-        nifti_data = nifti_img.get_fdata().astype(nifti_data_type)
+        nifti_data = nifti_voxels(nifti_img, nifti_data_type)
 
         # Load the json metadata
         json_path = os.path.join(directory, sub_path, filename + ".json")
@@ -20488,7 +20766,7 @@ class SaveLandmarkGuidepointsView(APIView):
 
         nifti_path = os.path.join(directory, sub_path, nifti_filename)
         nifti_img = nib.load(nifti_path)
-        nifti_data = nifti_img.get_fdata().astype(np.int16)
+        nifti_data = nifti_voxels(nifti_img, np.int16)
 
         volume = gaussian_filter(nifti_data, sigma=0.3)
         voxel_size = voxel_size_for_edit_stem(
@@ -20711,7 +20989,7 @@ class SaveLandmarkGuidepointsView(APIView):
         
         nifti_path = os.path.join(directory, sub_path, nifti_filename)
         nifti_img = nib.load(nifti_path)
-        nifti_data = nifti_img.get_fdata().astype(np.int16)
+        nifti_data = nifti_voxels(nifti_img, np.int16)
         
         # Marching cubes to get the surface mesh (following SnapToMeshView format)
         volume = gaussian_filter(nifti_data, sigma=0.3)
@@ -21191,7 +21469,7 @@ class GetSemiLandmarksView(APIView):
 
         print(f"Loading NIfTI file: {nifti_file}")
 
-        volume = nib.load(nifti_file).get_fdata().astype(np.int16)
+        volume = nifti_voxels(nib.load(nifti_file), np.int16)
 
         threshold_orig = json_metadata['threshold']
         spacing_per_voxel = voxel_size_for_edit_stem(
@@ -22890,6 +23168,106 @@ class RedoElasticToReferenceAtlasView(APIView):
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR if run_errors and not registered else status.HTTP_200_OK,
         )
+
+
+# ---------------------------------------------------------------------------
+# Reference grid check (rigid alignment vs the current project reference)
+# ---------------------------------------------------------------------------
+#
+# Rigid alignment resamples a subject onto the reference's voxel grid, so every
+# aligned subject has the reference's array shape. The subject JSON records only
+# the reference's name (`alignment_to`), not the grid. If the reference is later
+# recropped with another padding, or another reference with other dimensions is
+# selected, the subjects aligned before the change keep the old grid while the
+# subjects aligned after it get the new one. Tools that need one shared grid
+# (elastic registration, rotate-all, ...) then skip or refuse the old ones.
+#
+# The check compares array shapes read from the NIfTI headers (no voxel data is
+# loaded), so it also covers projects made before this check existed. A changed
+# reference with the same dimensions (for example a promoted atlas with the
+# previous reference's grid) is not reported, because the grids still match.
+
+
+def _nifti_header_shape(path):
+    """3D array shape from a NIfTI header, without loading voxels; None if unreadable."""
+    try:
+        shape = nib.load(path).header.get_data_shape()
+    except Exception as e:
+        print(f"Reference grid check: could not read header of {path}: {e}")
+        return None
+    return [int(v) for v in shape[:3]]
+
+
+def reference_grid_check(directory):
+    """
+    Rigidly aligned subjects whose current volume grid differs from the reference's.
+
+    The grid of a subject is the shape of its latest non-elastic full-resolution
+    volume (the volume the voxel tools read; an elastic output is always on the
+    reference grid it was registered to). Subjects that were never rigidly aligned
+    are not compared, since their grid is expected to differ. `applicable` is False
+    when there is no voxel reference to compare against (none selected, missing
+    volume, or a preserved-mesh reference that has no voxel grid).
+    """
+    reference = read_selected_reference(directory)
+    result = {
+        'applicable': False,
+        'reference': reference,
+        'reference_shape': None,
+        'mismatched': [],
+    }
+    if not reference:
+        return result
+
+    reference_dir = os.path.join(directory, "extracted", reference)
+    try:
+        with open(os.path.join(reference_dir, f"{reference}.json"), 'r') as jf:
+            reference_metadata = json.load(jf)
+    except (OSError, json.JSONDecodeError):
+        return result
+    if is_preserved_mesh_metadata(reference_metadata):
+        return result
+    reference_path = _resolve_latest_non_elastic_full_nifti_path(reference_dir, reference)
+    reference_shape = _nifti_header_shape(reference_path) if reference_path else None
+    if reference_shape is None:
+        return result
+    result['applicable'] = True
+    result['reference_shape'] = reference_shape
+
+    for scan_name in list_extracted_scan_names(directory):
+        if scan_name == reference:
+            continue
+        scan_dir = os.path.join(directory, "extracted", scan_name)
+        try:
+            with open(os.path.join(scan_dir, f"{scan_name}.json"), 'r') as jf:
+                metadata = json.load(jf)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not metadata.get('alignment_to') or is_preserved_mesh_metadata(metadata):
+            continue
+        scan_path = _resolve_latest_non_elastic_full_nifti_path(scan_dir, scan_name)
+        scan_shape = _nifti_header_shape(scan_path) if scan_path else None
+        if scan_shape is None or scan_shape == reference_shape:
+            continue
+        result['mismatched'].append({
+            'name': scan_name,
+            'shape': scan_shape,
+            'alignment_to': metadata.get('alignment_to'),
+        })
+    return result
+
+
+class ReferenceGridCheckView(APIView):
+    """
+    GET ?directory=... -> reference_grid_check (read-only; drives the grid mismatch
+    marker in the working-directory list, grid view and Rigid alignment status bar).
+    """
+
+    def get(self, request):
+        directory = request.query_params.get('directory')
+        if not directory or not os.path.isdir(directory):
+            return Response({'error': 'directory is required'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(reference_grid_check(directory))
 
 
 class GetProjectSettingsView(APIView):

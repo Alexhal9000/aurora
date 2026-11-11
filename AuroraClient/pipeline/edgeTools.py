@@ -22,6 +22,7 @@ from rest_framework import status
 
 import pygltflib
 
+from .niftiVoxels import nifti_voxels  # stored-dtype voxel loads without get_fdata()'s float64 copy (same values)
 from .preprocessingTools import cleanup_memory
 # Threaded, exact ball closing (same result as skimage's binary_closing; see parallelVolumeOps.py).
 from .parallelVolumeOps import binary_closing_ball
@@ -64,7 +65,7 @@ def _load_volume_and_meta(directory, filename, edit, full_resolution):
             nifti_file = os.path.join(directory, sub_path, f"{filename}_lossy.nii.gz")
 
     nii_img = nib.load(nifti_file)
-    volume = nii_img.get_fdata().astype(np.float32)
+    volume = nifti_voxels(nii_img, np.float32)
 
     lossy_params = meta.get('lossy_compression', [])
     if isinstance(lossy_params, dict):
@@ -415,7 +416,7 @@ class EdgeDetectionView(APIView):
             # Read in place (crash-safe rule 2): the mask is never renamed to be read.
             existing_img = load_nifti_readonly(mask_path)
             # Round before astype to avoid truncating floats
-            existing_array = np.round(existing_img.get_fdata()).astype(np.uint8)
+            existing_array = nifti_voxels(existing_img, np.uint8, round_values=True)
             new_label = int(existing_array.max()) + 1
             new_array = existing_array.copy()
             new_array[filled] = new_label
@@ -452,7 +453,7 @@ class EdgeDetectionView(APIView):
             if not os.path.isfile(other_path):
                 return
             other_img = nib.load(other_path)
-            target_shape = other_img.get_fdata().shape
+            target_shape = other_img.shape
             zoom_factors = [t / s for t, s in zip(target_shape, mask_array.shape)]
             other_mask = zoom(mask_array.astype(np.float32), zoom_factors, order=0).astype(np.uint8)
             other_mask_path = os.path.join(scan_folder, f"{other_base}.nii.mask.gz")

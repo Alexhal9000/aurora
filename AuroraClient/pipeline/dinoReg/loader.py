@@ -134,7 +134,7 @@ def get_dino_model(checkpoint_path: str | None = None, allow_cpu: bool = False):
     if not os.path.isfile(config_path) or not any(os.path.isfile(p) for p in weight_files):
         raise DinoRegError(
             "DINO-Reg requires the DINOv3 snapshot. "
-            "Download it from the header menu: AI models. "
+            "Download it in Settings > General > AI models. "
             f"Expected config.json and model.safetensors under {weights_dir}."
         ) from ModelMissingError(DINOV3_ID)
 

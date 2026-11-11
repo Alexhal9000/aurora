@@ -27,6 +27,7 @@ from rest_framework.views import APIView
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 
+from .niftiVoxels import nifti_voxels  # stored-dtype voxel loads without get_fdata()'s float64 copy (same values)
 from .ALPACA import ALPACA
 from .atlas_paths import resolve_atlas_dir
 from .batch_flag_filter import apply_flag_filter, load_flagged_subject_names, normalize_flag_filter_value
@@ -1661,7 +1662,7 @@ class MeshEditMixin:
         # Read in place (crash-safe rule 2): the source mask is never renamed to be read.
         mask_img = load_nifti_readonly(mask_src_path)
         mask_dtype = mask_img.get_data_dtype()
-        mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+        mask_data = nifti_voxels(mask_img, mask_dtype, round_values=True)
         sliced_mask = self._apply_slice_operations_to_mask(mask_data, voxel_size, operations)
 
         new_mask_edit_base = f"{filename}_edit_{edit_number}_sliced"
@@ -1727,7 +1728,7 @@ class MeshEditMixin:
         # Read in place (crash-safe rule 2): the source mask is never renamed to be read.
         mask_img = load_nifti_readonly(mask_src_path)
         mask_dtype = mask_img.get_data_dtype()
-        mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+        mask_data = nifti_voxels(mask_img, mask_dtype, round_values=True)
         shell_mask = np.asarray(shell_mask, dtype=bool)
         if shell_mask.shape != mask_data.shape:
             raise ValueError(
@@ -4668,7 +4669,7 @@ class ApplyMeshSliceView(MeshEditMixin, APIView):
 
         nifti_img = nib.load(source_path)
         original_dtype = nifti_img.get_data_dtype()
-        nifti_data = nifti_img.get_fdata().astype(original_dtype)
+        nifti_data = nifti_voxels(nifti_img, original_dtype)
         voxel_size = float(metadata.get("voxel_size", 1.0))
         threshold = metadata.get("threshold")
         background_value = registration_tools.get_background_value(
@@ -5674,7 +5675,7 @@ class ApplyMeshShellView(MeshEditMixin, APIView):
 
         nifti_img = nib.load(source_path)
         original_dtype = nifti_img.get_data_dtype()
-        nifti_data = nifti_img.get_fdata().astype(original_dtype)
+        nifti_data = nifti_voxels(nifti_img, original_dtype)
         voxel_size = float(metadata.get("voxel_size", 1.0))
         threshold = self._resolve_fullres_volume_threshold(metadata, nifti_data)
         background_value = registration_tools.get_background_value(

@@ -40,6 +40,7 @@ import matplotlib.pyplot as plt
 from skimage.filters import threshold_otsu
 import skimage.morphology
 from scipy.signal import convolve
+from .niftiVoxels import nifti_voxels  # stored-dtype voxel loads without get_fdata()'s float64 copy (same values)
 from .ALPACA import ALPACA
 from .coordinateFrames import list_extracted_scan_names
 from skimage import exposure
@@ -109,7 +110,7 @@ class SmartLandmarkingView(APIView):
         # Load the nifti data from edit
         nifti_path = os.path.join(directory, "atlas", atlas_latest_edit)
         nifti_img = nib.load(nifti_path)
-        atlas_nifti_data = nifti_img.get_fdata().astype(np.int16)
+        atlas_nifti_data = nifti_voxels(nifti_img, np.int16)
 
         # Apply Gaussian smoothing
         atlas_nifti_data = gaussian_filter(atlas_nifti_data, sigma=1.0)
@@ -148,7 +149,7 @@ class SmartLandmarkingView(APIView):
         # Load the nifti data from edit
         nifti_path = os.path.join(directory, "extracted", reference_subject, reference_latest_edit)
         nifti_img = nib.load(nifti_path)
-        reference_nifti_data = nifti_img.get_fdata().astype(np.int16)
+        reference_nifti_data = nifti_voxels(nifti_img, np.int16)
         
         # Load the json metadata
         json_path = os.path.join(directory, "extracted", reference_subject, f"{reference_subject}.json")
@@ -372,7 +373,7 @@ class SmartLandmarkingView(APIView):
         # Load the nifti data from filename
         nifti_path = os.path.join(directory, sub_path, edit + ".nii.gz")
         nifti_img = nib.load(nifti_path)
-        nifti_data = nifti_img.get_fdata().astype(np.int16)
+        nifti_data = nifti_voxels(nifti_img, np.int16)
         nifti_data = gaussian_filter(nifti_data, sigma=1.0)
         # Render the mesh with marchingcubes
         vertices, faces, _, _ = measure.marching_cubes(nifti_data, level=threshold, spacing=(json_metadata['voxel_size'], json_metadata['voxel_size'], json_metadata['voxel_size']))

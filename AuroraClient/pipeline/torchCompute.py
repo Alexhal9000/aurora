@@ -35,6 +35,87 @@ NVIDIA_DRIVER_HELP = (
 )
 
 
+# --- CUDA caching-allocator configuration -----------------------------------
+# ``expandable_segments`` lets PyTorch grow one virtual segment instead of
+# carving many fixed blocks, which reduces fragmentation on Linux. On Windows
+# (PyTorch 2.11, WDDM driver model) it is not reliable: after a CUDA OOM the
+# allocator's release path can hit
+#   "!handles_.at(i) INTERNAL ASSERT FAILED at ... CUDACachingAllocator.cpp"
+# which poisons the CUDA context, so the OOM can no longer be recovered by a
+# smaller batch (seen 2026-11-10 in DINO-Reg on a 12 GB Windows GPU). macOS
+# has no CUDA. So the option is only ever enabled on Linux.
+EXPANDABLE_SEGMENTS = "expandable_segments:True"
+
+
+def expandable_segments_supported() -> bool:
+    """True where Aurora enables the CUDA ``expandable_segments`` allocator option."""
+    return sys.platform.startswith("linux")
+
+
+def configure_cuda_allocator(env=None) -> None:
+    """Enable ``expandable_segments`` on Linux only; never override a user value.
+
+    ``env`` defaults to ``os.environ`` (call before the first CUDA allocation in
+    this process); pass a subprocess environment dict to configure a child.
+    Off Linux it also removes the option if Aurora itself set it earlier in
+    this process (the exact value below), so an older code path cannot leave
+    it on.
+    """
+    import os
+
+    target = os.environ if env is None else env
+    for key in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        if expandable_segments_supported():
+            target.setdefault(key, EXPANDABLE_SEGMENTS)
+        elif target.get(key) == EXPANDABLE_SEGMENTS:
+            del target[key]
+
+
+def is_cuda_memory_error(exc) -> bool:
+    """True for any GPU memory exhaustion PyTorch reports, not only "out of memory".
+
+    Besides ``torch.OutOfMemoryError`` ("CUDA out of memory. Tried to
+    allocate ..."), a full GPU also surfaces as library handle/workspace
+    failures (cuBLAS/cuDNN/cuFFT ``ALLOC_FAILED``) when those libraries
+    allocate outside the caching allocator. All of them are recoverable the
+    same way: free the cache and retry with less work in flight.
+    """
+    try:
+        import torch
+
+        if isinstance(exc, torch.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    if not isinstance(exc, RuntimeError):
+        return False
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or "alloc_failed" in msg
+        or "not_enough_workspace" in msg
+        or "cudaerrormemoryallocation" in msg
+    )
+
+
+def cuda_free_and_total_bytes(device):
+    """(free, total) bytes on a CUDA device per the driver, or None elsewhere.
+
+    ``torch.cuda.mem_get_info`` counts memory held by every process (desktop,
+    browser WebGL, other tools), unlike ``memory_allocated`` which only counts
+    this process's tensors.
+    """
+    try:
+        import torch
+
+        if torch.device(device).type != "cuda":
+            return None
+        free, total = torch.cuda.mem_get_info(torch.device(device))
+        return int(free), int(total)
+    except Exception:
+        return None
+
+
 def mps_available() -> bool:
     """True on a Mac whose PyTorch can use the Apple GPU."""
     try:

@@ -8,10 +8,13 @@ __version__ = "0.1.0"
 __maintainer__ = "José Guilherme de Almeida"
 __email__ = "jose.almeida@research.fchampalimaud.org"
 
-# Set PyTorch memory configuration before importing torch
+# Set PyTorch memory configuration before importing torch.
+# Aurora: expandable_segments only on Linux (broken after an OOM on Windows,
+# see torchCompute.configure_cuda_allocator); it was set unconditionally here,
+# which made it engine-wide because denoiseTools imports this at start-up.
 import os
-os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+from .torchCompute import configure_cuda_allocator
+configure_cuda_allocator()
 
 import numpy as np
 import torch

@@ -8,7 +8,9 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .paths import models_root
 
-MISSING_HINT = "Download it from the header menu: AI models"
+# Where users find the downloads: Settings > General > AI models (also the first-launch
+# "AI models" dialog and the "AI models available" button on the welcome screen).
+MISSING_HINT = "Download it in Settings > General > AI models"
 
 LICENSES_DIR = Path(__file__).resolve().parent / "licenses"
 

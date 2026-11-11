@@ -129,7 +129,7 @@ def run_medsam2_inference(
             raise ModelMissingError(
                 MEDSAM2_ID,
                 f"MedSAM2 checkpoint not found at {resolved_checkpoint}. "
-                "Download it from the header menu: AI models.",
+                "Download it in Settings > General > AI models.",
             )
         if not _is_finetuned_checkpoint(resolved_checkpoint):
             require_installed(MEDSAM2_ID)

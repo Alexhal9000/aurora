@@ -1,4 +1,4 @@
-"""Local Aurora endpoints for foundation-model status and download."""
+"""Local Aurora endpoints for foundation-model status, download and delete."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from rest_framework.views import APIView
 from .foundation_download import (
     DownloadError,
     cancel_download,
+    delete_model,
     start_download,
     status_payload,
 )
@@ -21,9 +22,23 @@ def _beta(request) -> bool:
     return is_beta_session(getattr(request, "aurora_session", None))
 
 
+def _can_manage(request) -> bool:
+    """Deleting models changes the computer for everyone: at this computer, or the shared
+    server's owner and managers only (engineSharing.can_manage, as for the terminal)."""
+    from pipeline import engineSharing  # lazy, as in engineTerminal.may_watch
+    record = getattr(request, "aurora_session", None)
+    return record is not None and engineSharing.can_manage(record)
+
+
+def _status(request) -> dict:
+    payload = status_payload(include_beta=_beta(request))
+    payload["can_manage"] = _can_manage(request)
+    return payload
+
+
 class FoundationModelStatusView(APIView):
     def get(self, request):
-        return Response(status_payload(include_beta=_beta(request)), status=status.HTTP_200_OK)
+        return Response(_status(request), status=status.HTTP_200_OK)
 
 
 class FoundationModelDownloadView(APIView):
@@ -56,10 +71,29 @@ class FoundationModelDownloadView(APIView):
             )
         except DownloadError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(status_payload(include_beta=_beta(request)), status=status.HTTP_202_ACCEPTED)
+        return Response(_status(request), status=status.HTTP_202_ACCEPTED)
 
 
 class FoundationModelCancelView(APIView):
     def post(self, request):
         cancel_download()
-        return Response(status_payload(include_beta=_beta(request)), status=status.HTTP_200_OK)
+        return Response(_status(request), status=status.HTTP_200_OK)
+
+
+class FoundationModelDeleteView(APIView):
+    """POST {model_id}: remove a downloaded model (Settings > General > AI models)."""
+
+    def post(self, request):
+        if not _can_manage(request):
+            return Response(
+                {"error": "Only the owner or a manager of this computer can delete AI models."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        model_id = str((request.data or {}).get("model_id") or "")
+        if get_spec(model_id) is None:
+            return Response({"error": f"Unknown model {model_id!r}."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            delete_model(model_id)
+        except DownloadError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response(_status(request), status=status.HTTP_200_OK)

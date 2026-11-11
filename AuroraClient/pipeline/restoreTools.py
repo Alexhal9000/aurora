@@ -13,6 +13,7 @@ import gc
 from skimage import exposure
 import shutil
 
+from .niftiVoxels import nifti_voxels  # stored-dtype voxel loads without get_fdata()'s float64 copy (same values)
 from .registrationTools import RegistrationTools
 # Threaded, lower-memory CLAHE, bit-identical to skimage's (see parallelVolumeOps.py).
 from . import parallelVolumeOps
@@ -222,7 +223,7 @@ class RestoreAllScansView(APIView):
                     time_start = time.time()
                     nifti_img = nib.load(scan_path)
                     original_dtype = nifti_img.get_data_dtype()
-                    scan_data = nifti_img.get_fdata().astype(original_dtype)
+                    scan_data = nifti_voxels(nifti_img, original_dtype)
                     scan_affine = nifti_img.affine
                     time_end = time.time()
                     print(f"Time taken to load {scan_name}: {time_end - time_start} seconds")

@@ -40,10 +40,20 @@ Method, for one scan with a confirmed segmentation threshold ``T``:
    outer margin defined by distance rather than by the volume border, so it
    still works on tight crops.
    ``surrounding_tissue`` (Surrounding tissue): any below-threshold voxel,
-   inside or outside the specimen, with ``g <= d < D*``. Inside/outside is
-   often undefined (a bone threshold leaves the body open), so it is not
-   used. On real adult mouse CT the near band peaked on soft tissue and the
-   far half on air.
+   inside or outside the specimen, in the innermost shell next to it,
+   ``g <= d < g + w``. The shell starts one guard wide (``w = g``) and its
+   width doubles until it holds enough voxels, never reaching past ``D*``
+   (so in the worst case it is the whole near band ``g <= d < D*``).
+   Inside/outside is often undefined (a bone threshold leaves the body
+   open), so it is not used. Why the innermost shell and not the whole near
+   band: the volume of a shell grows with its distance, so a pooled band is
+   dominated by its outer part. When the specimen sits deep in a large body
+   (whole-animal CT, bone threshold) ``D*`` is several millimetres and the
+   outer part of the band is air and packing outside the body (SkyScan
+   whole mouse F20G1F08: band peak 8 = air between the wrapping, innermost
+   shell peak 33 = soft tissue). The tissue touching the specimen is the
+   quantity the region is meant to measure, and it is also the part least
+   likely to be air.
    Air exclusion (``surrounding_tissue`` only). When the soft tissue around
    the specimen is thinner than ``D*`` (mouse skulls, limbs, heads scanned in
    a wide tube) the near band also holds a lot of air. Air is a narrow peak
@@ -52,7 +62,11 @@ Method, for one scan with a confirmed segmentation threshold ``T``:
    K0176: tissue ~35,000 lost to air ~32,790). The air peak ``A`` of the far
    band is therefore estimated first (exactly as for ``outside``) together
    with its spread ``s_A``, taken as the RMS deviation on the narrower side of
-   the peak (the side not contaminated by tissue or holder). Near-band voxels
+   the peak (the side not contaminated by tissue or holder). If the raw air
+   values pile up on their minimum or maximum (clipping, e.g. 8-bit exports
+   where all air darker than the window is stored as 0) the clipped side is
+   cut off and only looks narrow, so ``s_A`` is taken instead from the
+   half-maximum width of the other side (see ``peak_spread``). Near-band voxels
    with ``|v - A| <= k * s_A`` (``k = 3``, the same three-sigma rule as the
    edge guard) are dropped before the peak is taken. If too few voxels remain
    the near band holds no measurable tissue and its unfiltered peak is used;
@@ -90,9 +104,15 @@ BLUR_SIGMA = 1.0
 GUARD_SIGMAS = 3.0
 # Percentile of exterior distances splitting near (tissue) from far (air).
 SPLIT_DISTANCE_PERCENTILE = 50.0
+# Initial width of the Surrounding tissue shell beyond the edge guard, in
+# guard widths; doubled until the shell holds MIN_SAMPLES voxels (<= D*).
+TISSUE_SHELL_GUARDS = 1.0
 # Half-width of the air peak, in air standard deviations, removed from the
 # near band before the Surrounding tissue peak is taken.
 AIR_EXCLUSION_SIGMAS = 3.0
+# Fraction of raw air voxels sitting exactly on their minimum (or maximum)
+# above which that end of the range is treated as clipped.
+CLIP_PILE_UP_FRACTION = 0.01
 # Minimum number of selected voxels needed for a trustworthy histogram peak.
 MIN_SAMPLES = 2000
 # Bin-count safety limits for the Freedman-Diaconis histogram.
@@ -156,20 +176,83 @@ def histogram_peak(values):
     return centre, width, int(hist.size)
 
 
-def peak_spread(values, peak):
-    """Spread of the mode at ``peak`` from its narrower (cleaner) side.
+def _half_max_spread(values, peak, side):
+    """Gaussian sigma of the mode at ``peak`` from its half-maximum width on one side.
 
-    The RMS deviation from ``peak`` is computed separately for the values
-    below and above it; the smaller of the two is returned. Material that
-    sits next to the mode (tissue above air in CT, the sample holder)
-    widens only one side, so the narrower side is the better estimate of
-    the mode's own noise. Returns 0.0 when neither side has values.
+    ``side`` is -1 (below the peak) or +1 (above). The histogram (same
+    Freedman-Diaconis bins as the peak) is walked from the peak bin until the
+    count drops below half the peak count; the crossing is interpolated
+    linearly and the half width at half maximum is converted with
+    ``sigma = HWHM / sqrt(2 ln 2)``. Only the core of the mode is used, so a
+    tail of other material on that side (tissue, holder) does not widen it.
+    Returns None when the histogram ends before the half maximum is reached.
     """
-    spreads = []
-    for side in (values[values < peak], values[values > peak]):
-        if side.size:
-            spreads.append(float(np.sqrt(np.mean((side - peak) ** 2))))
-    return min(spreads) if spreads else 0.0
+    edges = _freedman_diaconis_edges(values)
+    hist, edges = np.histogram(values, bins=edges)
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    k = int(np.clip(np.searchsorted(edges, peak, side='right') - 1, 0, hist.size - 1))
+    half = 0.5 * float(hist[k])
+    j = k
+    while 0 <= j + side < hist.size and hist[j] > half:
+        j += side
+    if hist[j] > half:
+        return None
+    prev = j - side
+    c_prev, c_j = float(hist[prev]), float(hist[j])
+    frac = (c_prev - half) / (c_prev - c_j) if c_prev != c_j else 0.0
+    crossing = centres[prev] + side * frac * (centres[1] - centres[0])
+    return abs(float(crossing) - float(peak)) / math.sqrt(2.0 * math.log(2.0))
+
+
+def peak_spread(values, peak, clipped_low=False, clipped_high=False):
+    """Spread of the mode at ``peak``, chosen for the scenario.
+
+    Unclipped (default): the RMS deviation from ``peak`` is computed
+    separately for the values below and above it and the smaller of the two
+    is returned. Material that sits next to the mode (tissue above air in
+    CT, the sample holder) widens only one side, so the narrower side is the
+    better estimate of the mode's own noise.
+
+    Clipped: when the raw intensities pile up at the bottom of their range
+    (``clipped_low``: 8-bit exports and windowed data store all air darker
+    than the window as its lowest value) the side of the mode facing that
+    limit is cut off, so it looks narrow without being so, and the narrower
+    side rule picks exactly the wrong side. That side is then ignored and the
+    other side's half-maximum width (``_half_max_spread``) is used, which
+    reads the mode's core and not the tail of material beyond it.
+    ``clipped_high`` is the mirror case (saturation). If both sides are
+    clipped, or the half maximum cannot be measured, the narrower-side RMS
+    is used. Returns ``(spread, rule)``; rule is recorded in the provenance.
+    """
+    rms = {}
+    for side, part in ((-1, values[values < peak]), (1, values[values > peak])):
+        if part.size:
+            rms[side] = float(np.sqrt(np.mean((part - peak) ** 2)))
+    if not rms:
+        return 0.0, 'none'
+    if clipped_low != clipped_high:
+        side = 1 if clipped_low else -1
+        spread = _half_max_spread(values, peak, side)
+        if spread is not None and spread > 0:
+            return float(spread), 'half_max_' + ('upper' if side > 0 else 'lower')
+    return min(rms.values()), 'narrower_side_rms'
+
+
+def range_pile_up(raw_values):
+    """Whether raw values pile up at their minimum / maximum (clipping).
+
+    A noisy measurement practically never repeats its extreme value; when at
+    least ``CLIP_PILE_UP_FRACTION`` of the values sit exactly on the minimum
+    (or maximum), the range was clipped there.
+    """
+    if raw_values.size == 0:
+        return False, False
+    lo = raw_values.min()
+    hi = raw_values.max()
+    n = float(raw_values.size)
+    low = np.count_nonzero(raw_values == lo) / n >= CLIP_PILE_UP_FRACTION
+    high = np.count_nonzero(raw_values == hi) / n >= CLIP_PILE_UP_FRACTION
+    return bool(low), bool(high)
 
 
 def estimate_background_peak(data, threshold, region=DEFAULT_REGION):
@@ -252,11 +335,21 @@ def estimate_background_peak(data, threshold, region=DEFAULT_REGION):
     if region == REGION_OUTSIDE:
         selected = air_selected
     else:
-        selected = distances < cutoff
+        # Innermost shell next to the specimen (see module docstring): start
+        # TISSUE_SHELL_GUARDS guard widths wide and double the width until
+        # the shell holds enough voxels, never past the split cutoff.
+        width = float(TISSUE_SHELL_GUARDS * guard)
+        outer = min(guard + width, cutoff)
+        while outer < cutoff and np.count_nonzero(distances < outer) < MIN_SAMPLES:
+            width *= 2.0
+            outer = min(guard + width, cutoff)
+        selected = distances < outer
+        info['tissue_shell_outer_sampled_voxels'] = float(outer)
 
     # 5. Blur after the masking decisions; only selected voxels are read out.
     blurred = ndimage.gaussian_filter(sampled.astype(np.float32), sigma=sigma, mode='nearest')
     eligible_values = blurred[eligible]
+    eligible_raw = sampled[eligible] if region == REGION_SURROUNDING_TISSUE else None
     del blurred, eligible
     values = eligible_values[selected].astype(np.float64)
     if values.size < MIN_SAMPLES:
@@ -270,12 +363,17 @@ def estimate_background_peak(data, threshold, region=DEFAULT_REGION):
         air_values = eligible_values[air_selected].astype(np.float64)
         if air_values.size >= MIN_SAMPLES:
             air_peak, _, _ = histogram_peak(air_values)
-            air_spread = peak_spread(air_values, air_peak)
+            clipped_low, clipped_high = range_pile_up(eligible_raw[air_selected])
+            air_spread, spread_rule = peak_spread(
+                air_values, air_peak, clipped_low=clipped_low, clipped_high=clipped_high)
             half_width = float(AIR_EXCLUSION_SIGMAS * air_spread)
             tissue_values = values[np.abs(values - air_peak) > half_width]
             info.update({
                 'air_peak': float(air_peak),
                 'air_spread': float(air_spread),
+                'air_spread_rule': spread_rule,
+                'air_clipped_low': clipped_low,
+                'air_clipped_high': clipped_high,
                 'air_exclusion_half_width': half_width,
                 'air_excluded_voxels': int(values.size - tissue_values.size),
             })
@@ -291,7 +389,7 @@ def estimate_background_peak(data, threshold, region=DEFAULT_REGION):
         else:
             info['air_exclusion'] = f'skipped: only {air_values.size} far-band voxels to measure air'
         del air_values
-    del eligible_values
+    del eligible_values, eligible_raw
 
     # 8. Histogram peak with parabolic refinement.
     peak, bin_width, n_bins = histogram_peak(values)

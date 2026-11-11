@@ -39,6 +39,8 @@ import matplotlib.pyplot as plt
 from skimage.filters import threshold_otsu, butterworth, median, threshold_li
 import skimage.morphology
 from scipy.signal import convolve
+from .niftiVoxels import nifti_voxels  # stored-dtype voxel loads without get_fdata()'s float64 copy (same values)
+from .lowMemoryVolumeOps import first_true_indices, homogenize_unsigned_background, label_sizes  # identical lower-memory volume steps (tests: test_low_memory_volume_ops)
 from .ALPACA import ALPACA
 from .batch_flag_filter import load_flagged_subject_names, apply_flag_filter, normalize_flag_filter_value
 from .linkedScans import filter_out_linked_children, get_same_shape_siblings, full_res_nifti_path, has_link_partners
@@ -457,13 +459,15 @@ class CleanupMeshView(APIView):
         print("background_value: ", background_value)
 
         # To identify and remove small disconnected components, use threshold to identify the islands, keep the largest island
-        islands = (nifti_data_gaussian > threshold).astype(bool)
+        # (the comparison is already boolean; the former .astype(bool) only made a second copy)
+        islands = nifti_data_gaussian > threshold
         
         # Label connected components
         labeled_islands, num_features = ndimage.label(islands)
         
-        # Find the sizes of each component
-        sizes = np.bincount(labeled_islands.ravel())
+        # Find the sizes of each component (chunked bincount: same counts without an int64
+        # copy of the whole label volume, see lowMemoryVolumeOps.label_sizes)
+        sizes = label_sizes(labeled_islands, num_features)
                
         # Exclude the background (size of 0)
         sizes = sizes[1:]  # Skip the first element which corresponds to the background
@@ -513,17 +517,17 @@ class CleanupMeshView(APIView):
                 reason = 'components_removed'
                 largest_island = sizes.argmax() + 1  # +1 to account for background
                 print("Largest island label: ", largest_island)
-                labels_without_largest = np.where(
-                    (labeled_islands != largest_island) & (labeled_islands > 0),
-                    labeled_islands,
-                    0,
-                )
-                islands_mask = labels_without_largest > 0
+                # Every voxel of every island except the largest one. Same mask as the former
+                # np.where(labels != largest & labels > 0, labels, 0) > 0 (labels > 0 is exactly
+                # `islands`), without its full int32 temporary (4 bytes per voxel).
+                islands_mask = islands & (labeled_islands != largest_island)
 
             if cleanup_performed and islands_mask is not None:
                 n_to_remove = int(islands_mask.sum())
                 print(f"[clean_mesh] islands_mask.sum() = {n_to_remove} (voxels to set to background)")
-                sample_inds = np.argwhere(islands_mask)
+                # Only the first three are printed; np.argwhere of the whole mask cost 24 bytes
+                # per removed voxel. Same three voxels (C order), see lowMemoryVolumeOps.first_true_indices.
+                sample_inds = first_true_indices(islands_mask, 3)
                 if len(sample_inds) > 0:
                     for idx in sample_inds[:3]:
                         i, j, k = tuple(idx)
@@ -631,7 +635,7 @@ class CleanupMeshView(APIView):
         steps(1, 'Loading scan')
         nifti_img = nib.load(nifti_path)
         original_dtype = nifti_img.get_data_dtype()
-        nifti_data = nifti_img.get_fdata().astype(original_dtype)
+        nifti_data = nifti_voxels(nifti_img, original_dtype)
 
         # Clean the resulting mesh using the class CleanMesh and save it in the variable cleaned_data
         steps(2, 'Removing disconnected islands')
@@ -691,8 +695,10 @@ class CleanupMeshView(APIView):
         output_path = os.path.join(directory, sub_path, f"{filename}_edit_{edit_number}_cleaned.nii.gz")
         atomic_nib_save(new_nifti, output_path)
 
-        reloaded = nib.load(output_path).get_fdata()
+        # Debug check of the saved file, read in its stored dtype (was a float64 get_fdata()).
+        reloaded = nifti_voxels(nib.load(output_path))
         above_reload = int((reloaded > threshold).sum())
+        reloaded = None
         print(f"[post] after save: reloaded voxels above threshold = {above_reload}, path = {output_path}")
 
         # Removal mask (exactly which voxels were cleared) for linked siblings to replay.
@@ -770,7 +776,7 @@ class CleanupMeshView(APIView):
                 mask_img = load_nifti_readonly(dst_mask_full)
                 mask_dtype = mask_img.get_data_dtype()
                 # Round before astype to avoid truncating floats
-                mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                mask_arr = nifti_voxels(mask_img, mask_dtype, round_values=True)
                 slices = [slice(None, None, resolution_factor) for _ in range(3)]
                 lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
                 atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
@@ -903,7 +909,7 @@ class ApplyCleanupRemovalMaskView(APIView):
         
         # Load removal mask (read in place: the source file is never renamed)
         mask_img = load_nifti_readonly(removal_mask_path)
-        removal_mask = np.round(mask_img.get_fdata()).astype(bool)
+        removal_mask = nifti_voxels(mask_img, bool, round_values=True)
         mask_affine = mask_img.affine
 
         source_cleanup_settings = None
@@ -997,7 +1003,7 @@ class ApplyCleanupRemovalMaskView(APIView):
         # Load target nifti
         target_img = nib.load(nifti_path)
         target_dtype = target_img.get_data_dtype()
-        target_data = target_img.get_fdata().astype(target_dtype)
+        target_data = nifti_voxels(target_img, target_dtype)
         
         # Check shape match
         if target_data.shape != removal_mask.shape:
@@ -1145,6 +1151,7 @@ class HomogenizeBackgroundView(APIView):
         extracted_dir = os.path.join(directory, "extracted")
         scan_names = []
         skipped_preserved_meshes = []
+        skipped_faulty = []
         for scan_name in os.listdir(extracted_dir):
             if scan_name == "project_settings.json" or not os.path.isdir(os.path.join(extracted_dir, scan_name)):
                 continue
@@ -1154,13 +1161,14 @@ class HomogenizeBackgroundView(APIView):
                 print(f"Skipping {scan_name}: could not read metadata ({exc})")
                 continue
             if metadata.get('faulty', False):
+                skipped_faulty.append(scan_name)
                 continue
             if self._is_preserved_mesh_metadata(metadata):
                 skipped_preserved_meshes.append(scan_name)
                 continue
             scan_names.append(scan_name)
 
-        if not scan_names:
+        if not scan_names and not skipped_faulty:
             return Response(
                 {
                     "status": "error",
@@ -1169,39 +1177,71 @@ class HomogenizeBackgroundView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Exclude scans that are already backfixed or have elastic registration in any edit
-        scan_names_to_remove = []
+        # Exclude scans that are already backfixed or have elastic registration in any edit.
+        # A background offset is never stacked on top of an earlier one: the batch run
+        # would subtract a second shift from data already shifted. Each reason is kept
+        # separately so the user is told exactly why scans were left out.
+        skipped_backfixed = []
+        skipped_elastic = []
 
         for scan_name in scan_names:
             # Find all edits for this scan
             edit_files = glob.glob(os.path.join(directory, "extracted", scan_name, f"{scan_name}_edit_*_*.nii.gz"))
-            # If any edit file is backfixed, mark for removal
+            # If any edit file is backfixed, skip it (an offset was already applied)
             if any("_backfixed" in os.path.basename(f) for f in edit_files):
-                scan_names_to_remove.append(scan_name)
+                skipped_backfixed.append(scan_name)
                 continue  # Already marked, do not double-count elastics
 
-            # Remove if it has elastic registration in any edit
+            # Skip if it has elastic registration in any edit
             if has_elastic_registration(scan_name, directory):
-                scan_names_to_remove.append(scan_name)
+                skipped_elastic.append(scan_name)
 
-        # Remove marked scan names from scan_names
-        for scan_name in scan_names_to_remove:
-            if scan_name in scan_names:
-                scan_names.remove(scan_name)
-            else:
-                print(f"Scan {scan_name} not found in scan_names")
+        excluded = set(skipped_backfixed) | set(skipped_elastic)
+        scan_names = [name for name in scan_names if name not in excluded]
 
         # Order scan names alphabetically
         scan_names.sort()
 
         flagged_set = load_flagged_subject_names(directory)
+        before_filters = len(scan_names)
         scan_names = apply_flag_filter(scan_names, flagged_set, flag_filter)
+        after_flag_filter = len(scan_names)
         scan_names = filter_out_linked_children(directory, scan_names)
+        skipped_by_flag_filter = before_filters - after_flag_filter
+        skipped_linked_children = after_flag_filter - len(scan_names)
+
+        skip_summary = self._skip_summary(
+            backfixed=len(skipped_backfixed),
+            elastic=len(skipped_elastic),
+            faulty=len(skipped_faulty),
+            flag_filter=skipped_by_flag_filter,
+            linked=skipped_linked_children,
+            meshes=len(skipped_preserved_meshes),
+        )
+        if skipped_backfixed:
+            print(f"Skipping scans that already have a background offset (backfixed edit): {skipped_backfixed}")
+        if skipped_elastic:
+            print(f"Skipping elastic-completed scans: {skipped_elastic}")
+
         if not scan_names:
+            # Kept short to fit the snackbar; the full lists are in "skipped".
+            message = "No scan changed."
+            if skip_summary:
+                message += " Skipped: " + skip_summary + "."
+            if skipped_backfixed:
+                message += " An offset is never applied twice: delete the backfixed edit to redo it."
             return Response(
                 {
                     "status": "error",
-                    "message": "No eligible voxel-based scans were found for Set Background Value. Preserved PLY meshes are skipped.",
+                    "message": message,
+                    "skipped": {
+                        "already_backfixed": skipped_backfixed,
+                        "elastic": skipped_elastic,
+                        "faulty": skipped_faulty,
+                        "flag_filter": skipped_by_flag_filter,
+                        "linked_children": skipped_linked_children,
+                        "preserved_meshes": skipped_preserved_meshes,
+                    },
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -1210,9 +1250,22 @@ class HomogenizeBackgroundView(APIView):
 
         optimal_background = None
         scan_count = len(scan_names)
+        # Scans whose offset came out as 0: subtracting 0 changes no voxel, so no
+        # backfixed edit is written and the scan stays eligible for a later run.
+        unchanged_zero_shift = []
+        corrected_scans = []
+        failed_scans = []
 
         if background_value is not None:
             optimal_background = np.array(background_value, dtype=int)
+            if int(optimal_background) == 0:
+                return Response(
+                    {
+                        "status": "error",
+                        "message": "A value of 0 changes no voxel; no scan was modified.",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # One pass: each scan is loaded once, its background estimated (auto mode) and
         # shifted right away. No estimate depends on another scan, so nothing is gained
@@ -1260,7 +1313,7 @@ class HomogenizeBackgroundView(APIView):
                     time_start = time.time()
                     nifti_img = nib.load(scan_path)
                     original_dtype = nifti_img.get_data_dtype()  # Get the original data type
-                    scan_data = nifti_img.get_fdata().astype(original_dtype)  # keep original dtype
+                    scan_data = nifti_voxels(nifti_img, original_dtype)  # keep original dtype
                     time_end = time.time()
                     print(f"Time taken to load {scan_name} scan data: {time_end - time_start} seconds")
                     print(f"Original data type: {original_dtype}")
@@ -1282,6 +1335,13 @@ class HomogenizeBackgroundView(APIView):
                         if scan_background is None:
                             print(f"Skipping {scan_name}: no background value was estimated")
                             continue
+
+                    if int(scan_background) == 0:
+                        # Subtracting 0 is the identity: write no edit and leave the
+                        # metadata untouched, so the scan is not marked as corrected.
+                        print(f"{scan_name}: background offset is 0, scan left unchanged (no backfixed edit written)")
+                        unchanged_zero_shift.append(scan_name)
+                        continue
 
                     # Apply homogenization
                     time_start = time.time()
@@ -1389,7 +1449,7 @@ class HomogenizeBackgroundView(APIView):
                             mask_img = load_nifti_readonly(dst_mask_full)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
-                            mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                            mask_arr = nifti_voxels(mask_img, mask_dtype, round_values=True)
                             slices = [slice(None, None, resolution_factor) for _ in range(3)]
                             lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
                             atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
@@ -1424,9 +1484,11 @@ class HomogenizeBackgroundView(APIView):
                         print(f"  Error handling paired landmark files (backfixed): {le}")
 
                     cleanup_memory()
+                    corrected_scans.append(scan_name)
 
                 
             except Exception as e:
+                failed_scans.append(scan_name)
                 print(f"Error homogenizing {scan_name}: {str(e)}")
 
         # Send progress update
@@ -1445,7 +1507,48 @@ class HomogenizeBackgroundView(APIView):
                 }
             )
         
-        return Response({"status": "success", "message": "Background homogenization completed"})
+        # Tell the user exactly what happened to every scan (corrected, unchanged, skipped).
+        # Kept short to fit the snackbar; the full lists are returned alongside.
+        message = f"Offset applied to {len(corrected_scans)} of {scan_count} scans."
+        if unchanged_zero_shift:
+            message += f" {len(unchanged_zero_shift)} unchanged (offset 0)."
+        if failed_scans:
+            message += f" {len(failed_scans)} failed (see terminal)."
+        if skip_summary:
+            message += " Skipped: " + skip_summary + "."
+        return Response({
+            "status": "success",
+            "message": message,
+            "corrected": corrected_scans,
+            "unchanged_zero_shift": unchanged_zero_shift,
+            "failed": failed_scans,
+            "skipped": {
+                "already_backfixed": skipped_backfixed,
+                "elastic": skipped_elastic,
+                "faulty": skipped_faulty,
+                "flag_filter": skipped_by_flag_filter,
+                "linked_children": skipped_linked_children,
+                "preserved_meshes": skipped_preserved_meshes,
+            },
+        })
+
+    @staticmethod
+    def _skip_summary(backfixed=0, elastic=0, faulty=0, flag_filter=0, linked=0, meshes=0):
+        """Human-readable list of why scans were left out of a batch run."""
+        parts = []
+        if backfixed:
+            parts.append(f"{backfixed} already corrected")
+        if elastic:
+            parts.append(f"{elastic} elastic")
+        if faulty:
+            parts.append(f"{faulty} faulty")
+        if flag_filter:
+            parts.append(f"{flag_filter} flag filter")
+        if linked:
+            parts.append(f"{linked} linked")
+        if meshes:
+            parts.append(f"{meshes} PLY meshes")
+        return ", ".join(parts)
     
     def _get_background_value(self, data, current_threshold, region=None):
         """Automatic background offset for one scan.
@@ -1536,7 +1639,16 @@ class HomogenizeBackgroundView(APIView):
         original_dtype = data.dtype
         low_bound = np.iinfo(original_dtype).min
         high_bound = np.iinfo(original_dtype).max
-        
+
+        # Unsigned scans with a target inside the dtype range: max(data, t) - t in the stored
+        # dtype gives exactly clip(data - t, min, max) (the upper bound cannot be reached and
+        # the subtraction cannot wrap), without the int32 copies (~12 bytes per voxel).
+        # Everything else (signed scans, negative or out-of-range targets) keeps the int32 path.
+        homogenized = homogenize_unsigned_background(data, target_background)
+        if homogenized is not None:
+            print("done with background subtraction")
+            return homogenized
+
         # Subtract background value more efficiently
         data = data.astype(np.int32) - int(target_background)
         data = np.clip(data, low_bound, high_bound).astype(np.int32)
@@ -1726,7 +1838,7 @@ class ApplyThresholdView(APIView):
                 
                 reference_img = nib.load(reference_path)
                 reference_original_dtype = reference_img.get_data_dtype()
-                reference_data = reference_img.get_fdata().astype(reference_original_dtype)
+                reference_data = nifti_voxels(reference_img, reference_original_dtype)
                 reference_data = gaussian_filter(reference_data, sigma=1.0)
                 
                 # Get reference threshold from metadata, falling back to Otsu if absent.
@@ -1788,7 +1900,7 @@ class ApplyThresholdView(APIView):
                             # Load the scan data
                             nifti_img = nib.load(scan_path)
                             scan_original_dtype = nifti_img.get_data_dtype()
-                            scan_data = nifti_img.get_fdata().astype(scan_original_dtype)
+                            scan_data = nifti_voxels(nifti_img, scan_original_dtype)
                             scan_data = gaussian_filter(scan_data, sigma=1.0)
                     
 
@@ -2018,12 +2130,12 @@ class RemoveBackgroundView(APIView):
             nifti_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
         
         # Load removal mask (read in place: the source file is never renamed)
-        removal_mask = np.round(load_nifti_readonly(removal_mask_path).get_fdata()).astype(bool)
+        removal_mask = nifti_voxels(load_nifti_readonly(removal_mask_path), bool, round_values=True)
         
         # Load sibling nifti
         sibling_img = nib.load(nifti_path)
         sibling_dtype = sibling_img.get_data_dtype()
-        sibling_data = sibling_img.get_fdata().astype(sibling_dtype)
+        sibling_data = nifti_voxels(sibling_img, sibling_dtype)
         
         # Check shape match
         if sibling_data.shape != removal_mask.shape:
@@ -2233,7 +2345,7 @@ class RemoveBackgroundView(APIView):
                     # Load the scan data
                     nifti_img = nib.load(nifti_path)
                     original_dtype = nifti_img.get_data_dtype()
-                    nifti_data = nifti_img.get_fdata().astype(original_dtype)
+                    nifti_data = nifti_voxels(nifti_img, original_dtype)
                 
                     # Compute removal mask BEFORE modifying nifti_data (True where background will be removed)
                     removal_mask = (nifti_data < threshold)
@@ -2303,7 +2415,7 @@ class RemoveBackgroundView(APIView):
                             mask_img = load_nifti_readonly(dst_mask_full)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
-                            mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                            mask_arr = nifti_voxels(mask_img, mask_dtype, round_values=True)
                             slices = [slice(None, None, resolution_factor) for _ in range(3)]
                             lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
                             atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
@@ -2455,7 +2567,7 @@ class MatchHistogramView(APIView):
                     scan_img = nib.load(scan_path)
                     scan_affine = scan_img.affine
                     scan_original_dtype = scan_img.get_data_dtype()
-                    scan_data = scan_img.get_fdata().astype(scan_original_dtype)
+                    scan_data = nifti_voxels(scan_img, scan_original_dtype)
 
                     # Get the scan threshold from metadata
                     with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
@@ -2533,7 +2645,7 @@ class MatchHistogramView(APIView):
                     scan_img = nib.load(scan_path)
                     scan_affine = scan_img.affine
                     scan_original_dtype = scan_img.get_data_dtype()
-                    scan_data = scan_img.get_fdata().astype(scan_original_dtype)
+                    scan_data = nifti_voxels(scan_img, scan_original_dtype)
                 
                     # Get scan threshold
                     with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
@@ -2634,7 +2746,7 @@ class MatchHistogramView(APIView):
                     scan_img = nib.load(scan_path)
                     scan_affine = scan_img.affine
                     scan_original_dtype = scan_img.get_data_dtype()
-                    scan_data = scan_img.get_fdata().astype(scan_original_dtype)
+                    scan_data = nifti_voxels(scan_img, scan_original_dtype)
                 
                     # Get scan threshold
                     with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
@@ -2736,7 +2848,7 @@ class MatchHistogramView(APIView):
                     scan_img = nib.load(scan_path)
                     scan_affine = scan_img.affine
                     scan_original_dtype = scan_img.get_data_dtype()
-                    scan_data = scan_img.get_fdata().astype(scan_original_dtype)
+                    scan_data = nifti_voxels(scan_img, scan_original_dtype)
 
                     with open(os.path.join(directory, "extracted", scan_name, f"{scan_name}.json"), 'r') as jf:
                         scan_metadata = json.load(jf)
@@ -2900,7 +3012,7 @@ class MatchHistogramView(APIView):
                 mask_img = load_nifti_readonly(dst_mask_full)
                 mask_dtype = mask_img.get_data_dtype()
                 # Round before astype to avoid truncating floats
-                mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                mask_arr = nifti_voxels(mask_img, mask_dtype, round_values=True)
                 slices = [slice(None, None, resolution_factor) for _ in range(3)]
                 lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
                 atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
@@ -3062,7 +3174,7 @@ class MatchHistogramView(APIView):
             print(f"Using reference file: {reference_file}")
             reference_img = nib.load(reference_path)
             reference_original_dtype = reference_img.get_data_dtype()
-            reference_data = reference_img.get_fdata().astype(reference_original_dtype)
+            reference_data = nifti_voxels(reference_img, reference_original_dtype)
             
             reference_metadata['filename'] = reference_file
             reference_threshold = reference_metadata['threshold']
@@ -3178,12 +3290,12 @@ class BatchCleanupMeshView(APIView):
             nifti_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
         
         # Load removal mask (read in place: the source file is never renamed)
-        removal_mask = np.round(load_nifti_readonly(removal_mask_path).get_fdata()).astype(bool)
+        removal_mask = nifti_voxels(load_nifti_readonly(removal_mask_path), bool, round_values=True)
         
         # Load sibling nifti
         sibling_img = nib.load(nifti_path)
         sibling_dtype = sibling_img.get_data_dtype()
-        sibling_data = sibling_img.get_fdata().astype(sibling_dtype)
+        sibling_data = nifti_voxels(sibling_img, sibling_dtype)
         
         # Check shape match
         if sibling_data.shape != removal_mask.shape:
@@ -3479,7 +3591,7 @@ class BatchCleanupMeshView(APIView):
                     # Load the nifti file
                     nifti_img = nib.load(nifti_path)
                     original_dtype = nifti_img.get_data_dtype()
-                    nifti_data = nifti_img.get_fdata().astype(original_dtype)
+                    nifti_data = nifti_voxels(nifti_img, original_dtype)
                 
                     # Clean the mesh and check if cleanup was actually performed
                     cleaned_data, cleanup_performed, removal_mask, cleanup_outcome = cleanup_mesh_view.clean_mesh(
@@ -3623,7 +3735,7 @@ class BatchCleanupMeshView(APIView):
                             mask_img = load_nifti_readonly(dst_mask_full)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
-                            mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                            mask_arr = nifti_voxels(mask_img, mask_dtype, round_values=True)
                             slices = [slice(None, None, resolution_factor) for _ in range(3)]
                             lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
                             atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
@@ -3868,15 +3980,17 @@ class N4BiasCorrectionView(APIView):
                     # Load the nifti file
                     nifti_img = nib.load(nifti_path)
                     original_dtype = nifti_img.get_data_dtype()
-                    nifti_data = nifti_img.get_fdata().astype(np.float32)  # Convert to float32 for ANTs
-                
+                    # float32 for ANTs, passed without keeping a name so correct() can release
+                    # it once ANTs holds its own copy (same values, 4 bytes per voxel less).
                     # Apply N4 bias correction
-                    corrected_data = self.correct(nifti_data, params)
+                    corrected_data = self.correct(nifti_voxels(nifti_img, np.float32), params)
                     print(f"Corrected data shape: {corrected_data.shape}")
                 
                 
                     # Convert back to original data type
-                    corrected_data = np.clip(corrected_data, np.iinfo(original_dtype).min, np.iinfo(original_dtype).max).astype(original_dtype)
+                    # In-place clip: same values as np.clip(...) into a new float32 array.
+                    np.clip(corrected_data, np.iinfo(original_dtype).min, np.iinfo(original_dtype).max, out=corrected_data)
+                    corrected_data = corrected_data.astype(original_dtype)
                 
                     # Create new nifti image with corrected data
                     new_nifti = nib.Nifti1Image(corrected_data, nifti_img.affine)
@@ -3950,7 +4064,7 @@ class N4BiasCorrectionView(APIView):
                             mask_img = load_nifti_readonly(dst_mask_full)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
-                            mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                            mask_arr = nifti_voxels(mask_img, mask_dtype, round_values=True)
                             slices = [slice(None, None, resolution_factor) for _ in range(3)]
                             lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
                             atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)
@@ -4013,6 +4127,8 @@ class N4BiasCorrectionView(APIView):
         convergence_tol = 10 ** (-convergence_tol_exp)
 
         image_ants = ants.from_numpy(image_array)
+        # ANTs copied the voxels; drop our float32 array (the caller keeps no reference).
+        image_array = None
         corrected_ants = ants.n4_bias_field_correction(
             image_ants,
             shrink_factor=shrink_factor,
@@ -4020,6 +4136,7 @@ class N4BiasCorrectionView(APIView):
             spline_param=spline_param,
             verbose=True           
         )
+        image_ants = None
         corrected_array = corrected_ants.numpy()
         return corrected_array
 
@@ -4079,7 +4196,7 @@ class SaveBackgroundValuesView(APIView):
                     # Load the scan data
                     nifti_img = nib.load(scan_path)
                     original_dtype = nifti_img.get_data_dtype()
-                    scan_data = nifti_img.get_fdata().astype(original_dtype)
+                    scan_data = nifti_voxels(nifti_img, original_dtype)
                 
                     # Apply background correction using the HomogenizeBackgroundView method
                     background_value = float(scan_values['background'])
@@ -4173,7 +4290,7 @@ class SaveBackgroundValuesView(APIView):
                             mask_img = load_nifti_readonly(dst_mask_full)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
-                            mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                            mask_arr = nifti_voxels(mask_img, mask_dtype, round_values=True)
                             slices = [slice(None, None, resolution_factor) for _ in range(3)]
                             lossy_mask = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype, copy=False)
                             atomic_nib_save(nib.Nifti1Image(lossy_mask, lossy_affine), dst_mask_lossy)

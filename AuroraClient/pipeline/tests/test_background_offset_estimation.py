@@ -10,6 +10,8 @@ from pipeline.backgroundOffsetEstimation import (
     choose_sampling_stride,
     estimate_background_peak,
     normalize_region,
+    peak_spread,
+    range_pile_up,
 )
 
 
@@ -89,6 +91,54 @@ class BackgroundOffsetEstimationTests(unittest.TestCase):
         # Surrounding air is unaffected by the exclusion step.
         air, _ = estimate_background_peak(volume, 15000, region=REGION_OUTSIDE)
         self.assertLess(abs(air - 1000), 40)
+
+    def test_tissue_shell_next_to_specimen_deep_in_large_body(self):
+        # Bone deep inside a body that sits in low-density packing (paper,
+        # foam) inside a holder, as in SkyScan whole-mouse CT (F20G1F08): the
+        # median-distance near band is mostly packing (its volume grows with
+        # distance) and packing is not the air peak that air exclusion
+        # removes, so the pooled band peaked on packing. The innermost shell
+        # next to the specimen holds the tissue.
+        rng = np.random.default_rng(3)
+        shape = (128, 128, 128)
+        zz, yy, xx = np.indices(shape, dtype=np.float32)
+        r = np.sqrt((zz - 64) ** 2 + (yy - 64) ** 2 + (xx - 64) ** 2)
+        volume = np.full(shape, 1000.0, dtype=np.float32)
+        volume[r <= 50] = 2500.0
+        volume[r <= 24] = 8000.0
+        volume[r <= 6] = 20000.0
+        volume += rng.normal(0.0, 300.0, size=shape).astype(np.float32)
+        volume = np.clip(volume, 0, 65535).astype(np.uint16)
+        tissue, info = estimate_background_peak(volume, 15000, region=REGION_SURROUNDING_TISSUE)
+        self.assertLess(abs(tissue - 8000), 150, info)
+        self.assertLess(
+            info['tissue_shell_outer_sampled_voxels'],
+            info['split_distance_sampled_voxels'],
+        )
+
+    def test_air_spread_on_clipped_range(self):
+        # 8-bit air clipped at 0: the side of the air peak facing 0 is cut
+        # off and looks narrow, so the narrower-side rule underestimates the
+        # spread; the half-maximum width of the other side does not, even
+        # with tissue in that side's tail.
+        rng = np.random.default_rng(4)
+        air = np.clip(rng.normal(0.8, 1.0, 400_000), 0.0, None)
+        tissue = rng.normal(8.0, 1.5, 100_000)
+        values = np.concatenate([air, tissue])
+        low, high = range_pile_up(values)
+        self.assertTrue(low)
+        self.assertFalse(high)
+        # Spread around the known air mode (the estimator measures it on
+        # blurred values, where the pile-up at 0 is smeared out).
+        peak = 0.8
+        naive, rule = peak_spread(values, peak)
+        self.assertEqual(rule, 'narrower_side_rms')
+        spread, rule = peak_spread(values, peak, clipped_low=low, clipped_high=high)
+        self.assertEqual(rule, 'half_max_upper')
+        self.assertLess(abs(spread - 1.0), 0.15)
+        self.assertLess(naive, 0.7)
+        # Unclipped values keep the narrower-side rule.
+        self.assertEqual(range_pile_up(rng.normal(100.0, 5.0, 10_000)), (False, False))
 
     def test_constant_padding_is_ignored(self):
         volume = _phantom(pad=True)

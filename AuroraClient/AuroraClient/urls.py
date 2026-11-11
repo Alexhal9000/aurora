@@ -56,6 +56,7 @@ from pipeline.engineCancel import EngineCancelView
 from pipeline.staticMediaViews import StaticMediaView
 from pipeline.aiModels.foundation_views import (
     FoundationModelCancelView,
+    FoundationModelDeleteView,
     FoundationModelDownloadView,
     FoundationModelStatusView,
 )
@@ -160,12 +161,14 @@ urlpatterns = [
     path('rebalance-landmarks-along-path/', RebalanceLandmarksAlongPathView.as_view(), name='rebalance_landmarks_along_path'),
     path('report-bad-file/', ReportBadFileView.as_view(), name='report_bad_file'),
     path('flag-subjects/', FlagSubjectsView.as_view(), name='flag_subjects'),
+    path('faulty-subjects/', FaultySubjectsView.as_view(), name='faulty_subjects'),
     path('link-scans/', LinkScansView.as_view(), name='link_scans'),
     path('copy-mask-to-reference/', CopyMaskToReferenceView.as_view(), name='copy_mask_to_reference'),
     path('get-ai-models/', GetAIModelsView.as_view(), name='get_ai_models'),
     path('ai-models/foundation/status/', FoundationModelStatusView.as_view(), name='ai_models_foundation_status'),
     path('ai-models/foundation/download/', FoundationModelDownloadView.as_view(), name='ai_models_foundation_download'),
     path('ai-models/foundation/cancel/', FoundationModelCancelView.as_view(), name='ai_models_foundation_cancel'),
+    path('ai-models/foundation/delete/', FoundationModelDeleteView.as_view(), name='ai_models_foundation_delete'),
     path('run-ai-segmentation/', RunAISegmentationView.as_view(), name='run_ai_segmentation'),
     path('ai-finetune/discover/', FineTuneDiscoverView.as_view(), name='ai_finetune_discover'),
     path('ai-finetune/validate/', FineTuneValidateView.as_view(), name='ai_finetune_validate'),
@@ -194,6 +197,7 @@ urlpatterns = [
     path('display-environment/', DisplayEnvironmentView.as_view(), name='display_environment'),
     path('make-atlas-reference/', MakeAtlasReferenceView.as_view(), name='make_atlas_reference'),
     path('redo-elastic-to-reference-atlas/', RedoElasticToReferenceAtlasView.as_view(), name='redo_elastic_to_reference_atlas'),
+    path('reference-grid-check/', ReferenceGridCheckView.as_view(), name='reference_grid_check'),
     path('get-all-subjects-mesh/', GetAllSubjectsMeshView.as_view(), name='get_all_subjects_mesh'),
     path('get-version/', GetVersionView.as_view(), name='get_version'),
     path('preview-denoise/', PreviewDenoiseView.as_view(), name='preview_denoise'),

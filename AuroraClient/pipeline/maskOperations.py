@@ -30,6 +30,7 @@ from asgiref.sync import async_to_sync
 
 import matplotlib
 # Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .niftiVoxels import nifti_voxels  # stored-dtype voxel loads without get_fdata()'s float64 copy (same values)
 from .crashSafety import (
     crash_safe_view,
     request_subjects,
@@ -176,6 +177,36 @@ def _dilate_binary_mask(mask_bool, iterations):
     if not np.any(m):
         return m
     return binary_dilation(m, iterations=int(iterations))
+
+
+def _masked_voxels_for_save(masked_data, source_img):
+    """Masked voxels converted back to the source scan's stored dtype, ready to save.
+
+    The masking tools load the scan with get_fdata() (float64) and zero voxels by indexing
+    or by multiplying with a 0/1 mask, then save the result with the source header. Saving
+    float64 data under an integer header (uint8, uint16, int16) makes nibabel rescale the
+    values to fill the whole integer range and write that factor as scl_slope. Unless the
+    scan's brightest voxel happens to be the dtype maximum, the slope is not 1 (e.g. 0.137
+    for a uint16 scan peaking at 9000), so the stored numbers no longer equal the voxels.
+    On reload, `get_fdata().astype(dtype)` then truncates values like 4199.9997 to 4199:
+    about half the voxels came back one grey level lower, the slope was carried into every
+    later edit, and the scaled file could not take nifti_voxels' direct (low-memory) load.
+
+    For an unscaled integer source, every value in `masked_data` is either an original
+    voxel (a whole number get_fdata read exactly) or 0, so casting back to the stored dtype
+    is exact and the saved file holds the voxels unchanged, with no scl_slope.
+
+    Anything else keeps the old behaviour: float scans (nibabel stores float data as is)
+    and sources that already carried a real scl_slope/scl_inter (their float values are
+    not whole numbers, so nibabel still has to choose a scale).
+    """
+    stored = np.dtype(source_img.get_data_dtype())
+    if stored.kind not in 'iu':
+        return masked_data
+    dataobj = source_img.dataobj
+    if getattr(dataobj, 'slope', 1.0) != 1.0 or getattr(dataobj, 'inter', 0.0) != 0.0:
+        return masked_data
+    return np.asarray(masked_data).astype(stored, copy=False)
 
 
 def _resize_mask_between_lossy_and_full(arr, target_shape):
@@ -1279,7 +1310,7 @@ def _backup_and_apply_mask_to_elastic(
 
             mask_temp = mask_path.replace('.nii.mask.gz', '_mask.nii.gz')
             mask_img = load_nifti_readonly(mask_path)
-            mask_arr = np.round(mask_img.get_fdata()).astype(np.uint8)
+            mask_arr = nifti_voxels(mask_img, np.uint8, round_values=True)
 
             combined = np.zeros(mask_arr.shape, dtype=bool)
             for label in labels:
@@ -1300,7 +1331,7 @@ def _backup_and_apply_mask_to_elastic(
                 edata[~combined] = 0
             else:
                 edata[combined] = 0
-            atomic_nib_save(nib.Nifti1Image(edata, ei.affine, header=ei.header), img_path)
+            atomic_nib_save(nib.Nifti1Image(_masked_voxels_for_save(edata, ei), ei.affine, header=ei.header), img_path)
             print(f"Backed up and masked elastic ({stem})")
         except Exception as exc:
             print(f"Warning: could not backup/mask elastic ({stem}): {exc}")
@@ -1514,7 +1545,7 @@ class ApplyMaskToImageView(APIView):
             
             mask_img = load_nifti_readonly(full_mask_path)
             # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-            mask_data_3d = np.round(mask_img.get_fdata()).astype(np.uint8)
+            mask_data_3d = nifti_voxels(mask_img, np.uint8, round_values=True)
             
             # ===== LOAD AND APPLY MASK TO FULL RESOLUTION IMAGE =====
             full_image_filename = f"{full_edit}.nii.gz"
@@ -1559,7 +1590,7 @@ class ApplyMaskToImageView(APIView):
             full_output_path = os.path.join(target_subject_dir, full_output_filename)
 
             full_masked_img = nib.Nifti1Image(
-                masked_full_data, 
+                _masked_voxels_for_save(masked_full_data, full_image_img),  # stored dtype, no scl_slope
                 full_image_img.affine, 
                 header=full_image_img.header
             )
@@ -1887,7 +1918,7 @@ class BatchApplyMaskToScansView(APIView):
                     
                         mask_img = load_nifti_readonly(mask_path)
                         # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-                        mask_data = np.round(mask_img.get_fdata()).astype(np.uint8)
+                        mask_data = nifti_voxels(mask_img, np.uint8, round_values=True)
                     
                         # Check if the mask contains the specified label
                         unique_labels = np.unique(mask_data)
@@ -1942,7 +1973,7 @@ class BatchApplyMaskToScansView(APIView):
                         output_path = os.path.join(target_subject_dir, output_filename)
                     
                         masked_img = nib.Nifti1Image(
-                            masked_image_data,
+                            _masked_voxels_for_save(masked_image_data, image_img),  # stored dtype, no scl_slope
                             image_img.affine,
                             header=image_img.header
                         )
@@ -2022,7 +2053,7 @@ class BatchApplyMaskToScansView(APIView):
                                             _e_mask_temp = _e_mask_src.replace('.nii.mask.gz', '_mask.nii.gz')
                                             _em = load_nifti_readonly(_e_mask_src)
                                             # Round before astype to avoid truncating floats
-                                            _emdata = np.round(_em.get_fdata()).astype(np.uint8)
+                                            _emdata = nifti_voxels(_em, np.uint8, round_values=True)
                                             if label in np.unique(_emdata):
                                                 _e_lmask = (_emdata == label).astype(np.uint8)
                                                 if dilation > 0:
@@ -2031,7 +2062,7 @@ class BatchApplyMaskToScansView(APIView):
                                                     ).astype(np.uint8)
                                                 _edata = _edata * _e_lmask
                                         _e_img_dst = os.path.join(target_subject_dir, f"{subject_name}_edit_1_elastic.nii.gz")
-                                        atomic_nib_save(nib.Nifti1Image(_edata, _ei.affine, header=_ei.header), _e_img_dst)
+                                        atomic_nib_save(nib.Nifti1Image(_masked_voxels_for_save(_edata, _ei), _ei.affine, header=_ei.header), _e_img_dst)
                                         print(f"Saved masked elastic copy to mask folder: {subject_name}")
                                     except Exception as _ce:
                                         print(f"Warning: could not save elastic copy for {subject_name}: {_ce}")
@@ -2104,7 +2135,7 @@ class BatchApplyMaskToScansView(APIView):
                                             sib_output_filename = f"{sibling_name}_edit_0{sib_suffix}.nii.gz"
                                             sib_output_path = os.path.join(sib_target_dir, sib_output_filename)
                                             sib_masked_img = nib.Nifti1Image(
-                                                sib_masked_data,
+                                                _masked_voxels_for_save(sib_masked_data, sib_image_img),  # stored dtype, no scl_slope
                                                 sib_image_img.affine,
                                                 header=sib_image_img.header
                                             )
@@ -2390,7 +2421,7 @@ class MaskOutLabelsView(APIView):
             mask_header = mask_img.header.copy()
             mask_dtype = mask_img.get_data_dtype()
             # Round before astype to avoid truncating floats
-            mask_data = np.round(mask_img.get_fdata()).astype(np.uint8)
+            mask_data = nifti_voxels(mask_img, np.uint8, round_values=True)
 
             # ===== Detect insert-before-elastic (segmentation on edit immediately before elastic) =====
             current_edit_num = _parse_edit_slot_number(full_edit, filename)
@@ -2532,7 +2563,7 @@ class MaskOutLabelsView(APIView):
             full_output_path = os.path.join(base_path, f"{full_output_name}.nii.gz")
             
             full_masked_img = nib.Nifti1Image(
-                masked_full_data,
+                _masked_voxels_for_save(masked_full_data, full_image_img),  # stored dtype, no scl_slope
                 full_image_img.affine,
                 header=full_image_img.header
             )
@@ -3007,7 +3038,7 @@ class BatchMaskOutScansView(APIView):
 
                         mask_img = load_nifti_readonly(mask_path)
                         # Round before astype to avoid truncating floats (e.g. 0.999 to 0) caused by NIfTI scl_slope headers
-                        mask_data = np.round(mask_img.get_fdata()).astype(np.uint8)
+                        mask_data = nifti_voxels(mask_img, np.uint8, round_values=True)
 
                         # Check if the mask contains the specified label
                         unique_labels = np.unique(mask_data)
@@ -3112,7 +3143,7 @@ class BatchMaskOutScansView(APIView):
                                         _e_mask_temp = _e_mask_path.replace('.nii.mask.gz', '_mask.nii.gz')
                                         _em = load_nifti_readonly(_e_mask_path)
                                         # Round before astype to avoid truncating floats
-                                        _ed = np.round(_em.get_fdata()).astype(np.uint8)
+                                        _ed = nifti_voxels(_em, np.uint8, round_values=True)
                                         if label in np.unique(_ed):
                                             _e_combined = (_ed == label).astype(bool)
                                             if dilation > 0:
@@ -3125,7 +3156,7 @@ class BatchMaskOutScansView(APIView):
                                         else:
                                             _edata[_e_combined] = 0
                                         atomic_nib_save(
-                                            nib.Nifti1Image(_edata, _ei.affine, header=_ei.header),
+                                            nib.Nifti1Image(_masked_voxels_for_save(_edata, _ei), _ei.affine, header=_ei.header),
                                             _e_img_path,
                                         )
                                         print(f"Backed up and masked elastic ({_e_stem}) for {subject_name}")
@@ -3141,7 +3172,7 @@ class BatchMaskOutScansView(APIView):
                         full_output_path = os.path.join(subject_path, f"{full_output_name}.nii.gz")
                     
                         full_masked_img = nib.Nifti1Image(
-                            masked_image_data,
+                            _masked_voxels_for_save(masked_image_data, image_img),  # stored dtype, no scl_slope
                             image_img.affine,
                             header=image_img.header
                         )
@@ -3230,7 +3261,7 @@ class BatchMaskOutScansView(APIView):
                                 mask_img = load_nifti_readonly(dst_mask_full)
                                 mask_dtype = mask_img.get_data_dtype()
                                 # Round before astype to avoid truncating floats
-                                mask_arr = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                                mask_arr = nifti_voxels(mask_img, mask_dtype, round_values=True)
                                 slices = [slice(None, None, resolution_factor) for _ in range(3)]
                                 lossy_mask_arr = mask_arr[slices[0], slices[1], slices[2]].astype(mask_dtype)
                                 atomic_nib_save(nib.Nifti1Image(lossy_mask_arr, lossy_affine), dst_mask_lossy)

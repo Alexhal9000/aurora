@@ -133,12 +133,86 @@ def status_payload(include_beta: bool = False) -> Dict[str, Any]:
     models = []
     for spec in enabled_models(include_beta=include_beta):
         item = public_spec(spec["id"])
+        # Settings > General > AI models: where the model lives on this computer and the
+        # recorded agreement to its terms (accepted_terms.json, written after a download).
+        item["path"] = str(foundation_dir() / spec["subdir"])
+        item["accepted_terms"] = accepted_terms_entry(spec["id"])
         if progress and progress.get("model_id") == spec["id"]:
             item["download"] = progress
         else:
             item["download"] = None
         models.append(item)
-    return {"models": models, "count": len(models), "progress": progress}
+    return {
+        "models": models,
+        "count": len(models),
+        "progress": progress,
+        "models_root": str(foundation_dir()),
+    }
+
+
+def _read_accepted_terms() -> List[Dict[str, Any]]:
+    path = foundation_dir() / "accepted_terms.json"
+    if not path.is_file():
+        return []
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8")).get("entries") or []
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def accepted_terms_entry(model_id: str) -> Optional[Dict[str, Any]]:
+    """Latest recorded agreement for model_id, or None.
+
+    current is False when the license text bundled with this Aurora differs from the one
+    that was accepted (the provider changed its terms since the download)."""
+    latest = None
+    for entry in _read_accepted_terms():
+        if entry.get("model_id") == model_id:
+            latest = entry
+    if latest is None:
+        return None
+    current_hash = license_hash(model_id)
+    return {
+        "accepted_at": str(latest.get("accepted_at") or ""),
+        "user_name": str(latest.get("user_name") or ""),
+        "current": bool(current_hash) and latest.get("license_hash") == current_hash,
+    }
+
+
+def delete_model(model_id: str) -> List[str]:
+    """Remove a downloaded model's files (Settings > General > AI models).
+
+    Only the files the registry lists (and their .part leftovers) are removed, then the
+    model's folder if nothing else is left in it, so files a user put there stay. The
+    accepted_terms.json history is kept: it records past agreements, not installs.
+    Returns the names removed."""
+    spec = get_spec(model_id)
+    if spec is None:
+        raise DownloadError(f"Unknown model {model_id!r}.")
+    with _LOCK:
+        if _STATE["active"]:
+            raise DownloadError("Wait for the current AI model download to finish.")
+    directory = foundation_dir() / spec["subdir"]
+    removed: List[str] = []
+    for file_spec in spec["files"]:
+        for target in (directory / file_spec["name"], directory / f"{file_spec['name']}.part"):
+            if not target.is_file():
+                continue
+            try:
+                target.unlink()
+            except OSError as exc:
+                # Windows refuses while another process has the file open (a run using it).
+                raise DownloadError(
+                    f"Could not delete {target.name}: {exc}. Close anything using the model and try again."
+                ) from exc
+            removed.append(target.name)
+    try:
+        directory.rmdir()
+    except OSError:
+        pass  # not empty (other files) or already gone
+    logger.info("Deleted foundation model %s (%s)", model_id, ", ".join(removed) or "nothing to remove")
+    return removed
 
 
 def record_accepted_terms(model_ids: List[str], user_name: str = "") -> None:

@@ -8,6 +8,7 @@ from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 # Crash-safe protocol (atomic writes, read-only mask loads, subject transactions): see crashSafety.py.
+from .niftiVoxels import nifti_voxels  # stored-dtype voxel loads without get_fdata()'s float64 copy (same values)
 from .crashSafety import (
     crash_safe_view,
     request_subjects,
@@ -320,7 +321,7 @@ class RunAISegmentationView(APIView):
                     # Read in place (crash-safe rule 2): the mask is never renamed to be read.
                     mask_img = load_nifti_readonly(mask_path)
                     # Round before astype to avoid truncating floats
-                    mask_data_3d = np.round(mask_img.get_fdata()).astype(np.uint8)
+                    mask_data_3d = nifti_voxels(mask_img, np.uint8, round_values=True)
                     print(f"Mask loaded successfully. Shape: {mask_data_3d.shape}, dtype: {mask_data_3d.dtype}")
                 else:
                     # No existing mask, create empty one with same shape as image
@@ -443,7 +444,7 @@ class RunAISegmentationView(APIView):
                 if os.path.exists(full_save_path):
                     existing_full_mask_img = load_nifti_readonly(full_save_path)
                     # Round before astype to avoid truncating floats
-                    existing_full_mask_data = np.round(existing_full_mask_img.get_fdata()).astype(np.uint8)
+                    existing_full_mask_data = nifti_voxels(existing_full_mask_img, np.uint8, round_values=True)
                 else:
                     existing_full_mask_data = np.zeros(target_shape, dtype=np.uint8)
                 

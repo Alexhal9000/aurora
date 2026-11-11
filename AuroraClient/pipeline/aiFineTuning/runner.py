@@ -15,6 +15,7 @@ from ..aiModels.contracts import FOUNDATION_MEDSAM2, medsam2_train_capabilities
 from ..aiModels.foundation_models import MEDSAM2_ID, require_installed
 from ..aiModels.medsam2_adapter import DEFAULT_CONFIG, default_checkpoint
 from ..aiModels.paths import ensure_models_root, registered_model_dir, run_dir
+from ..torchCompute import configure_cuda_allocator
 from .checkpoint import INFERENCE_ARTIFACT_FILENAME, export_inference_checkpoint
 from .dataset import collect_examples
 from .discover import discover_project
@@ -274,7 +275,8 @@ def _spawn_worker(run_id: str) -> None:
     env = os.environ.copy()
     pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = os.pathsep.join([str(client_root), pythonpath]) if pythonpath else str(client_root)
-    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # expandable_segments on Linux only (see torchCompute.configure_cuda_allocator)
+    configure_cuda_allocator(env)
     proc = subprocess.Popen(
         cmd,
         cwd=str(client_root),

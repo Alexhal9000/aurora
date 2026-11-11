@@ -35,7 +35,8 @@ from .dinoReg.loader import (
     get_dinov2_model,
 )
 from .registrationTools import RegistrationTools
-from .torchCompute import empty_device_cache
+from .lowMemoryVolumeOps import normalize_input_without_float_copy  # identical lower-memory volume steps
+from .torchCompute import cuda_free_and_total_bytes, empty_device_cache, is_cuda_memory_error
 REG_FEATURE_DIM = 24
 SLICE_GAP = 2
 # Pass 2: try the largest ViT grid first (112×96 ≈ paper's high setting).
@@ -58,6 +59,14 @@ CPU_ENCODE_BATCH = 4
 # Apple GPU (MPS) shares system RAM and may page instead of raising OOM, so the
 # probe stops here rather than at ENCODE_BATCH_MAX.
 MPS_ENCODE_BATCH_MAX = 8
+# VRAM headroom kept free on CUDA: the probe only accepts a batch whose
+# measured peak (encoder forward + the L2-normalised float32 copy made right
+# after it) fits in the driver's free memory minus this margin. Without it the
+# probe took the largest batch that *just* fitted, and the desktop / browser
+# WebGL / allocator fragmentation then pushed the real batch over (12 GB
+# Windows GPU, 2026-11-10). Margin = max(absolute floor, fraction of total).
+VRAM_MARGIN_MIN_BYTES = int(1.5 * 1024 ** 3)
+VRAM_MARGIN_FRACTION = 0.15
 MAX_PCA_FIT_TOKENS = 250_000
 # Full FG token clouds are too large for an all-pairs similarity matrix.
 # Spatial stride + a hard cap keeps matching in the same regime as voxel-patch RANSAC.
@@ -124,8 +133,10 @@ def _notify(progress_callback: ProgressCallback, message: str):
 
 
 def _normalize_volume(volume):
+    # uint8/uint16 go in as they are: min_max_normalize makes its own float32 copy, and the
+    # result is identical (lowMemoryVolumeOps.normalize_input_without_float_copy).
     return _reg_tools.min_max_normalize(
-        np.asarray(volume, dtype=np.float32), new_min=-1, new_max=1
+        normalize_input_without_float_copy(volume), new_min=-1, new_max=1
     )
 
 
@@ -224,7 +235,17 @@ def _encode_slice_batch_gpu(model, device, slices_bhw, input_h, input_w):
 
 
 def _is_cuda_oom(exc) -> bool:
-    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    """Any GPU memory exhaustion (OOM, cuBLAS/cuDNN alloc failures); see torchCompute."""
+    return is_cuda_memory_error(exc)
+
+
+def _batch_oom_exhausted(label, input_h, input_w):
+    """Raised when even a single slice does not fit: the caller's grid fallback
+    (``_encode_pair_highest_res``) catches the "out of memory" text."""
+    return RuntimeError(
+        f"CUDA out of memory: {label} cannot encode one {int(input_h)}x{int(input_w)} "
+        "slice in the free GPU memory"
+    )
 
 
 def _shrink_encode_batch(bs, scan_name=None, label="encode"):
@@ -288,22 +309,83 @@ def _probe_encode_batch_size(
             break
         c = nxt
 
-    for cand in candidates:
-        batch = np.stack([sample] * int(cand), axis=0)
+    # CUDA: VRAM budget = driver-reported free memory minus a safety margin
+    # (VRAM_MARGIN_*). mem_get_info counts every process, so memory taken by
+    # the desktop or the browser is respected too. Each candidate's cost is the
+    # growth of this process's reserved memory over the trial, i.e. what it
+    # really takes from the driver. A batch is accepted only if that cost fits
+    # the budget; batches predicted (linearly) to exceed it are never tried, so
+    # the probe never pushes the GPU to its limit (on Windows an over-full GPU
+    # spills into slow shared system memory instead of failing).
+    is_cuda = torch.device(device).type == "cuda"
+    budget = None
+    if is_cuda:
+        _empty_cache()
+        info = cuda_free_and_total_bytes(device)
+        if info is not None:
+            free_b, total_b = info
+            margin = max(VRAM_MARGIN_MIN_BYTES, int(VRAM_MARGIN_FRACTION * total_b))
+            budget = max(0, free_b - margin)
+            _log(
+                scan_name,
+                f"{label}: GPU free {free_b / 1024 ** 3:.2f} of {total_b / 1024 ** 3:.2f} GB, "
+                f"margin {margin / 1024 ** 3:.2f} GB -> encode budget {budget / 1024 ** 3:.2f} GB",
+            )
+
+    per_slice = 0.0
+    best_cost = 0
+    tried = set()
+
+    def _trial(n):
+        """Encode n copies of the sample; return the reserved-memory cost or None on OOM."""
+        failed = False
+        cost = 0
+        batch = np.stack([sample] * int(n), axis=0)
+        if is_cuda:
+            torch.cuda.synchronize(device)
+            reserved0 = torch.cuda.memory_reserved(device)
+            torch.cuda.reset_peak_memory_stats(device)
         try:
             toks = _encode_slice_batch_gpu(model, device, batch, input_h, input_w)
+            # The real loops normalise right after encoding; include that copy.
+            toks = _l2_normalize_tokens_bnC(toks)
+            if is_cuda:
+                torch.cuda.synchronize(device)
+                cost = int(torch.cuda.max_memory_reserved(device) - reserved0)
             del toks
-            _empty_cache()
-            best = int(cand)
         except RuntimeError as exc:
-            if _is_cuda_oom(exc):
-                _empty_cache()
-                break
-            raise
+            if not _is_cuda_oom(exc):
+                raise
+            failed = True
+        # Freed outside the except block so the traceback does not pin tensors.
+        _empty_cache()
+        return None if failed else max(cost, 0)
+
+    for cand in candidates:
+        if budget is not None and per_slice > 0 and per_slice * cand > budget:
+            # Next ramp step would not fit: try the largest count that should.
+            fit = int(budget // per_slice)
+            if fit > best and fit not in tried:
+                tried.add(fit)
+                cost = _trial(fit)
+                if cost is not None and cost <= budget:
+                    best, best_cost = int(fit), cost
+            break
+        tried.add(cand)
+        cost = _trial(cand)
+        if cost is None:
+            break
+        if budget is not None and cost > budget and cand > 1:
+            break
+        best, best_cost = int(cand), cost
+        per_slice = max(per_slice, cost / float(cand))
     _log(
         scan_name,
         f"{label}: best encode batch={best} for input {int(input_h)}x{int(input_w)} "
-        f"(probed up to {max_bs})",
+        f"(probed up to {max_bs}"
+        + (f", uses {best_cost / 1024 ** 3:.2f} GB of {budget / 1024 ** 3:.2f} GB budget"
+           if budget is not None else "")
+        + ")",
     )
     return int(best)
 
@@ -372,6 +454,27 @@ def _l2_normalize_tokens_bnC(tokens, eps=1e-8):
     return tokens / norms
 
 
+# torch.pca_lowrank is a randomized SVD (Gaussian test matrix from the global
+# torch RNG). Unseeded, the PCA basis -- and therefore the features and the
+# pose -- could differ slightly between two runs on the same data. A fixed seed
+# makes a run reproducible on the same device/build; the caller's RNG state is
+# restored afterwards. CUDA, CPU and MPS draw different streams, so a CPU
+# (fallback) fit is reproducible but not bit-identical to a CUDA fit.
+PCA_LOWRANK_SEED = 0
+
+
+def _seeded_pca_lowrank(x, q, niter=4, seed=PCA_LOWRANK_SEED):
+    """``torch.pca_lowrank`` with a fixed seed, without touching the global RNG."""
+    import torch
+
+    cuda_devices = (
+        list(range(torch.cuda.device_count())) if torch.cuda.is_initialized() else []
+    )
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.manual_seed(int(seed))
+        return torch.pca_lowrank(x, q=q, niter=niter)
+
+
 def _fit_pca_basis_gpu(fit_tokens_nc, n_components, device):
     """
     Fit mean + PCA basis on GPU from (N, C) float32 tokens.
@@ -382,14 +485,32 @@ def _fit_pca_basis_gpu(fit_tokens_nc, n_components, device):
     # Apple MPS: fit on the CPU (pca_lowrank's QR/SVD have patchy MPS support),
     # then move mean/basis to MPS for the projections. Same maths, float32.
     fit_device = torch.device("cpu") if torch.device(device).type == "mps" else device
-    x_fit = torch.from_numpy(np.ascontiguousarray(fit_tokens_nc, dtype=np.float32)).to(fit_device)
+    try:
+        x_fit = torch.from_numpy(np.ascontiguousarray(fit_tokens_nc, dtype=np.float32)).to(fit_device)
+        return _fit_pca_basis_on(x_fit, n_components, device)
+    except RuntimeError as exc:
+        if torch.device(fit_device).type != "cuda" or not _is_cuda_oom(exc):
+            raise
+    # CUDA short on memory (other processes, fragmentation): the fit is
+    # (N<=250k, 1024) float32, so the CPU does it in seconds with the same maths.
+    x_fit = None
+    _empty_cache()
+    _log(None, "joint PCA fit: GPU out of memory, fitting on the CPU instead")
+    x_fit = torch.from_numpy(np.ascontiguousarray(fit_tokens_nc, dtype=np.float32))
+    return _fit_pca_basis_on(x_fit, n_components, device)
+
+
+def _fit_pca_basis_on(x_fit, n_components, device):
+    """PCA mean + basis of (N, C) ``x_fit`` on its own device; returned on ``device``."""
+    import torch
+
     mean = x_fit.mean(dim=0)
     x_fit = x_fit - mean
     n_comp = min(int(n_components), int(x_fit.shape[0]) - 1, int(x_fit.shape[1]))
     if n_comp < 3:
         raise RuntimeError("too few tokens/components for PCA")
     q = min(n_comp + 8, x_fit.shape[0], x_fit.shape[1])
-    _u, _s, v = torch.pca_lowrank(x_fit, q=q, niter=4)
+    _u, _s, v = _seeded_pca_lowrank(x_fit, q=q, niter=4)
     basis = v[:, :n_comp].contiguous()
     del x_fit, _u, _s, v
     return mean.to(device), basis.to(device)
@@ -438,17 +559,22 @@ def _sample_axial_tokens_for_pca(
     while i0 < len(encode_idx) and n_kept < int(max_tokens):
         batch_ids = encode_idx[i0:i0 + bs]
         batch = np.stack([volume[:, :, sid] for sid in batch_ids], axis=0)
+        oom = False
         try:
             toks = _encode_slice_batch_gpu(model, device, batch, input_h, input_w)
+            toks = _l2_normalize_tokens_bnC(toks)
         except RuntimeError as exc:
-            if _is_cuda_oom(exc):
-                new_bs = _shrink_encode_batch(bs, scan_name=scan_name, label=label)
-                if new_bs is None:
-                    raise
-                bs = new_bs
-                continue  # retry same unprocessed encode_idx[i0:]
-            raise
-        toks = _l2_normalize_tokens_bnC(toks)
+            if not _is_cuda_oom(exc):
+                raise
+            oom = True
+        if oom:
+            # Shrink outside the except block so the traceback frees its tensors.
+            toks = None
+            new_bs = _shrink_encode_batch(bs, scan_name=scan_name, label=label)
+            if new_bs is None:
+                raise _batch_oom_exhausted(label, input_h, input_w)
+            bs = new_bs
+            continue  # retry same unprocessed encode_idx[i0:]
         # toks: (B, feat_h*feat_w, C)
         b, n_pix, c = toks.shape
         flat = toks.reshape(b * n_pix, c)
@@ -523,20 +649,24 @@ def _encode_axial_project_into(
     while i0 < len(encode_idx):
         batch_ids = encode_idx[i0:i0 + bs]
         batch = np.stack([volume[:, :, sid] for sid in batch_ids], axis=0)
+        oom = False
         try:
             toks = _encode_slice_batch_gpu(model, device, batch, input_h, input_w)
+            toks = _l2_normalize_tokens_bnC(toks)
+            proj = _project_tokens_gpu(toks, mean_1C, basis_Ck)
+            proj_np = proj.detach().cpu().numpy().astype(np.float32)
+            del toks, proj
         except RuntimeError as exc:
-            if _is_cuda_oom(exc):
-                new_bs = _shrink_encode_batch(bs, scan_name=scan_name, label=label)
-                if new_bs is None:
-                    raise
-                bs = new_bs
-                continue  # retry same unprocessed encode_idx[i0:] — do not skip
-            raise
-        toks = _l2_normalize_tokens_bnC(toks)
-        proj = _project_tokens_gpu(toks, mean_1C, basis_Ck)
-        proj_np = proj.detach().cpu().numpy().astype(np.float32)
-        del toks, proj
+            if not _is_cuda_oom(exc):
+                raise
+            oom = True
+        if oom:
+            toks = proj = None
+            new_bs = _shrink_encode_batch(bs, scan_name=scan_name, label=label)
+            if new_bs is None:
+                raise _batch_oom_exhausted(label, input_h, input_w)
+            bs = new_bs
+            continue  # retry same unprocessed encode_idx[i0:] — do not skip
         for row, sid in enumerate(batch_ids):
             out_hwzd[:, :, sid, :] = proj_np[row].reshape(feat_h, feat_w, -1)
             encoded_at.append(sid)
@@ -826,16 +956,19 @@ def encode_volume_axial(
     while i0 < len(encode_idx):
         batch_ids = encode_idx[i0:i0 + bs]
         batch = np.stack([volume[:, :, sid] for sid in batch_ids], axis=0)
+        oom = False
         try:
             feats = _encode_slice_batch(model, device, batch, input_h, input_w)
         except RuntimeError as exc:
-            if _is_cuda_oom(exc):
-                new_bs = _shrink_encode_batch(bs, scan_name=scan_name, label=label)
-                if new_bs is None:
-                    raise
-                bs = new_bs
-                continue  # retry same unprocessed slices
-            raise
+            if not _is_cuda_oom(exc):
+                raise
+            oom = True
+        if oom:
+            new_bs = _shrink_encode_batch(bs, scan_name=scan_name, label=label)
+            if new_bs is None:
+                raise _batch_oom_exhausted(label, input_h, input_w)
+            bs = new_bs
+            continue  # retry same unprocessed slices
         for row, sid in enumerate(batch_ids):
             tokens[:, sid, :] = feats[row]
             encoded_at.append(sid)
@@ -1063,7 +1196,7 @@ def _joint_pca_scatter(
     mean = x_fit.mean(dim=0)
     x_fit = x_fit - mean
     q = min(n_comp + 8, x_fit.shape[0], x_fit.shape[1])
-    _u, _s, v = torch.pca_lowrank(x_fit, q=q, niter=4)
+    _u, _s, v = _seeded_pca_lowrank(x_fit, q=q, niter=4)
     basis = v[:, :n_comp]
     del x_fit
     chunks = []
@@ -2535,19 +2668,23 @@ def _encode_cube_axial_tokens(
     while i0 < n:
         batch_ids = list(range(i0, min(i0 + bs, n)))
         sl = np.stack([volume_cube[:, :, int(z_index[j])] for j in batch_ids], axis=0)
+        oom = False
         try:
             toks = _encode_slice_batch_gpu(model, device, sl, input_h, input_w)
+            toks = _l2_normalize_tokens_bnC(toks)
+            tokens[batch_ids] = toks.detach().cpu().numpy().astype(np.float32)
+            del toks
         except RuntimeError as exc:
-            if _is_cuda_oom(exc):
-                new_bs = _shrink_encode_batch(bs, scan_name=scan_name, label=label)
-                if new_bs is None:
-                    raise
-                bs = new_bs
-                continue
-            raise
-        toks = _l2_normalize_tokens_bnC(toks)
-        tokens[batch_ids] = toks.detach().cpu().numpy().astype(np.float32)
-        del toks
+            if not _is_cuda_oom(exc):
+                raise
+            oom = True
+        if oom:
+            toks = None
+            new_bs = _shrink_encode_batch(bs, scan_name=scan_name, label=label)
+            if new_bs is None:
+                raise _batch_oom_exhausted(label, input_h, input_w)
+            bs = new_bs
+            continue
         for j in batch_ids:
             sm = resize(
                 mask_cube[:, :, int(z_index[j])].astype(np.float32),
@@ -2816,8 +2953,7 @@ def _encode_pair_highest_res(
             last_oom = None
             break
         except (RuntimeError, MemoryError) as exc:
-            msg = str(exc).lower()
-            if isinstance(exc, MemoryError) or "out of memory" in msg:
+            if isinstance(exc, MemoryError) or _is_cuda_oom(exc):
                 last_oom = exc
                 _log(scan_name, f"CUDA/host OOM at {feat_h}x{feat_w}, trying a smaller grid")
                 import gc
@@ -5229,10 +5365,12 @@ def _find_dino_reg_correspondences_impl(
     moving_vs = float(moving_voxel_size)
 
     _notify(progress_callback, f"Normalizing volumes for DINO-Reg ({scan_name or 'scan'})...")
-    fixed_norm = _normalize_volume(fixed_volume)
-    moving_norm = _normalize_volume(moving_volume)
+    # Masks before the float32 copies: each mask build has its own float32/int32
+    # temporaries, so building them first keeps those off the two normalized volumes.
     fixed_mask = _foreground_mask_from_raw(fixed_volume, fixed_threshold)
     moving_mask = _foreground_mask_from_raw(moving_volume, moving_threshold)
+    fixed_norm = _normalize_volume(fixed_volume)
+    moving_norm = _normalize_volume(moving_volume)
     if fixed_mask.sum() < 64 or moving_mask.sum() < 64:
         _log(scan_name, "too little foreground for DINO-Reg")
         if debug is not None:
@@ -5283,7 +5421,13 @@ def _find_dino_reg_correspondences_impl(
 
     # Pre-rotate moving volume by the winning octahedral relabel so moving and
     # fixed share canonical anatomical slice orientations during high-res encode.
-    moving_norm_p2 = _apply_octahedral_relabel(moving_norm, R_cube)
+    # Pass 1 is done with the un-rotated normalized scan (moving_crop is a view of it).
+    # Relabel the stored-dtype scan and normalize that: min-max normalization is per voxel
+    # with a permutation-invariant min and max, so this equals relabelling the normalized
+    # volume (same values, C-contiguous float32 either way) without two float32 copies.
+    moving_crop = None
+    moving_norm = None
+    moving_norm_p2 = _normalize_volume(_apply_octahedral_relabel(moving_volume, R_cube))
     moving_mask_p2 = _apply_octahedral_relabel(moving_mask, R_cube)
 
     z0_m_p2, z1_m_p2 = _foreground_z_extent(moving_mask_p2)

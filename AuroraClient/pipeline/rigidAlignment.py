@@ -33,6 +33,8 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
 
+from .niftiVoxels import nifti_voxels  # stored-dtype voxel loads without get_fdata()'s float64 copy (same values)
+from .lowMemoryVolumeOps import gaussian_float32, label_sizes  # identical lower-memory volume steps (tests: test_low_memory_volume_ops)
 from .batch_flag_filter import load_flagged_subject_names, apply_flag_filter, normalize_flag_filter_value
 from .linkedScans import filter_out_linked_children, get_link_group, get_same_shape_siblings
 
@@ -661,15 +663,18 @@ def _largest_voxel_connected_component(mask):
     labeled, num_features = ndimage.label(np.asarray(mask, dtype=bool))
     if num_features == 0:
         return np.asarray(mask, dtype=bool)
-    sizes = np.bincount(labeled.ravel())
+    sizes = label_sizes(labeled, num_features)  # same counts as np.bincount, no int64 copy
     sizes[0] = 0
     return labeled == int(sizes.argmax())
 
 
 def _content_mask_from_threshold(volume, threshold, sigma=1.0):
     """Geometry-only mask: Gaussian smooth, threshold, largest connected component."""
-    smoothed = gaussian_filter(np.asarray(volume, dtype=np.float32), sigma=float(sigma))
+    # float32 Gaussian straight from the stored dtype (identical, see
+    # lowMemoryVolumeOps.gaussian_float32); the float32 copy is freed before labelling.
+    smoothed = gaussian_float32(volume, float(sigma))
     binary = smoothed > float(threshold)
+    smoothed = None
     return _largest_voxel_connected_component(binary)
 
 
@@ -972,7 +977,7 @@ def compute_and_save_landmark_distances(
 
     nifti_img = nib.load(nifti_path)
     original_dtype = nifti_img.get_data_dtype()
-    nifti_data = nifti_img.get_fdata().astype(original_dtype)
+    nifti_data = nifti_voxels(nifti_img, original_dtype)
     nifti_data = gaussian_filter(nifti_data, sigma=0.3)
 
     if np.any(np.isnan(nifti_data)) or np.any(np.isinf(nifti_data)):
@@ -4216,7 +4221,7 @@ class AlignToReferenceView(APIView):
             reference_img = nib.load(reference_path)
             reference_affine_data = reference_img.affine
             reference_original_dtype = reference_img.get_data_dtype()
-            reference_data = reference_img.get_fdata().astype(reference_original_dtype)
+            reference_data = nifti_voxels(reference_img, reference_original_dtype)
             reference_data = gaussian_filter(reference_data, sigma=1.0)
             reference_shape = reference_data.shape
             reference_voxel_size = reference_metadata['voxel_size']
@@ -4406,7 +4411,7 @@ class AlignToReferenceView(APIView):
                                                 sib_nifti_path = os.path.join(directory, "extracted", sibling_name, f"{sibling_name}.nii.gz")
                                             sib_img = nib.load(sib_nifti_path)
                                             sib_dtype = sib_img.get_data_dtype()
-                                            sib_data = sib_img.get_fdata().astype(sib_dtype)
+                                            sib_data = nifti_voxels(sib_img, sib_dtype)
                                             if scale_match != 1:
                                                 sib_data = ndimage.zoom(sib_data, scale_match, order=interpolation_order, mode='constant', cval=0)
                                             sib_padded = np.pad(
@@ -4835,7 +4840,7 @@ class AlignToReferenceView(APIView):
                     nifti_img = nib.load(scan_path)
                     nifti_affine_data = nifti_img.affine
                     original_dtype = nifti_img.get_data_dtype()
-                    scan_data = nifti_img.get_fdata().astype(original_dtype)
+                    scan_data = nifti_voxels(nifti_img, original_dtype)
 
                     # Get threshold from scan metadata
                     threshold = scan_metadata['threshold']   
@@ -5372,7 +5377,11 @@ class AlignToReferenceView(APIView):
                         est_slices = tuple(slice(None, None, estimation_stride) for _ in range(3))
 
                         adjusted_background_value = self.registration_tools.get_adjusted_background_value(
-                            background_value, scan_data.astype(np.float32), new_min=-1, new_max=1
+                            # Only min and max are used: float32 of the min/max equals the
+                            # min/max of a float32 copy (rounding is monotonic), minus that copy.
+                            background_value,
+                            np.array([np.min(scan_data), np.max(scan_data)], dtype=np.float32),
+                            new_min=-1, new_max=1
                         )
                         print(f"Adjusted background value: {adjusted_background_value} from {background_value}")
                     
@@ -6343,7 +6352,7 @@ class AlignToReferenceView(APIView):
                             mask_img = load_nifti_readonly(mask_src_path)
                             mask_dtype = mask_img.get_data_dtype()
                             # Round before astype to avoid truncating floats
-                            mask_data = np.round(mask_img.get_fdata()).astype(mask_dtype)
+                            mask_data = nifti_voxels(mask_img, mask_dtype, round_values=True)
 
                             # Apply the same transformations as the scan data, but with nearest neighbor
                             if uses_scipy_centroid_embed_rigid(method):
@@ -6557,7 +6566,7 @@ class AlignToReferenceView(APIView):
                                     
                                         sib_img = nib.load(sib_nifti_path)
                                         sib_dtype = sib_img.get_data_dtype()
-                                        sib_data = sib_img.get_fdata().astype(sib_dtype)
+                                        sib_data = nifti_voxels(sib_img, sib_dtype)
                                     
                                         # Apply the same transform based on method
                                         if method.lower() == 'alpaca':
@@ -6733,7 +6742,7 @@ class AlignToReferenceView(APIView):
                                             sib_mask_temp = sib_mask_src.replace('.nii.mask.gz', '_mask.nii.gz')
                                             sib_mask_img = load_nifti_readonly(sib_mask_src)
                                             sib_mask_dtype = sib_mask_img.get_data_dtype()
-                                            sib_mask_data = np.round(sib_mask_img.get_fdata()).astype(sib_mask_dtype)
+                                            sib_mask_data = nifti_voxels(sib_mask_img, sib_mask_dtype, round_values=True)
                                         
                                             # Apply same transform to mask with nearest neighbor
                                             if method.lower() == 'alpaca':

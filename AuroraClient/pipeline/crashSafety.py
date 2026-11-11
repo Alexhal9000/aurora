@@ -380,8 +380,20 @@ def _subject_lock(scan_dir):
 
 
 def is_subject_active(scan_dir):
+    """
+    True while this engine has a transaction on `scan_dir`, including one that is still
+    starting: SubjectTransaction holds the subject lock before it registers in _ACTIVE
+    (its journal is written in between). Without the lock check a project recovery on
+    another thread (GetProjectSettingsView, e.g. a page refresh during extraction) took
+    that half-made .aurora_txn for a leftover and deleted it under the writer
+    (2026-11-10: "atomic_output: writer did not create .../.journal.json.csp-tmp-...").
+    """
+    key = _key(scan_dir)
     with _REGISTRY_LOCK:
-        return _key(scan_dir) in _ACTIVE
+        if key in _ACTIVE:
+            return True
+        lock = _SUBJECT_LOCKS.get(key)
+    return lock is not None and lock.locked()
 
 
 def _visible_entries(scan_dir):
@@ -467,7 +479,11 @@ class SubjectTransaction:
                 recover_subject(self.scan_dir, force=True)
             self._begin()
         except BaseException:
+            # Forget the lock once released: a LinkedTransaction releases every member it
+            # created when the group ends, and a second release would raise "release
+            # unlocked lock" over the real error that stopped this member from starting.
             self._lock.release()
+            self._lock = None
             raise
         with _REGISTRY_LOCK:
             _ACTIVE[key] = {'txn': self, 'thread': me, 'depth': 1}
@@ -704,6 +720,11 @@ class SubjectTransaction:
 
     def rollback(self):
         if self._finished or self._outer is not None:
+            return
+        if self._journal is None:
+            # Never started (its _begin failed, see __enter__): nothing in the subject was
+            # touched, and there is no journal to roll back from.
+            self._finished = True
             return
         if not os.path.isdir(self.scan_dir):
             self._finished = True

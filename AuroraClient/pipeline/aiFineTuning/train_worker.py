@@ -19,8 +19,11 @@ from .validation_mode import (
     volume_val_examples,
 )
 
-# Must be set before torch is imported in this subprocess.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+from ..torchCompute import configure_cuda_allocator  # noqa: E402
+
+# Must be set before torch is imported in this subprocess. Linux only: on
+# Windows expandable_segments breaks OOM recovery (torchCompute docs).
+configure_cuda_allocator()
 
 
 def main(argv=None) -> int:
